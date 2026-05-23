@@ -7,6 +7,22 @@
     }
   },
   "customizations": {
+    "repositories": {
+      "margic/director": {
+        "permissions": {
+          "issues": "write",
+          "contents": "write",
+          "pull_requests": "write"
+        }
+      },
+      "margic/racecontrol": {
+        "permissions": {
+          "issues": "write",
+          "contents": "write",
+          "pull_requests": "write"
+        }
+      }
+    },
     "vscode": {
       "extensions": [
         "rust-lang.rust-analyzer",
