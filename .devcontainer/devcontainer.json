@@ -4,7 +4,8 @@
   "features": {
     "ghcr.io/devcontainers/features/node:1": {
       "version": "lts"
-    }
+    },
+    "ghcr.io/devcontainers/features/github-cli:1": {}
   },
   "customizations": {
     "repositories": {
@@ -32,5 +33,5 @@
       ]
     }
   },
-  "postCreateCommand": "rustc --version && cargo --version && node --version && npm --version"
+  "postCreateCommand": "rustc --version && cargo --version && node --version && npm --version && gh --version"
 }

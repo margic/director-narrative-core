@@ -8,6 +8,7 @@ This repository includes a Codespaces/devcontainer setup for hybrid Rust + Node.
 - Devcontainer config: `.devcontainer/devcontainer.json`
 - Rust toolchain support
 - Node.js LTS support
+- GitHub CLI (`gh`) support
 - Recommended VS Code extensions for Rust and Node.js workflows
 
 ## Prototype Roadmap Backlog
