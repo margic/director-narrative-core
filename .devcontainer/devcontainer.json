@@ -1,0 +1,37 @@
+{
+  "name": "director-narrative-core",
+  "image": "mcr.microsoft.com/devcontainers/rust:1-1-bullseye",
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "lts"
+    },
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
+  "customizations": {
+    "repositories": {
+      "margic/director": {
+        "permissions": {
+          "issues": "write",
+          "contents": "write",
+          "pull_requests": "write"
+        }
+      },
+      "margic/racecontrol": {
+        "permissions": {
+          "issues": "write",
+          "contents": "write",
+          "pull_requests": "write"
+        }
+      }
+    },
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "vadimcn.vscode-lldb",
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode"
+      ]
+    }
+  },
+  "postCreateCommand": "rustc --version && cargo --version && node --version && npm --version && gh --version"
+}
