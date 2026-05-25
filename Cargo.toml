@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "napi"]
+resolver = "2"
+
 [package]
 name = "director-narrative-core"
 version = "0.1.0"
