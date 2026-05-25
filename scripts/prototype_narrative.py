@@ -142,6 +142,48 @@ def find_car_ahead_ldp(frame, lap_time_s):
     return best_idx, best_diff * lap_time_s
 
 
+def find_car_behind_ldp(frame, lap_time_s):
+    """
+    Find the closest car physically behind using car_idx_lap_dist_pct.
+    Returns (car_behind_idx, gap_seconds) or (-1, nan).
+    gap_seconds is the gap from that car TO US (positive = they are behind us).
+    A decreasing gap over laps means they are closing — defensive pressure.
+    """
+    player_idx = frame['player_car_idx']
+    player_pos = frame['player_car_position']
+    ldp_arr    = frame['car_idx_lap_dist_pct']
+    pos_arr    = frame['car_idx_position']
+    pit_arr    = frame['car_idx_on_pit_road']
+
+    if player_pos <= 0:
+        return -1, np.nan
+
+    player_ldp  = ldp_arr[player_idx]
+    best_idx    = -1
+    best_diff   = np.inf
+    max_ldp_gap = MAX_BATTLE_GAP_S / lap_time_s
+
+    for i in range(len(ldp_arr)):
+        if i == player_idx:
+            continue
+        p, ldp, pit = pos_arr[i], ldp_arr[i], pit_arr[i]
+        if p <= 0 or p <= player_pos:   # not behind us in race order
+            continue
+        if pit or ldp < -0.5:           # on pit road or inactive sentinel
+            continue
+        diff = player_ldp - ldp         # positive = we are ahead of them
+        if diff < -0.5:
+            diff += 1.0                 # they've crossed S/F, we haven't yet
+        if 0.0 < diff < best_diff:
+            best_diff = diff
+            best_idx  = i
+
+    if best_idx < 0 or best_diff > max_ldp_gap:
+        return -1, np.nan
+
+    return best_idx, best_diff * lap_time_s
+
+
 # ── OLS helper (spec §5.2) ────────────────────────────────────────────────────
 
 def ols_slope(laps, gaps):
@@ -261,13 +303,18 @@ print()
 
 # ── Engine state ──────────────────────────────────────────────────────────────
 
-lap_timer_live = LapTimer()
-sampler        = AnchorSampler(anchor_count)
-regression     = RegressionStore()
-engine_state   = BattleState.IDLE
-prev_slope     = None
-pit_laps       = set()
-all_events     = []
+lap_timer_live   = LapTimer()
+sampler          = AnchorSampler(anchor_count)
+regression       = RegressionStore()
+engine_state     = BattleState.IDLE
+prev_slope       = None
+# ── Defensive (car-behind) state ─────────────────────────────────────────────
+sampler_behind   = AnchorSampler(anchor_count)
+regression_behind= RegressionStore()
+defensive_state  = BattleState.IDLE
+prev_slope_beh   = None
+pit_laps         = set()
+all_events       = []
 
 # Frame-level streaming state
 prev_lap          = None
@@ -278,9 +325,12 @@ lap_pit_frames    = {}     # lap → frame count with on_pit_road == True
 CLOSE_APPROACH_THRESH_S    = 1.5   # within 1.5 s → potential overtake window
 CLOSE_APPROACH_MIN_FRAMES  = 5     # must persist for ≥ 5 frames before firing
 
-consecutive_close = 0
-last_close_t      = -999.0
-tracking_car      = -1    # CarIdx of car currently in close-approach sequence
+consecutive_close     = 0
+last_close_t          = -999.0
+tracking_car          = -1    # CarIdx of car currently in close-approach sequence
+consecutive_close_beh = 0
+last_close_beh_t      = -999.0
+tracking_car_beh      = -1    # CarIdx of car in close-pressure-behind sequence
 
 # Logging for visualisation
 gap_log           = []    # (session_time, gap_s, car_ahead_idx, lap)
@@ -317,9 +367,11 @@ for frame in raw_frames:
         lap_pit_frames[lap] = lap_pit_frames.get(lap, 0) + 1
 
     # ── Gap calculation (ldp-based, updates every frame) ──────────────────────
-    car_ahead_idx, gap_s = find_car_ahead_ldp(frame, lap_t)
+    car_ahead_idx,  gap_s     = find_car_ahead_ldp(frame, lap_t)
+    car_behind_idx, gap_beh_s = find_car_behind_ldp(frame, lap_t)
 
     sampler.update(lap, ldp, gap_s, car_ahead_idx, is_clean)
+    sampler_behind.update(lap, ldp, gap_beh_s, car_behind_idx, is_clean)
 
     if not np.isnan(gap_s):
         gap_log.append((t, gap_s, car_ahead_idx, lap))
@@ -364,6 +416,30 @@ for frame in raw_frames:
         consecutive_close = 0
         if car_ahead_idx != tracking_car:
             tracking_car = -1
+
+    # Pressure from behind: car behind within threshold for ≥ MIN_FRAMES
+    if not np.isnan(gap_beh_s) and gap_beh_s < CLOSE_APPROACH_THRESH_S:
+        consecutive_close_beh += 1
+        if (consecutive_close_beh >= CLOSE_APPROACH_MIN_FRAMES
+                and (t - last_close_beh_t) > 30.0
+                and car_behind_idx != tracking_car_beh):
+            tracking_car_beh = car_behind_idx
+            last_close_beh_t = t
+            car_pos_val_beh  = frame['car_idx_position'][car_behind_idx]
+            evt = _make_event('PRESSURE_BEHIND', lap, t,
+                              car_behind_idx=int(car_behind_idx),
+                              gap_s=round(float(gap_beh_s), 2),
+                              car_race_position=int(car_pos_val_beh),
+                              ai_prompt_hint=(
+                                  f"CarIdx {car_behind_idx} (P{int(car_pos_val_beh)})"
+                                  f" is only {gap_beh_s:.2f}s behind"))
+            all_events.append(evt)
+            print(f"  [{_fmt_t(t)}  L{lap:02d}]  PRESSURE_BEHIND  "
+                  f"CarIdx {car_behind_idx} (P{int(car_pos_val_beh)}) @ {gap_beh_s:.2f}s")
+    else:
+        consecutive_close_beh = 0
+        if car_behind_idx != tracking_car_beh:
+            tracking_car_beh = -1
 
     # ── Lap-crossing: regression + state classification ────────────────────────
     if prev_lap is not None and lap != prev_lap:
@@ -476,6 +552,62 @@ for frame in raw_frames:
         engine_state = new_state
         if slope_info:
             prev_slope = slope_info['median_slope']
+
+        # ── Defensive regression: car behind closing on us ────────────────────
+        regression_behind.ingest(sampler_behind, max_lap=done_lap)
+        per_anchor_beh = regression_behind.per_bucket_slopes(min_readings=MIN_PUSH_READINGS)
+        slopes_beh     = list(per_anchor_beh.values())
+        new_def_state  = BattleState.IDLE
+        slope_beh_info = {}
+
+        if done_lap not in pit_laps and slopes_beh:
+            med_beh       = float(np.median(slopes_beh))
+            n_agree_beh   = sum(1 for s in slopes_beh if s < 0)
+            hot_beh       = min(per_anchor_beh, key=per_anchor_beh.get)
+            hotspot_beh   = hot_beh / anchor_count
+            slope_beh_info = {
+                'median_slope':         round(med_beh, 4),
+                'anchors_qualifying':   len(slopes_beh),
+                'anchors_agreeing':     n_agree_beh,
+                'hotspot_lap_dist_pct': round(hotspot_beh, 3),
+            }
+            # Negative slope = gap-behind shrinking = car behind closing on us
+            if (med_beh <= ATTACK_SLOPE_THRESHOLD
+                    and len(slopes_beh) >= MIN_ATTACK_READINGS
+                    and prev_slope_beh is not None and med_beh < prev_slope_beh):
+                new_def_state = BattleState.ATTACK_SETUP
+            elif med_beh <= PUSH_SLOPE_THRESHOLD and len(slopes_beh) >= MIN_PUSH_READINGS:
+                new_def_state = BattleState.PUSH
+            elif slopes_beh:
+                new_def_state = BattleState.TRACKING
+
+        if new_def_state != defensive_state:
+            if new_def_state in (BattleState.PUSH, BattleState.ATTACK_SETUP):
+                hint_beh = (
+                    f"Car behind closing at {abs(slope_beh_info['median_slope']):.3f}s/lap "
+                    f"({slope_beh_info['anchors_agreeing']}/{slope_beh_info['anchors_qualifying']} "
+                    f"anchors agree), hotspot @ {slope_beh_info['hotspot_lap_dist_pct']:.0%}"
+                ) if slope_beh_info else ""
+                label = ('DEFEND_PUSH' if new_def_state == BattleState.PUSH
+                         else 'DEFEND_ATTACK')
+                evt = _make_event(label, done_lap, t,
+                                  **slope_beh_info, ai_prompt_hint=hint_beh)
+                all_events.append(evt)
+                print(f"  [{_fmt_t(t)}  L{done_lap:02d}]  {label}  "
+                      f"slope={slope_beh_info.get('median_slope', 0):+.4f}s/lap  "
+                      f"n={slope_beh_info.get('anchors_qualifying', 0)}  "
+                      f"hotspot@{slope_beh_info.get('hotspot_lap_dist_pct', 0):.0%}")
+
+        if slopes_beh:
+            s_b   = slope_beh_info.get('median_slope', np.nan)
+            n_b   = slope_beh_info.get('anchors_qualifying', 0)
+            n_ab  = slope_beh_info.get('anchors_agreeing', 0)
+            print(f"       defensive:  slope={s_b:+.4f}s/lap  "
+                  f"n={n_b}  agree={n_ab}/{n_b}  → {new_def_state.name}")
+
+        defensive_state = new_def_state
+        if slope_beh_info:
+            prev_slope_beh = slope_beh_info['median_slope']
 
     prev_lap      = lap
     prev_on_pit   = on_pit
