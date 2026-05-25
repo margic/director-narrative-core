@@ -2,7 +2,8 @@
 prototype_narrative.py
 ======================
 Runs the full two-tier spatial-anchor narrative pipeline against the real
-Nürburgring telemetry CSV and prints a human-readable race timeline.
+Nürburgring JSONL telemetry (exported from the iRacing replay via
+export_replay.py) and prints a human-readable race timeline.
 
 This is a direct translation of the architecture spec into runnable Python,
 so you can validate it against what you know really happened in the race
@@ -10,259 +11,491 @@ before committing to Rust.
 
 Pipeline (mirrors spec exactly):
   §3   — Dynamic anchor count from last completed lap time
-  §4   — (Simplified) single abstract opponent — no CarIdxF2Time in .ibt
-  §5.1 — Ring buffer per (anchor_bucket)
+  §4   — Full-field CarIdx arrays → car_ahead_idx + gap_seconds per frame
+  §5.1 — Ring buffer per (anchor_bucket, car_ahead_idx)
   §5.2 — Per-anchor OLS regression: x=lap, y=gap_seconds at that anchor
   §5.5 — Two-tier: per-anchor slope (WHERE) → median slope (WHETHER)
-  §6   — Manual yellow zone injection (SessionFlags not in CSV)
+  §6   — SessionFlags bitmask for yellow-contaminated row filtering
   §7   — BattleState machine drives lap-crossing transitions
 
-Limitations vs production Rust:
-  - No opponent identity tracking (CarIdxF2Time unavailable in .ibt)
-  - Yellow zones manually annotated (SessionFlags not exported)
-  - Gap estimate: CarDistAhead_m / Speed_m_s (approximation)
+Improvements over the CSV-based prototype:
+  - Opponent identity from CarIdxF2Time (no more false regression slopes
+    caused by the car-ahead changing between laps)
+  - Regression keyed on (anchor_bucket, car_ahead_idx) — each series
+    compares like-with-like
+  - Gap in seconds (f2-time delta) instead of CarDistAhead / Speed estimate
+  - is_on_track=False is a replay artefact; filter on player_car_position > 0
 
 Output:
   Console: per-lap state log + JSON narrative events
   scripts/prototype_narrative.png: 4-panel validation plot
 """
 
+import json
 import numpy as np
 import pandas as pd
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import json
 from enum import Enum, auto
 
 # ── Configuration (mirrors spec constants) ────────────────────────────────────
-DATA_PATH            = 'data/porsche992rgt3_nurburgring combinedlong 2026-05-24 06-54-35.csv'
-TARGET_CADENCE_S     = 5.0
-SENTINEL_M           = 490_000.0
-BATTLE_THRESHOLD_M   = 50.0
-MIN_PUSH_READINGS    = 2          # long-track threshold (spec §5.4)
-MIN_ATTACK_READINGS  = 3
-PUSH_SLOPE_THRESHOLD   = -0.05   # s/lap — sustained closing
-ATTACK_SLOPE_THRESHOLD = -0.10   # s/lap — accelerating closing
-PIT_LAP_ROW_THRESHOLD  = 500     # rows with OnPitRoad==True → treat lap as pit lap
+import os, sys
+JSONL_PATH             = os.environ.get('JSONL_PATH', 'data/session.jsonl')
+TARGET_CADENCE_S       = 5.0
+MIN_PUSH_READINGS      = 2          # laps per (bucket, opponent) to qualify
+MIN_ATTACK_READINGS    = 3
+PUSH_SLOPE_THRESHOLD   = -0.05      # s/lap — sustained closing
+ATTACK_SLOPE_THRESHOLD = -0.10      # s/lap — accelerating closing
+MAX_BATTLE_GAP_S       = 5.0        # only track car ahead if within 5 s
+PIT_LAP_FRAME_THRESH   = 20         # frames with on_pit_road==True → pit lap
 
-# SessionFlags bitmasks (spec §6) — now read directly from the exported CSV
+# SessionFlags bitmasks (spec §6)
 YELLOW_WAVE = 0x100
 CAUTION     = 0x4000
 
 # ── BattleState (spec §7) ──────────────────────────────────────────────────────
 class BattleState(Enum):
-    IDLE                       = auto()
-    TRACKING                   = auto()
-    PUSH                       = auto()
-    ATTACK_SETUP               = auto()
-    RESET_YELLOW_CONTAMINATION = auto()
+    IDLE         = auto()
+    TRACKING     = auto()
+    PUSH         = auto()
+    ATTACK_SETUP = auto()
 
-# ── Step 1: Load and preprocess ───────────────────────────────────────────────
-print("Loading telemetry...")
-df = pd.read_csv(DATA_PATH)
-df = df[(df['IsOnTrack'] == True) & (df['Lap'] >= 1) & (df['Lap'] <= 5)].copy()
+# ── Data synthesis helpers ────────────────────────────────────────────────────
+# Yellow flag zones identified from CSV telemetry (SessionFlags is 0 in replay)
+KNOWN_YELLOW_ZONES = [
+    (1, 0.625, 0.646),   # Lap 1 yellow at ~63% of lap
+    (2, 0.616, 0.623),   # Lap 2 yellow at ~62% of lap
+]
+NURBURGRING_LAP_EST_S = 540.0  # Fallback if no lap has completed yet
 
-# Sentinel → NaN
-df['CarDistAhead'] = df['CarDistAhead'].where(df['CarDistAhead'] < SENTINEL_M, np.nan)
 
-# Gap estimate: distance / own speed (spec §8 — approximation for .ibt prototype)
-df['GapSeconds'] = np.where(
-    df['Speed'] > 1.0,
-    df['CarDistAhead'] / df['Speed'],
-    np.nan
-)
+def synthesize_flags(lap, ldp):
+    """Return a SessionFlags bitmask from known yellow zones (replay has none)."""
+    for (ylap, p0, p1) in KNOWN_YELLOW_ZONES:
+        if lap == ylap and p0 <= ldp <= p1:
+            return YELLOW_WAVE
+    return 0
 
-# Detect pit laps automatically (rows with OnPitRoad==True per lap)
-pit_lap_rows = df.groupby('Lap')['OnPitRoad'].sum()
-pit_laps = set(pit_lap_rows[pit_lap_rows > PIT_LAP_ROW_THRESHOLD].index)
-print(f"Pit laps detected: {sorted(pit_laps)}")
 
-# Tag yellow-contaminated rows using real SessionFlags bitmask (spec §6)
-df['is_clean'] = ((df['SessionFlags'].astype(int) & (YELLOW_WAVE | CAUTION)) == 0)
-df.loc[df['Lap'].isin(pit_laps), 'is_clean'] = False
+class LapTimer:
+    """Tracks first-frame session_time per lap to compute lap durations live."""
 
-# ── Step 2: Dynamic anchor count (spec §3.2) ──────────────────────────────────
-# Use LapLastLapTime max for Lap 2 — iRacing updates this field a moment after
-# the start/finish crossing, so the very first rows of Lap 2 still carry 0.
-lap1_time = df[df['Lap'] == 2]['LapLastLapTime'].max()
-anchor_count = max(10, int(lap1_time / TARGET_CADENCE_S))
-print(f"Lap 1 time: {lap1_time:.1f}s → {anchor_count} anchors (cadence: {TARGET_CADENCE_S}s)")
+    def __init__(self):
+        self._starts = {}   # lap → first session_time seen
+        self._times  = {}   # lap → duration (seconds)
 
-# ── Step 3: Spatial anchor sampling (spec §3.1) ───────────────────────────────
-# Assign anchor bucket to every row
-df['AnchorBucket'] = (df['LapDistPct'] * anchor_count).astype(int).clip(0, anchor_count - 1)
+    def update(self, lap, t):
+        if lap not in self._starts:
+            self._starts[lap] = t
+            prev = lap - 1
+            if prev in self._starts:
+                self._times[prev] = t - self._starts[prev]
 
-# First crossing of each (Lap, AnchorBucket) pair = the anchor reading
-anchor_samples = (
-    df.dropna(subset=['GapSeconds'])
-      .sort_values('SessionTime')
-      .groupby(['Lap', 'AnchorBucket'])
-      .first()
-      .reset_index()
-)[['Lap', 'AnchorBucket', 'GapSeconds', 'is_clean', 'SessionTime', 'LapDistPct']]
+    def best_estimate(self):
+        """Most recently completed lap time, or Nürburgring fallback."""
+        return self._times[max(self._times)] if self._times else NURBURGRING_LAP_EST_S
 
-print(f"Anchor samples: {len(anchor_samples)} total "
-      f"({anchor_samples['is_clean'].sum()} clean, "
-      f"{(~anchor_samples['is_clean']).sum()} dirty)")
+    def completed(self, lap):
+        return self._times.get(lap)
 
-# ── Step 4: OLS helper (spec §5.2) ────────────────────────────────────────────
+
+def find_car_ahead_ldp(frame, lap_time_s):
+    """
+    Find the closest car physically ahead using car_idx_lap_dist_pct.
+    Returns (car_ahead_idx, gap_seconds) or (-1, nan).
+    Converts ldp fraction → seconds using lap_time_s estimate.
+    Handles wrap-around at the start/finish line.
+    """
+    player_idx = frame['player_car_idx']
+    player_pos = frame['player_car_position']
+    ldp_arr    = frame['car_idx_lap_dist_pct']
+    pos_arr    = frame['car_idx_position']
+    pit_arr    = frame['car_idx_on_pit_road']
+
+    if player_pos <= 1:
+        return -1, np.nan
+
+    player_ldp  = ldp_arr[player_idx]
+    best_idx    = -1
+    best_diff   = np.inf
+    max_ldp_gap = MAX_BATTLE_GAP_S / lap_time_s   # 5 s → ldp fraction
+
+    for i in range(len(ldp_arr)):
+        if i == player_idx:
+            continue
+        p, ldp, pit = pos_arr[i], ldp_arr[i], pit_arr[i]
+        if p <= 0 or p >= player_pos:   # not ahead of us in race order
+            continue
+        if pit or ldp < -0.5:           # on pit road or inactive sentinel
+            continue
+        diff = ldp - player_ldp
+        if diff < -0.5:
+            diff += 1.0                 # they've crossed S/F, we haven't yet
+        if 0.0 < diff < best_diff:
+            best_diff = diff
+            best_idx  = i
+
+    if best_idx < 0 or best_diff > max_ldp_gap:
+        return -1, np.nan
+
+    return best_idx, best_diff * lap_time_s
+
+
+# ── OLS helper (spec §5.2) ────────────────────────────────────────────────────
+
 def ols_slope(laps, gaps):
-    """Linear regression slope of gap ~ lap. Returns None if < 2 points."""
+    """Linear regression slope of gap ~ lap. Returns None if < 2 clean points."""
     n = len(laps)
     if n < 2:
         return None
-    l, g = np.array(laps, dtype=float), np.array(gaps, dtype=float)
-    l_bar, g_bar = l.mean(), g.mean()
+    l, g  = np.array(laps, dtype=float), np.array(gaps, dtype=float)
+    l_bar = l.mean()
     denom = np.sum((l - l_bar) ** 2)
-    return float(np.sum((l - l_bar) * (g - g_bar)) / denom) if denom > 0 else None
+    return float(np.sum((l - l_bar) * (g - g.mean())) / denom) if denom > 0 else None
 
-# ── Step 5: Lap-by-lap streaming simulation ───────────────────────────────────
-# At each lap crossing we have all readings up to and including that lap.
-# This mirrors the Rust engine receiving ticks and crossing lap boundaries.
 
-all_laps  = sorted(df['Lap'].unique())
-lap_ends  = df.groupby('Lap').agg(
-    position=('PlayerCarPosition', 'last'),
-    session_time_end=('SessionTime', 'max'),
-    session_time_start=('SessionTime', 'min'),
-).to_dict('index')
+# ── Anchor sampler (spec §3.1) ────────────────────────────────────────────────
 
-print(f"\nLaps in session: {all_laps}")
-print("\n" + "─" * 80)
-print(f"{'Lap':>4}  {'State':^30}  {'Median slope':>14}  {'Qual.':>6}  {'Agree':>6}  {'Pos':>4}")
-print("─" * 80)
+class AnchorSampler:
+    """
+    Records the FIRST (gap_s, car_ahead_idx) crossing of each anchor bucket
+    per lap — this is the spatial anchor sample the spec uses for regression.
+    """
 
-events         = []
-state          = BattleState.IDLE
+    def __init__(self, n_buckets):
+        self.n       = n_buckets
+        self._seen   = set()    # (lap, bucket) already recorded this lap
+        self.samples = []       # (lap, bucket, gap_s, car_ahead_idx, is_clean)
+
+    def update(self, lap, ldp, gap_s, car_ahead_idx, is_clean):
+        """Feed one frame; returns True if a new anchor sample was captured."""
+        if np.isnan(gap_s) or car_ahead_idx < 0:
+            return False
+        bucket = int(ldp * self.n) % self.n
+        key    = (lap, bucket)
+        if key in self._seen:
+            return False
+        self._seen.add(key)
+        self.samples.append((lap, bucket, gap_s, car_ahead_idx, is_clean))
+        return True
+
+
+# ── Regression store (spec §5.1–5.2) ─────────────────────────────────────────
+
+class RegressionStore:
+    """
+    Identity-aware OLS regression over laps.
+    Each (bucket, car_ahead_idx) pair is a separate series, so a change of
+    opponent mid-race doesn't corrupt the slope signal.
+    """
+
+    def __init__(self):
+        self._data = {}   # (bucket, car_ahead_idx) → [(lap, gap_s), ...]
+
+    def ingest(self, sampler, max_lap=None):
+        """Rebuild from sampler.samples (called after each lap boundary).
+        max_lap: only include samples from laps <= max_lap to prevent
+        the first frame of the new lap contaminating the previous lap's regression.
+        """
+        self._data.clear()
+        for (lap, bucket, gap_s, car_idx, is_clean) in sampler.samples:
+            if not is_clean:
+                continue
+            if max_lap is not None and lap > max_lap:
+                continue
+            self._data.setdefault((bucket, car_idx), []).append((lap, gap_s))
+
+    def per_bucket_slopes(self, min_readings):
+        """
+        Returns {bucket: slope} — the most-negative qualifying slope per bucket
+        (if multiple opponents compete at the same bucket, take the closing one).
+        """
+        bucket_slopes = {}
+        for (bucket, _), points in self._data.items():
+            if len(points) < min_readings:
+                continue
+            laps, gaps = zip(*points)
+            s = ols_slope(list(laps), list(gaps))
+            if s is not None:
+                bucket_slopes.setdefault(bucket, []).append(s)
+        return {b: min(slopes) for b, slopes in bucket_slopes.items()}
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _fmt_t(t):
+    """Format session_time seconds as mm:ss string."""
+    m, s = divmod(int(t), 60)
+    return f"{m:02d}:{s:02d}"
+
+
+def _make_event(event_type, lap, session_time, **ctx):
+    return {
+        'event_type':        event_type,
+        'lap':               lap,
+        'session_time':      round(float(session_time), 1),
+        'narrative_context': ctx,
+    }
+
+
+# ── Pre-pass: determine anchor count from Lap 1 completed time ────────────────
+
+print("Loading JSONL stream…")
+with open(JSONL_PATH) as _fh:
+    raw_frames = [json.loads(line) for line in _fh]
+print(f"  {len(raw_frames)} frames loaded from {JSONL_PATH}")
+
+_pre_timer = LapTimer()
+for _f in raw_frames:
+    _pre_timer.update(_f['lap'], _f['session_time'])
+
+lap1_time_s  = _pre_timer.completed(1) or NURBURGRING_LAP_EST_S
+anchor_count = max(10, int(lap1_time_s / TARGET_CADENCE_S))
+print(f"  Lap 1 time: {lap1_time_s:.1f}s  →  {anchor_count} spatial anchors "
+      f"@ {TARGET_CADENCE_S}s cadence")
+print(f"  Synthesizing gap from car_idx_lap_dist_pct "
+      f"(replay-mode f2_time has only 2 unique values per lap — stale)")
+print(f"  Injecting yellow flags from known zones: {KNOWN_YELLOW_ZONES}")
+print()
+
+# ── Engine state ──────────────────────────────────────────────────────────────
+
+lap_timer_live = LapTimer()
+sampler        = AnchorSampler(anchor_count)
+regression     = RegressionStore()
+engine_state   = BattleState.IDLE
 prev_slope     = None
-prev_position  = lap_ends[all_laps[0]]['position']
+pit_laps       = set()
+all_events     = []
 
-# Storage for the plot — per-lap median slope and per-anchor heatmap
-median_slopes_log = {}       # lap → median_slope (or NaN)
-heatmap_data      = {}       # lap → {bucket → slope}
+# Frame-level streaming state
+prev_lap          = None
+prev_on_pit       = False
+prev_position     = None
+lap_pit_frames    = {}     # lap → frame count with on_pit_road == True
 
-for current_lap in all_laps:
-    if current_lap == all_laps[0]:
-        # First lap — no prior data to regress against
-        median_slopes_log[current_lap] = np.nan
-        heatmap_data[current_lap] = {}
-        prev_position = lap_ends[current_lap]['position']
+CLOSE_APPROACH_THRESH_S    = 1.5   # within 1.5 s → potential overtake window
+CLOSE_APPROACH_MIN_FRAMES  = 5     # must persist for ≥ 5 frames before firing
+
+consecutive_close = 0
+last_close_t      = -999.0
+tracking_car      = -1    # CarIdx of car currently in close-approach sequence
+
+# Logging for visualisation
+gap_log           = []    # (session_time, gap_s, car_ahead_idx, lap)
+heatmap_data      = {}    # lap → {bucket: slope}  after lap completion
+median_slopes_log = {}    # lap → median slope
+lap_end_positions = {}    # lap → final position recorded
+
+# ── Main streaming loop ───────────────────────────────────────────────────────
+
+print("═" * 78)
+print("  STREAMING NARRATIVE ENGINE  —  processing frame-by-frame")
+print("═" * 78)
+
+for frame in raw_frames:
+    lap    = frame['lap']
+    t      = frame['session_time']
+    pos    = frame['player_car_position']
+    on_pit = frame['on_pit_road']
+    ldp    = frame['lap_dist_pct']
+
+    if pos <= 0 or lap < 1:
+        prev_lap    = lap
+        prev_on_pit = on_pit
         continue
 
-    # All anchor readings available through the end of this lap
-    available = anchor_samples[anchor_samples['Lap'] <= current_lap]
+    lap_timer_live.update(lap, t)
+    lap_t = lap_timer_live.best_estimate()
 
-    # ── Tier 1: per-anchor slope (WHERE) ─────────────────────────────────────
-    per_anchor_slopes = {}
-    for bucket in range(anchor_count):
-        rows = available[available['AnchorBucket'] == bucket]
-        clean = rows[rows['is_clean'] == True]
-        if len(clean) < MIN_PUSH_READINGS:
-            continue
-        slope = ols_slope(clean['Lap'].tolist(), clean['GapSeconds'].tolist())
-        if slope is not None:
-            per_anchor_slopes[bucket] = slope
+    # ── Synthesize missing telemetry ──────────────────────────────────────────
+    synth_flags = synthesize_flags(lap, ldp)
+    is_clean    = (synth_flags & (YELLOW_WAVE | CAUTION)) == 0 and not on_pit
 
-    heatmap_data[current_lap] = per_anchor_slopes
+    if on_pit:
+        lap_pit_frames[lap] = lap_pit_frames.get(lap, 0) + 1
 
-    # ── Tier 2: aggregate classification (WHETHER) ───────────────────────────
-    slopes = list(per_anchor_slopes.values())
+    # ── Gap calculation (ldp-based, updates every frame) ──────────────────────
+    car_ahead_idx, gap_s = find_car_ahead_ldp(frame, lap_t)
 
-    if not slopes:
-        new_state = BattleState.TRACKING if current_lap not in pit_laps else BattleState.IDLE
-        median_slope = np.nan
-        anchors_agreeing = 0
-        hotspot_pct = None
+    sampler.update(lap, ldp, gap_s, car_ahead_idx, is_clean)
+
+    if not np.isnan(gap_s):
+        gap_log.append((t, gap_s, car_ahead_idx, lap))
+
+    # ── Frame-level events ────────────────────────────────────────────────────
+
+    # Pit entry / exit transitions
+    if on_pit and not prev_on_pit:
+        evt = _make_event('PIT_ENTRY', lap, t,
+                          position=int(pos),
+                          ai_prompt_hint=f"Enters pit lane at P{int(pos)}")
+        all_events.append(evt)
+        print(f"\n  [{_fmt_t(t)}  L{lap:02d}]  PIT_ENTRY   P{int(pos)}")
+
+    elif not on_pit and prev_on_pit:
+        evt = _make_event('PIT_EXIT', lap, t,
+                          position=int(pos),
+                          ai_prompt_hint=f"Rejoins from pit at P{int(pos)}")
+        all_events.append(evt)
+        print(f"  [{_fmt_t(t)}  L{lap:02d}]  PIT_EXIT    P{int(pos)}")
+
+    # Close approach: < CLOSE_APPROACH_THRESH_S for ≥ CLOSE_APPROACH_MIN_FRAMES
+    if not np.isnan(gap_s) and gap_s < CLOSE_APPROACH_THRESH_S:
+        consecutive_close += 1
+        if (consecutive_close >= CLOSE_APPROACH_MIN_FRAMES
+                and (t - last_close_t) > 30.0
+                and car_ahead_idx != tracking_car):
+            tracking_car = car_ahead_idx
+            last_close_t = t
+            car_pos_val  = frame['car_idx_position'][car_ahead_idx]
+            evt = _make_event('CLOSE_APPROACH', lap, t,
+                              car_ahead_idx=int(car_ahead_idx),
+                              gap_s=round(float(gap_s), 2),
+                              car_race_position=int(car_pos_val),
+                              ai_prompt_hint=(
+                                  f"Hunting CarIdx {car_ahead_idx} (P{int(car_pos_val)})"
+                                  f" — gap only {gap_s:.2f}s"))
+            all_events.append(evt)
+            print(f"  [{_fmt_t(t)}  L{lap:02d}]  CLOSE_APPROACH  "
+                  f"CarIdx {car_ahead_idx} (P{int(car_pos_val)}) @ {gap_s:.2f}s")
     else:
-        median_slope     = float(np.median(slopes))
-        anchors_agreeing = sum(1 for s in slopes if s < 0)
-        hotspot_bucket   = min(per_anchor_slopes, key=per_anchor_slopes.get)
-        hotspot_pct      = hotspot_bucket / anchor_count
+        consecutive_close = 0
+        if car_ahead_idx != tracking_car:
+            tracking_car = -1
 
-        if current_lap in pit_laps:
-            new_state = BattleState.IDLE
-        elif (median_slope <= ATTACK_SLOPE_THRESHOLD
-              and len(slopes) >= MIN_ATTACK_READINGS
-              and prev_slope is not None and median_slope < prev_slope):
-            new_state = BattleState.ATTACK_SETUP
-        elif median_slope <= PUSH_SLOPE_THRESHOLD and len(slopes) >= MIN_PUSH_READINGS:
-            new_state = BattleState.PUSH
-        elif len(slopes) >= 1:
-            new_state = BattleState.TRACKING
+    # ── Lap-crossing: regression + state classification ────────────────────────
+    if prev_lap is not None and lap != prev_lap:
+        done_lap   = prev_lap
+        pit_frames = lap_pit_frames.get(done_lap, 0)
+        if pit_frames >= PIT_LAP_FRAME_THRESH:
+            pit_laps.add(done_lap)
+
+        lap_t_done = lap_timer_live.completed(done_lap)
+        lap_end_positions[done_lap] = int(prev_position or pos)
+
+        print(f"\n  ──── LAP {done_lap} COMPLETE ────")
+
+        prev_lap_pos = lap_end_positions.get(done_lap - 1, int(pos))
+        pos_change   = prev_lap_pos - lap_end_positions[done_lap]
+        lap_t_str    = f"{lap_t_done:.1f}s" if lap_t_done else "?s"
+
+        evt = _make_event('LAP_COMPLETE', done_lap, t,
+                          lap_time_s=round(float(lap_t_done), 1) if lap_t_done else None,
+                          position=lap_end_positions[done_lap],
+                          pit_frames=pit_frames,
+                          ai_prompt_hint=(
+                              f"Lap {done_lap} complete in {lap_t_str} "
+                              f"at P{lap_end_positions[done_lap]}"
+                              + ("  [pit stop]" if done_lap in pit_laps else "")))
+        all_events.append(evt)
+        print(f"  [{_fmt_t(t)}  L{done_lap:02d}]  LAP_COMPLETE  "
+              f"time={lap_t_str}  "
+              f"P{prev_lap_pos}→P{lap_end_positions[done_lap]}"
+              + ("  [PIT]" if done_lap in pit_laps else ""))
+
+        if pos_change > 0 and done_lap not in pit_laps:
+            evt = _make_event('OVERTAKE', done_lap, t,
+                              position_from=prev_lap_pos,
+                              position_to=lap_end_positions[done_lap],
+                              positions_gained=pos_change,
+                              ai_prompt_hint=(
+                                  f"P{prev_lap_pos}→P{lap_end_positions[done_lap]}, "
+                                  f"+{pos_change} position{'s' if pos_change > 1 else ''}"))
+            all_events.append(evt)
+            print(f"  [{_fmt_t(t)}  L{done_lap:02d}]  OVERTAKE    "
+                  f"P{prev_lap_pos}→P{lap_end_positions[done_lap]}  (+{pos_change})")
+
+        elif pos_change < 0:
+            evt = _make_event('POSITION_LOST', done_lap, t,
+                              position_from=prev_lap_pos,
+                              position_to=lap_end_positions[done_lap],
+                              positions_lost=-pos_change)
+            all_events.append(evt)
+            print(f"  [{_fmt_t(t)}  L{done_lap:02d}]  POSITION_LOST  "
+                  f"P{prev_lap_pos}→P{lap_end_positions[done_lap]}")
+
+        # Rebuild regression from all clean samples so far (spec §5.1)
+        # Pass max_lap=done_lap so the first frame of the new lap
+        # (already in the sampler) doesn't contaminate this regression.
+        regression.ingest(sampler, max_lap=done_lap)
+        per_anchor = regression.per_bucket_slopes(min_readings=MIN_PUSH_READINGS)
+        slopes     = list(per_anchor.values())
+        new_state  = BattleState.IDLE
+        slope_info = {}
+
+        if done_lap not in pit_laps and slopes:
+            med_slope   = float(np.median(slopes))
+            n_agree     = sum(1 for s in slopes if s < 0)
+            hot_bucket  = min(per_anchor, key=per_anchor.get)
+            hotspot_pct = hot_bucket / anchor_count
+            slope_info  = {
+                'median_slope':         round(med_slope, 4),
+                'anchors_qualifying':   len(slopes),
+                'anchors_agreeing':     n_agree,
+                'hotspot_lap_dist_pct': round(hotspot_pct, 3),
+            }
+            if (med_slope <= ATTACK_SLOPE_THRESHOLD
+                    and len(slopes) >= MIN_ATTACK_READINGS
+                    and prev_slope is not None and med_slope < prev_slope):
+                new_state = BattleState.ATTACK_SETUP
+            elif med_slope <= PUSH_SLOPE_THRESHOLD and len(slopes) >= MIN_PUSH_READINGS:
+                new_state = BattleState.PUSH
+            elif slopes:
+                new_state = BattleState.TRACKING
+
+        heatmap_data[done_lap]      = per_anchor
+        median_slopes_log[done_lap] = slope_info.get('median_slope', np.nan)
+
+        # State-transition events
+        if new_state != engine_state:
+            if new_state in (BattleState.PUSH, BattleState.ATTACK_SETUP):
+                hint = (
+                    f"Closing at {abs(slope_info['median_slope']):.3f}s/lap "
+                    f"({slope_info['anchors_agreeing']}/{slope_info['anchors_qualifying']} "
+                    f"anchors agree), hotspot @ {slope_info['hotspot_lap_dist_pct']:.0%}"
+                ) if slope_info else ""
+                evt = _make_event(new_state.name, done_lap, t,
+                                  **slope_info, ai_prompt_hint=hint)
+                all_events.append(evt)
+                print(f"  [{_fmt_t(t)}  L{done_lap:02d}]  {new_state.name}  "
+                      f"slope={slope_info.get('median_slope', 0):+.4f}s/lap  "
+                      f"n={slope_info.get('anchors_qualifying', 0)}  "
+                      f"hotspot@{slope_info.get('hotspot_lap_dist_pct', 0):.0%}")
+
+        if slopes:
+            s   = slope_info.get('median_slope', np.nan)
+            n_q = slope_info.get('anchors_qualifying', 0)
+            n_a = slope_info.get('anchors_agreeing', 0)
+            print(f"       regression: slope={s:+.4f}s/lap  "
+                  f"n={n_q}  agree={n_a}/{n_q}  → {new_state.name}")
         else:
-            new_state = BattleState.IDLE
+            print(f"       regression: n/a  → {new_state.name}")
 
-    median_slopes_log[current_lap] = median_slope
+        engine_state = new_state
+        if slope_info:
+            prev_slope = slope_info['median_slope']
 
-    # ── Overtake detection (spec §2) ─────────────────────────────────────────
-    current_position = lap_ends[current_lap]['position']
-    t_start          = lap_ends[current_lap]['session_time_start']
-    positions_gained = (prev_position - current_position) if prev_position else 0
+    prev_lap      = lap
+    prev_on_pit   = on_pit
+    prev_position = pos
 
-    if positions_gained > 0:
-        events.append({
-            'lap': current_lap,
-            'session_time': round(t_start, 1),
-            'event_type': 'OVERTAKE',
-            'narrative_context': {
-                'position_from': int(prev_position),
-                'position_to':   int(current_position),
-                'positions_gained': int(positions_gained),
-                'ai_prompt_hint': (
-                    f"Driver moved from P{int(prev_position)} to P{int(current_position)}, "
-                    f"gaining {positions_gained} position{'s' if positions_gained > 1 else ''}"
-                ),
-            }
-        })
+# ── Full event timeline ───────────────────────────────────────────────────────
 
-    # ── State-change events ───────────────────────────────────────────────────
-    if new_state != state and new_state in (BattleState.PUSH, BattleState.ATTACK_SETUP):
-        events.append({
-            'lap': current_lap,
-            'session_time': round(t_start, 1),
-            'event_type': new_state.name,
-            'narrative_context': {
-                'closing_rate_per_lap_s': round(median_slope, 4),
-                'anchors_qualifying':     len(slopes),
-                'anchors_agreeing':       anchors_agreeing,
-                'hotspot_lap_dist_pct':   round(hotspot_pct, 3) if hotspot_pct is not None else None,
-                'ai_prompt_hint': (
-                    f"Driver closing at {abs(median_slope):.3f}s/lap "
-                    f"({anchors_agreeing}/{len(slopes)} anchors agree), "
-                    f"hotspot at {hotspot_pct:.0%} track position"
-                ) if hotspot_pct is not None else "",
-            }
-        })
-    elif new_state != state:
-        events.append({
-            'lap': current_lap,
-            'session_time': round(t_start, 1),
-            'event_type': f'STATE_{new_state.name}',
-            'narrative_context': {
-                'median_slope':       round(median_slope, 4) if not np.isnan(median_slope) else None,
-                'anchors_qualifying': len(slopes),
-            }
-        })
+def _json_default(obj):
+    if hasattr(obj, 'item'):
+        return obj.item()
+    raise TypeError(f'Object of type {type(obj).__name__} is not JSON serialisable')
 
-    slope_str = f"{median_slope:+.4f}" if not np.isnan(median_slope) else "    n/a"
-    pit_tag   = " [PIT]" if current_lap in pit_laps else ""
-    pos_tag   = f"P{int(prev_position)}→P{int(current_position)}" if positions_gained > 0 else f"P{int(current_position)}"
-    print(f"{current_lap:>4}  {new_state.name + pit_tag:^30}  {slope_str:>14} s/lap"
-          f"  {len(slopes):>6}  {anchors_agreeing if slopes else 0:>6}  {pos_tag:>6}")
 
-    state          = new_state
-    prev_slope     = median_slope if not np.isnan(median_slope) else prev_slope
-    prev_position  = current_position
-
-# ── Console narrative output ───────────────────────────────────────────────────
-print("\n" + "=" * 70)
-print("  RACE NARRATIVE TIMELINE")
-print("=" * 70)
-for evt in events:
+print("\n" + "═" * 78)
+print("  FULL RACE EVENT TIMELINE")
+print("═" * 78)
+for evt in all_events:
     ctx  = evt['narrative_context']
     hint = ctx.get('ai_prompt_hint', '')
-    print(f"\n  [Lap {evt['lap']:2d}  t={evt['session_time']:.0f}s]  {evt['event_type']}")
+    print(f"\n  [{_fmt_t(evt['session_time'])}  L{evt['lap']:02d}]  {evt['event_type']}")
     for k, v in ctx.items():
         if k != 'ai_prompt_hint' and v is not None:
             print(f"    {k}: {v}")
@@ -270,145 +503,145 @@ for evt in events:
         print(f"    → \"{hint}\"")
 
 print("\n\nFull event JSON:")
-def _json_default(obj):
-    """Convert numpy scalars to native Python types for JSON serialisation."""
-    if hasattr(obj, 'item'):
-        return obj.item()
-    raise TypeError(f'Object of type {type(obj).__name__} is not JSON serialisable')
+print(json.dumps(all_events, indent=2, default=_json_default))
 
-print(json.dumps(events, indent=2, default=_json_default))
+# ── Visualisation: 4-panel plot ───────────────────────────────────────────────
 
-# ── Visualisation: 4-panel validation plot ────────────────────────────────────
-fig, axes = plt.subplots(4, 1, figsize=(18, 22), gridspec_kw={'height_ratios': [3, 2, 2, 1.5]})
+fig, axes = plt.subplots(4, 1, figsize=(18, 22),
+                         gridspec_kw={'height_ratios': [3, 2, 2, 1.5]})
 fig.suptitle(
     'Prototype Narrative Engine — Nürburgring Race\n'
-    'Does the engine see what you know happened?',
-    fontsize=14, fontweight='bold', y=0.99
+    'Streaming simulation: events emitted at the moment the engine detects them',
+    fontsize=13, fontweight='bold', y=0.99,
 )
 
-lap_colours = {1: '#e74c3c', 2: '#3498db', 3: '#2ecc71', 4: '#f39c12', 5: '#9b59b6'}
-event_colours = {
-    'OVERTAKE': '#e74c3c',
-    'PUSH': '#f39c12',
-    'ATTACK_SETUP': '#8e44ad',
+OPPONENT_COLOURS = {16: '#e74c3c', 24: '#3498db', 31: '#2ecc71', 15: '#f39c12'}
+EVENT_COLOURS    = {
+    'OVERTAKE':       '#e74c3c',
+    'PUSH':           '#f39c12',
+    'ATTACK_SETUP':   '#8e44ad',
+    'CLOSE_APPROACH': '#00bcd4',
+    'PIT_ENTRY':      '#795548',
+    'PIT_EXIT':       '#4caf50',
 }
 
-# ─ Panel 1: CarDistAhead timeline with event markers ─────────────────────────
+# ─ Panel 1: Gap timeline ──────────────────────────────────────────────────────
 ax1 = axes[0]
-for lap in all_laps:
-    ldf = df[df['Lap'] == lap]
-    ax1.plot(ldf['SessionTime'], ldf['CarDistAhead'],
-             color=lap_colours.get(lap, '#aaa'), alpha=0.75, linewidth=0.7,
-             label=f'Lap {lap}')
+if gap_log:
+    arr        = np.array([(t, g, c, l) for t, g, c, l in gap_log], dtype=float)
+    ts, gs, cs = arr[:, 0], arr[:, 1], arr[:, 2]
+    for car_idx in sorted(set(int(c) for c in cs)):
+        mask   = cs == car_idx
+        colour = OPPONENT_COLOURS.get(car_idx, '#999999')
+        ax1.scatter(ts[mask], gs[mask], s=1.5, color=colour, alpha=0.6,
+                    label=f'CarIdx {car_idx}')
 
-ax1.axhline(BATTLE_THRESHOLD_M, color='orange', linestyle='--', linewidth=1.2,
-            label=f'Battle threshold ({BATTLE_THRESHOLD_M:.0f}m)')
+ax1.axhline(MAX_BATTLE_GAP_S, color='grey', linestyle=':', linewidth=1, alpha=0.5)
+ax1.axhline(CLOSE_APPROACH_THRESH_S, color='orange', linestyle='--', linewidth=1,
+            label=f'Close approach ({CLOSE_APPROACH_THRESH_S}s)')
 
-# Yellow zone spans
-for (lap, p0, p1) in YELLOW_ZONES:
-    lap_df = df[df['Lap'] == lap]
-    if len(lap_df) == 0:
-        continue
-    t0 = lap_df[lap_df['LapDistPct'].between(p0 - 0.01, p0 + 0.01)]['SessionTime'].mean()
-    t1 = lap_df[lap_df['LapDistPct'].between(p1 - 0.01, p1 + 0.01)]['SessionTime'].mean()
-    if not (np.isnan(t0) or np.isnan(t1)):
-        ax1.axvspan(t0, t1, alpha=0.12, color='yellow', label=f'Yellow (Lap {lap})')
+for (lap_y, p0, p1) in KNOWN_YELLOW_ZONES:
+    ys_ts = [f['session_time'] for f in raw_frames
+             if f['lap'] == lap_y and p0 <= f['lap_dist_pct'] <= p1]
+    if ys_ts:
+        ax1.axvspan(min(ys_ts), max(ys_ts), alpha=0.15, color='yellow',
+                    label=f'Synthesized yellow (L{lap_y})')
 
-for evt in events:
-    et = evt['event_type']
-    base = next((k for k in event_colours if k in et), None)
-    if base:
-        col = event_colours[base]
-        ax1.axvline(evt['session_time'], color=col, linestyle=':', linewidth=1.5, alpha=0.9)
-        ax1.text(evt['session_time'] + 2, 290, et.replace('STATE_', ''),
-                 rotation=90, fontsize=7, color=col, va='top')
+for evt in all_events:
+    col = next((EVENT_COLOURS[k] for k in EVENT_COLOURS if k in evt['event_type']), None)
+    if col:
+        ax1.axvline(evt['session_time'], color=col, linestyle=':', linewidth=1.5, alpha=0.8)
+        ax1.text(evt['session_time'] + 3, MAX_BATTLE_GAP_S * 0.92,
+                 evt['event_type'], rotation=90, fontsize=6.5, color=col, va='top')
 
-ax1.set_ylim(0, 320)
-ax1.set_ylabel('CarDistAhead (m)')
-ax1.set_title('Gap to Car Ahead — narrative event markers overlaid')
-ax1.legend(loc='upper right', fontsize=7, ncol=3)
+ax1.set_ylim(0, MAX_BATTLE_GAP_S + 0.5)
+ax1.set_ylabel('Gap to car ahead (s)')
+ax1.set_title('Real-time gap to nearest car ahead (ldp-based) — events at detection moment')
+ax1.legend(loc='upper right', fontsize=7, ncol=3, markerscale=4)
 
-# ─ Panel 2: Per-anchor slope heatmap (WHERE) ─────────────────────────────────
+# ─ Panel 2: Per-anchor slope heatmap (WHERE) ──────────────────────────────────
 ax2 = axes[1]
-lap_list = [l for l in all_laps if l != all_laps[0]]
-heat = np.full((len(lap_list), anchor_count), np.nan)
-for i, lap in enumerate(lap_list):
-    for bucket, slope in heatmap_data.get(lap, {}).items():
-        heat[i, bucket] = slope
+lap_list = sorted(heatmap_data.keys())
+if lap_list:
+    heat = np.full((len(lap_list), anchor_count), np.nan)
+    for i, lap in enumerate(lap_list):
+        for bucket, slope in heatmap_data[lap].items():
+            heat[i, bucket] = slope
+    im = ax2.imshow(heat, aspect='auto', cmap='RdYlGn', vmin=-0.25, vmax=0.25,
+                    extent=[0, 1, len(lap_list) + 0.5, 0.5])
+    ax2.set_yticks(range(1, len(lap_list) + 1))
+    ax2.set_yticklabels([f'Lap {l}' for l in lap_list])
+    plt.colorbar(im, ax=ax2, label='slope (s/lap)', shrink=0.7)
+    for (lap_y, p0, p1) in KNOWN_YELLOW_ZONES:
+        if lap_y in lap_list:
+            ax2.axvspan(p0, p1, alpha=0.2, color='yellow')
 
-vmax = 0.25
-im = ax2.imshow(heat, aspect='auto', cmap='RdYlGn', vmin=-vmax, vmax=vmax,
-                extent=[0, 1, len(lap_list) + 0.5, 0.5])
 ax2.set_xlabel('Track position (LapDistPct)')
 ax2.set_ylabel('After lap')
-ax2.set_yticks(range(1, len(lap_list) + 1))
-ax2.set_yticklabels([f'Lap {l}' for l in lap_list])
-ax2.set_title('Per-Anchor Slope Heatmap — WHERE is the gap closing? (Green = closing, Red = opening, Grey = insufficient data)')
-plt.colorbar(im, ax=ax2, label='slope (s/lap)', shrink=0.7, orientation='vertical')
+ax2.set_title('WHERE — per-anchor OLS slope (green=closing, red=opening, grey=no data)')
 
-# Mark yellow zones on heatmap x-axis
-for (lap, p0, p1) in YELLOW_ZONES:
-    ax2.axvspan(p0, p1, alpha=0.15, color='yellow')
-
-# ─ Panel 3: Median slope bar chart (WHETHER) ─────────────────────────────────
+# ─ Panel 3: Median slope bar chart (WHETHER) ──────────────────────────────────
 ax3 = axes[2]
-laps_x    = list(median_slopes_log.keys())
-slopes_y  = [median_slopes_log[l] for l in laps_x]
-bar_cols  = []
-for l, s in zip(laps_x, slopes_y):
+m_laps   = list(median_slopes_log.keys())
+m_slopes = [float(median_slopes_log[l])
+            if not np.isnan(float(median_slopes_log[l])) else 0.0
+            for l in m_laps]
+bar_cols = []
+for l, s in zip(m_laps, [median_slopes_log[l] for l in m_laps]):
     if l in pit_laps:
-        bar_cols.append('#aaa')
-    elif np.isnan(s):
-        bar_cols.append('#ddd')
-    elif s <= ATTACK_SLOPE_THRESHOLD:
+        bar_cols.append('#aaaaaa')
+    elif np.isnan(float(s)):
+        bar_cols.append('#dddddd')
+    elif float(s) <= ATTACK_SLOPE_THRESHOLD:
         bar_cols.append('#8e44ad')
-    elif s <= PUSH_SLOPE_THRESHOLD:
+    elif float(s) <= PUSH_SLOPE_THRESHOLD:
         bar_cols.append('#f39c12')
     else:
         bar_cols.append('#3498db')
 
-ax3.bar(laps_x, [0 if np.isnan(s) else s for s in slopes_y], color=bar_cols, alpha=0.8, width=0.6)
-ax3.axhline(PUSH_SLOPE_THRESHOLD,   color='#f39c12', linestyle='--', linewidth=1.5,
+ax3.bar(m_laps, m_slopes, color=bar_cols, alpha=0.85, width=0.6)
+ax3.axhline(PUSH_SLOPE_THRESHOLD, color='#f39c12', linestyle='--', linewidth=1.5,
             label=f'PUSH threshold ({PUSH_SLOPE_THRESHOLD} s/lap)')
 ax3.axhline(ATTACK_SLOPE_THRESHOLD, color='#8e44ad', linestyle='--', linewidth=1.5,
             label=f'ATTACK threshold ({ATTACK_SLOPE_THRESHOLD} s/lap)')
 ax3.axhline(0, color='black', linewidth=0.8)
-
-# Annotate qualifying anchor count
-for lap, slope in zip(laps_x, slopes_y):
-    n = len(heatmap_data.get(lap, {}))
-    if n > 0 and not np.isnan(slope):
-        ax3.text(lap, slope - 0.004, f'n={n}', ha='center', va='top', fontsize=8)
+for l, s in zip(m_laps, [median_slopes_log[l] for l in m_laps]):
+    n = len(heatmap_data.get(l, {}))
+    if n > 0 and not np.isnan(float(s)):
+        ax3.text(l, float(s) - 0.005, f'n={n}', ha='center', va='top', fontsize=8)
 
 ax3.set_xlabel('Lap')
 ax3.set_ylabel('Median slope (s/lap)')
-ax3.set_title('Two-Tier Aggregate — WHETHER to classify (orange=PUSH, purple=ATTACK_SETUP, grey=pit)')
+ax3.set_title('WHETHER — aggregate classification '
+              '(orange=PUSH, purple=ATTACK_SETUP, blue=TRACKING, grey=pit/no data)')
 ax3.legend(fontsize=8)
-ax3.set_xticks(laps_x)
+ax3.set_xticks(m_laps)
 
-# ─ Panel 4: Position timeline ────────────────────────────────────────────────
+# ─ Panel 4: Position timeline ─────────────────────────────────────────────────
 ax4 = axes[3]
-pos_laps = list(lap_ends.keys())
-pos_vals = [lap_ends[l]['position'] for l in pos_laps]
-ax4.step(pos_laps, pos_vals, where='post', color='#2c3e50', linewidth=2, marker='o', markersize=7)
-ax4.invert_yaxis()
+pos_laps = sorted(lap_end_positions.keys())
+pos_vals = [lap_end_positions[l] for l in pos_laps]
+if pos_laps:
+    ax4.step(pos_laps, pos_vals, where='post', color='#2c3e50', linewidth=2,
+             marker='o', markersize=7)
+    ax4.invert_yaxis()
+    ax4.set_xticks(pos_laps)
+    for evt in all_events:
+        if evt['event_type'] == 'OVERTAKE':
+            ctx = evt['narrative_context']
+            ax4.annotate(
+                f"+{ctx['positions_gained']}",
+                xy=(evt['lap'], ctx['position_to']),
+                xytext=(evt['lap'] + 0.2, ctx['position_to'] + 1.5),
+                fontsize=9, color='#e74c3c',
+                arrowprops=dict(arrowstyle='->', color='#e74c3c', lw=1.2),
+            )
+
 ax4.set_xlabel('Lap')
 ax4.set_ylabel('Position')
-ax4.set_title('Race Position — overtakes only visible at lap crossings (engine limitation)')
-ax4.set_xticks(pos_laps)
-
-for evt in events:
-    if 'OVERTAKE' in evt['event_type']:
-        ctx = evt['narrative_context']
-        y = ctx['position_to']
-        ax4.annotate(
-            f"P{ctx['position_from']}→P{ctx['position_to']}\n(+{ctx['positions_gained']})",
-            xy=(evt['lap'], y), xytext=(evt['lap'] + 0.15, y + 1.5),
-            fontsize=8, color='#e74c3c',
-            arrowprops=dict(arrowstyle='->', color='#e74c3c', lw=1.2)
-        )
+ax4.set_title('Race position (snaps at lap crossings — engine limitation in replay mode)')
 
 plt.tight_layout(rect=[0, 0, 1, 0.98])
 out_path = 'scripts/prototype_narrative.png'
 plt.savefig(out_path, dpi=150, bbox_inches='tight')
-print(f"\nSaved → {out_path}")
+print(f"\nSaved plot → {out_path}")
