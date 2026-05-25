@@ -29,6 +29,9 @@ impl AnchorSampler {
         }
     }
 
+    /// Number of spatial buckets this sampler was configured with.
+    pub fn n_buckets(&self) -> usize { self.n_buckets }
+
     /// Feed one frame. Returns `true` if a new anchor sample was captured.
     ///
     /// `ldp` is `lap_dist_pct` (0.0–1.0). The bucket key is derived from

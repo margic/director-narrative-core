@@ -77,6 +77,7 @@ impl RegressionStore {
 
         car_slopes
             .into_iter()
+            .filter(|(_, slopes)| slopes.len() >= min_readings)
             .map(|(car_idx, mut slopes)| {
                 let n_buckets = slopes.len();
                 let n_agree   = slopes.iter().filter(|&&s| s < 0.0).count();

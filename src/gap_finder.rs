@@ -65,7 +65,7 @@ pub fn find_cars_behind(frame: &TelemetryFrame, lap_time_s: f32, n: usize) -> Ve
             if position <= player_pos      { return None; } // not behind in race order
 
             let mut diff = player_ldp - car_ldp;
-            if diff < -0.5 { diff += 1.0; } // S/F line wrap
+            if diff < 0.0 { diff += 1.0; } // S/F line wrap
 
             let gap_s = diff * lap_time_s;
             if gap_s > MAX_BATTLE_GAP_S    { return None; }
