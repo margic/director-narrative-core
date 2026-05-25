@@ -1,6 +1,7 @@
 pub mod anchor_sampler;
 pub mod battle_state;
 pub mod engine;
+pub mod gap_finder;
 pub mod lap_timer;
 pub mod race_event;
 pub mod regression_store;
