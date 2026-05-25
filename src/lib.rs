@@ -5,4 +5,5 @@ pub mod gap_finder;
 pub mod lap_timer;
 pub mod race_event;
 pub mod regression_store;
+pub mod replay;
 pub mod telemetry_frame;

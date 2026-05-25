@@ -1,5 +1,6 @@
 /// A single decoded telemetry frame from the iRacing session stream.
-/// Serde `Deserialize` impl added in issue #9.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct TelemetryFrame {
     pub lap:                  u8,
     pub session_time:         f32,
