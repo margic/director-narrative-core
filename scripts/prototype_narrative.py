@@ -48,6 +48,7 @@ MIN_ATTACK_READINGS    = 3
 PUSH_SLOPE_THRESHOLD   = -0.05      # s/lap — sustained closing
 ATTACK_SLOPE_THRESHOLD = -0.10      # s/lap — accelerating closing
 MAX_BATTLE_GAP_S       = 5.0        # only track car ahead if within 5 s
+SCAN_FIELD_POSITIONS   = 5          # how many cars ahead AND behind to watch
 PIT_LAP_FRAME_THRESH   = 20         # frames with on_pit_road==True → pit lap
 
 # SessionFlags bitmasks (spec §6)
@@ -100,12 +101,11 @@ class LapTimer:
         return self._times.get(lap)
 
 
-def find_car_ahead_ldp(frame, lap_time_s):
+def find_cars_ahead_ldp(frame, lap_time_s, n=SCAN_FIELD_POSITIONS):
     """
-    Find the closest car physically ahead using car_idx_lap_dist_pct.
-    Returns (car_ahead_idx, gap_seconds) or (-1, nan).
-    Converts ldp fraction → seconds using lap_time_s estimate.
-    Handles wrap-around at the start/finish line.
+    Find the N closest cars physically ahead using car_idx_lap_dist_pct.
+    Returns a list of (car_idx, gap_seconds) sorted by ascending gap (nearest first).
+    Covers slower lapped traffic and cars within striking distance ahead.
     """
     player_idx = frame['player_car_idx']
     player_pos = frame['player_car_position']
@@ -114,12 +114,11 @@ def find_car_ahead_ldp(frame, lap_time_s):
     pit_arr    = frame['car_idx_on_pit_road']
 
     if player_pos <= 1:
-        return -1, np.nan
+        return []
 
     player_ldp  = ldp_arr[player_idx]
-    best_idx    = -1
-    best_diff   = np.inf
-    max_ldp_gap = MAX_BATTLE_GAP_S / lap_time_s   # 5 s → ldp fraction
+    candidates  = []
+    max_ldp_gap = MAX_BATTLE_GAP_S / lap_time_s
 
     for i in range(len(ldp_arr)):
         if i == player_idx:
@@ -132,22 +131,19 @@ def find_car_ahead_ldp(frame, lap_time_s):
         diff = ldp - player_ldp
         if diff < -0.5:
             diff += 1.0                 # they've crossed S/F, we haven't yet
-        if 0.0 < diff < best_diff:
-            best_diff = diff
-            best_idx  = i
+        if 0.0 < diff <= max_ldp_gap:
+            candidates.append((diff, i))
 
-    if best_idx < 0 or best_diff > max_ldp_gap:
-        return -1, np.nan
-
-    return best_idx, best_diff * lap_time_s
+    candidates.sort()
+    return [(idx, diff * lap_time_s) for diff, idx in candidates[:n]]
 
 
-def find_car_behind_ldp(frame, lap_time_s):
+def find_cars_behind_ldp(frame, lap_time_s, n=SCAN_FIELD_POSITIONS):
     """
-    Find the closest car physically behind using car_idx_lap_dist_pct.
-    Returns (car_behind_idx, gap_seconds) or (-1, nan).
+    Find the N closest cars physically behind using car_idx_lap_dist_pct.
+    Returns a list of (car_idx, gap_seconds) sorted by ascending gap (nearest first).
+    Covers faster class cars charging through and cars closing in on us.
     gap_seconds is the gap from that car TO US (positive = they are behind us).
-    A decreasing gap over laps means they are closing — defensive pressure.
     """
     player_idx = frame['player_car_idx']
     player_pos = frame['player_car_position']
@@ -156,11 +152,10 @@ def find_car_behind_ldp(frame, lap_time_s):
     pit_arr    = frame['car_idx_on_pit_road']
 
     if player_pos <= 0:
-        return -1, np.nan
+        return []
 
     player_ldp  = ldp_arr[player_idx]
-    best_idx    = -1
-    best_diff   = np.inf
+    candidates  = []
     max_ldp_gap = MAX_BATTLE_GAP_S / lap_time_s
 
     for i in range(len(ldp_arr)):
@@ -174,14 +169,11 @@ def find_car_behind_ldp(frame, lap_time_s):
         diff = player_ldp - ldp         # positive = we are ahead of them
         if diff < -0.5:
             diff += 1.0                 # they've crossed S/F, we haven't yet
-        if 0.0 < diff < best_diff:
-            best_diff = diff
-            best_idx  = i
+        if 0.0 < diff <= max_ldp_gap:
+            candidates.append((diff, i))
 
-    if best_idx < 0 or best_diff > max_ldp_gap:
-        return -1, np.nan
-
-    return best_idx, best_diff * lap_time_s
+    candidates.sort()
+    return [(idx, diff * lap_time_s) for diff, idx in candidates[:n]]
 
 
 # ── OLS helper (spec §5.2) ────────────────────────────────────────────────────
@@ -207,19 +199,19 @@ class AnchorSampler:
 
     def __init__(self, n_buckets):
         self.n       = n_buckets
-        self._seen   = set()    # (lap, bucket) already recorded this lap
-        self.samples = []       # (lap, bucket, gap_s, car_ahead_idx, is_clean)
+        self._seen   = set()    # (lap, bucket, car_idx) — per-car, so multiple cars don't collide
+        self.samples = []       # (lap, bucket, gap_s, car_idx, is_clean)
 
-    def update(self, lap, ldp, gap_s, car_ahead_idx, is_clean):
+    def update(self, lap, ldp, gap_s, car_idx, is_clean):
         """Feed one frame; returns True if a new anchor sample was captured."""
-        if np.isnan(gap_s) or car_ahead_idx < 0:
+        if np.isnan(gap_s) or car_idx < 0:
             return False
         bucket = int(ldp * self.n) % self.n
-        key    = (lap, bucket)
+        key    = (lap, bucket, car_idx)   # per-car key: each car tracked independently
         if key in self._seen:
             return False
         self._seen.add(key)
-        self.samples.append((lap, bucket, gap_s, car_ahead_idx, is_clean))
+        self.samples.append((lap, bucket, gap_s, car_idx, is_clean))
         return True
 
 
@@ -262,6 +254,33 @@ class RegressionStore:
             if s is not None:
                 bucket_slopes.setdefault(bucket, []).append(s)
         return {b: min(slopes) for b, slopes in bucket_slopes.items()}
+
+    def per_car_median_slopes(self, min_readings):
+        """
+        Per-car two-tier analysis: for each tracked opponent compute the median
+        of its per-bucket OLS slopes.  Returns:
+          {car_idx: {'median': float, 'n_buckets': int, 'n_agree': int}}
+        Only cars with >= min_readings qualifying buckets are included.
+        Use this instead of the cross-car median when multiple opponents are
+        tracked simultaneously — avoids dilution from cars that are not closing.
+        """
+        car_bucket_slopes = {}   # car_idx → [slope at each qualifying bucket]
+        for (bucket, car_idx), points in self._data.items():
+            if len(points) < min_readings:
+                continue
+            laps, gaps = zip(*points)
+            s = ols_slope(list(laps), list(gaps))
+            if s is not None:
+                car_bucket_slopes.setdefault(car_idx, []).append(s)
+        result = {}
+        for car_idx, bslopes in car_bucket_slopes.items():
+            if len(bslopes) >= min_readings:
+                result[car_idx] = {
+                    'median':    float(np.median(bslopes)),
+                    'n_buckets': len(bslopes),
+                    'n_agree':   sum(1 for s in bslopes if s < 0),
+                }
+        return result
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -366,12 +385,18 @@ for frame in raw_frames:
     if on_pit:
         lap_pit_frames[lap] = lap_pit_frames.get(lap, 0) + 1
 
-    # ── Gap calculation (ldp-based, updates every frame) ──────────────────────
-    car_ahead_idx,  gap_s     = find_car_ahead_ldp(frame, lap_t)
-    car_behind_idx, gap_beh_s = find_car_behind_ldp(frame, lap_t)
+    # ── Gap calculation: scan SCAN_FIELD_POSITIONS cars ahead and behind ────────
+    cars_ahead  = find_cars_ahead_ldp(frame, lap_t)
+    cars_behind = find_cars_behind_ldp(frame, lap_t)
 
-    sampler.update(lap, ldp, gap_s, car_ahead_idx, is_clean)
-    sampler_behind.update(lap, ldp, gap_beh_s, car_behind_idx, is_clean)
+    for (ci, gs) in cars_ahead:
+        sampler.update(lap, ldp, gs, ci, is_clean)
+    for (ci, gs) in cars_behind:
+        sampler_behind.update(lap, ldp, gs, ci, is_clean)
+
+    # Nearest car drives frame-level events; regression sees all N
+    car_ahead_idx,  gap_s     = cars_ahead[0]  if cars_ahead  else (-1, np.nan)
+    car_behind_idx, gap_beh_s = cars_behind[0] if cars_behind else (-1, np.nan)
 
     if not np.isnan(gap_s):
         gap_log.append((t, gap_s, car_ahead_idx, lap))
@@ -496,29 +521,32 @@ for frame in raw_frames:
         # Pass max_lap=done_lap so the first frame of the new lap
         # (already in the sampler) doesn't contaminate this regression.
         regression.ingest(sampler, max_lap=done_lap)
-        per_anchor = regression.per_bucket_slopes(min_readings=MIN_PUSH_READINGS)
-        slopes     = list(per_anchor.values())
-        new_state  = BattleState.IDLE
-        slope_info = {}
+        per_anchor   = regression.per_bucket_slopes(min_readings=MIN_PUSH_READINGS)   # for heatmap
+        car_medians  = regression.per_car_median_slopes(min_readings=MIN_PUSH_READINGS)
+        new_state    = BattleState.IDLE
+        slope_info   = {}
 
-        if done_lap not in pit_laps and slopes:
-            med_slope   = float(np.median(slopes))
-            n_agree     = sum(1 for s in slopes if s < 0)
-            hot_bucket  = min(per_anchor, key=per_anchor.get)
-            hotspot_pct = hot_bucket / anchor_count
+        if done_lap not in pit_laps and car_medians:
+            # Most threatening car: lowest (most negative) per-car median slope
+            threat_car  = min(car_medians, key=lambda c: car_medians[c]['median'])
+            tinfo       = car_medians[threat_car]
+            med_slope   = tinfo['median']
+            hot_bucket  = min(per_anchor, key=per_anchor.get) if per_anchor else 0
+            hotspot_pct = hot_bucket / anchor_count if per_anchor else 0.0
             slope_info  = {
+                'car_ahead_idx':        int(threat_car),
                 'median_slope':         round(med_slope, 4),
-                'anchors_qualifying':   len(slopes),
-                'anchors_agreeing':     n_agree,
+                'anchors_qualifying':   tinfo['n_buckets'],
+                'anchors_agreeing':     tinfo['n_agree'],
                 'hotspot_lap_dist_pct': round(hotspot_pct, 3),
             }
             if (med_slope <= ATTACK_SLOPE_THRESHOLD
-                    and len(slopes) >= MIN_ATTACK_READINGS
+                    and tinfo['n_buckets'] >= MIN_ATTACK_READINGS
                     and prev_slope is not None and med_slope < prev_slope):
                 new_state = BattleState.ATTACK_SETUP
-            elif med_slope <= PUSH_SLOPE_THRESHOLD and len(slopes) >= MIN_PUSH_READINGS:
+            elif med_slope <= PUSH_SLOPE_THRESHOLD and tinfo['n_buckets'] >= MIN_PUSH_READINGS:
                 new_state = BattleState.PUSH
-            elif slopes:
+            elif car_medians:
                 new_state = BattleState.TRACKING
 
         heatmap_data[done_lap]      = per_anchor
@@ -528,7 +556,8 @@ for frame in raw_frames:
         if new_state != engine_state:
             if new_state in (BattleState.PUSH, BattleState.ATTACK_SETUP):
                 hint = (
-                    f"Closing at {abs(slope_info['median_slope']):.3f}s/lap "
+                    f"CarIdx {slope_info['car_ahead_idx']} — "
+                    f"closing at {abs(slope_info['median_slope']):.3f}s/lap "
                     f"({slope_info['anchors_agreeing']}/{slope_info['anchors_qualifying']} "
                     f"anchors agree), hotspot @ {slope_info['hotspot_lap_dist_pct']:.0%}"
                 ) if slope_info else ""
@@ -536,15 +565,17 @@ for frame in raw_frames:
                                   **slope_info, ai_prompt_hint=hint)
                 all_events.append(evt)
                 print(f"  [{_fmt_t(t)}  L{done_lap:02d}]  {new_state.name}  "
+                      f"CarIdx {slope_info.get('car_ahead_idx', '?')}  "
                       f"slope={slope_info.get('median_slope', 0):+.4f}s/lap  "
                       f"n={slope_info.get('anchors_qualifying', 0)}  "
                       f"hotspot@{slope_info.get('hotspot_lap_dist_pct', 0):.0%}")
 
-        if slopes:
+        if car_medians:
             s   = slope_info.get('median_slope', np.nan)
             n_q = slope_info.get('anchors_qualifying', 0)
             n_a = slope_info.get('anchors_agreeing', 0)
-            print(f"       regression: slope={s:+.4f}s/lap  "
+            ci  = slope_info.get('car_ahead_idx', '?')
+            print(f"       regression: CarIdx {ci}  slope={s:+.4f}s/lap  "
                   f"n={n_q}  agree={n_a}/{n_q}  → {new_state.name}")
         else:
             print(f"       regression: n/a  → {new_state.name}")
@@ -555,36 +586,40 @@ for frame in raw_frames:
 
         # ── Defensive regression: car behind closing on us ────────────────────
         regression_behind.ingest(sampler_behind, max_lap=done_lap)
-        per_anchor_beh = regression_behind.per_bucket_slopes(min_readings=MIN_PUSH_READINGS)
-        slopes_beh     = list(per_anchor_beh.values())
-        new_def_state  = BattleState.IDLE
-        slope_beh_info = {}
+        per_anchor_beh   = regression_behind.per_bucket_slopes(min_readings=MIN_PUSH_READINGS)
+        car_medians_beh  = regression_behind.per_car_median_slopes(min_readings=MIN_PUSH_READINGS)
+        new_def_state    = BattleState.IDLE
+        slope_beh_info   = {}
 
-        if done_lap not in pit_laps and slopes_beh:
-            med_beh       = float(np.median(slopes_beh))
-            n_agree_beh   = sum(1 for s in slopes_beh if s < 0)
-            hot_beh       = min(per_anchor_beh, key=per_anchor_beh.get)
-            hotspot_beh   = hot_beh / anchor_count
+        if done_lap not in pit_laps and car_medians_beh:
+            # Most threatening car: most negative per-car median slope (closing on us)
+            threat_beh   = min(car_medians_beh, key=lambda c: car_medians_beh[c]['median'])
+            tinfo_beh    = car_medians_beh[threat_beh]
+            med_beh      = tinfo_beh['median']
+            hot_beh      = min(per_anchor_beh, key=per_anchor_beh.get) if per_anchor_beh else 0
+            hotspot_beh  = hot_beh / anchor_count if per_anchor_beh else 0.0
             slope_beh_info = {
+                'car_behind_idx':       int(threat_beh),
                 'median_slope':         round(med_beh, 4),
-                'anchors_qualifying':   len(slopes_beh),
-                'anchors_agreeing':     n_agree_beh,
+                'anchors_qualifying':   tinfo_beh['n_buckets'],
+                'anchors_agreeing':     tinfo_beh['n_agree'],
                 'hotspot_lap_dist_pct': round(hotspot_beh, 3),
             }
             # Negative slope = gap-behind shrinking = car behind closing on us
             if (med_beh <= ATTACK_SLOPE_THRESHOLD
-                    and len(slopes_beh) >= MIN_ATTACK_READINGS
+                    and tinfo_beh['n_buckets'] >= MIN_ATTACK_READINGS
                     and prev_slope_beh is not None and med_beh < prev_slope_beh):
                 new_def_state = BattleState.ATTACK_SETUP
-            elif med_beh <= PUSH_SLOPE_THRESHOLD and len(slopes_beh) >= MIN_PUSH_READINGS:
+            elif med_beh <= PUSH_SLOPE_THRESHOLD and tinfo_beh['n_buckets'] >= MIN_PUSH_READINGS:
                 new_def_state = BattleState.PUSH
-            elif slopes_beh:
+            elif car_medians_beh:
                 new_def_state = BattleState.TRACKING
 
         if new_def_state != defensive_state:
             if new_def_state in (BattleState.PUSH, BattleState.ATTACK_SETUP):
                 hint_beh = (
-                    f"Car behind closing at {abs(slope_beh_info['median_slope']):.3f}s/lap "
+                    f"CarIdx {slope_beh_info['car_behind_idx']} closing from behind at "
+                    f"{abs(slope_beh_info['median_slope']):.3f}s/lap "
                     f"({slope_beh_info['anchors_agreeing']}/{slope_beh_info['anchors_qualifying']} "
                     f"anchors agree), hotspot @ {slope_beh_info['hotspot_lap_dist_pct']:.0%}"
                 ) if slope_beh_info else ""
@@ -594,16 +629,20 @@ for frame in raw_frames:
                                   **slope_beh_info, ai_prompt_hint=hint_beh)
                 all_events.append(evt)
                 print(f"  [{_fmt_t(t)}  L{done_lap:02d}]  {label}  "
+                      f"CarIdx {slope_beh_info.get('car_behind_idx', '?')}  "
                       f"slope={slope_beh_info.get('median_slope', 0):+.4f}s/lap  "
                       f"n={slope_beh_info.get('anchors_qualifying', 0)}  "
                       f"hotspot@{slope_beh_info.get('hotspot_lap_dist_pct', 0):.0%}")
 
-        if slopes_beh:
-            s_b   = slope_beh_info.get('median_slope', np.nan)
-            n_b   = slope_beh_info.get('anchors_qualifying', 0)
-            n_ab  = slope_beh_info.get('anchors_agreeing', 0)
-            print(f"       defensive:  slope={s_b:+.4f}s/lap  "
+        if car_medians_beh:
+            s_b  = slope_beh_info.get('median_slope', np.nan)
+            n_b  = slope_beh_info.get('anchors_qualifying', 0)
+            n_ab = slope_beh_info.get('anchors_agreeing', 0)
+            ci_b = slope_beh_info.get('car_behind_idx', '?')
+            print(f"       defensive:  CarIdx {ci_b}  slope={s_b:+.4f}s/lap  "
                   f"n={n_b}  agree={n_ab}/{n_b}  → {new_def_state.name}")
+        else:
+            print(f"       defensive:  n/a  → {new_def_state.name}")
 
         defensive_state = new_def_state
         if slope_beh_info:
