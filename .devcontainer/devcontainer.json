@@ -33,5 +33,5 @@
       ]
     }
   },
-  "postCreateCommand": "rustc --version && cargo --version && node --version && npm --version && gh --version"
+  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y python-is-python3 && rustc --version && cargo --version && node --version && npm --version && gh --version && python --version && python3 --version"
 }
