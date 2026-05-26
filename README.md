@@ -38,11 +38,33 @@ Expected output for the synthetic fixture:
 [19:42  L09]  PIT_ENTRY   P8  ->  IDLE
 ```
 
-### Run Rust tests (once Rust crate is implemented)
+### Run Rust tests
 
 ```bash
 python3 scripts/synthesize_test_fixture.py   # generate test fixtures
 cargo test
+```
+
+### Run the Node.js listener (end-to-end demo)
+
+```bash
+# 1. Build the native module
+cargo build -p director-narrative-core-napi
+cp target/debug/libdirector_narrative_core_napi.so napi/index.node
+
+# 2. Generate the synthetic test fixture (if not already present)
+python3 scripts/synthesize_test_fixture.py
+
+# 3. Stream frames and print narrative events
+node listener/index.js data/test_fixture.jsonl
+```
+
+Expected key events in the output:
+
+```
+{ "eventType": "PUSH",         "lap": 3, "sessionTime": 480, ... }
+{ "eventType": "ATTACK_SETUP", "lap": 4, "sessionTime": 620, ... }
+{ "eventType": "CLOSE_APPROACH", "lap": 6, ...                   }
 ```
 
 ## Key Design Decisions
@@ -60,6 +82,8 @@ cargo test
 ## Project Structure
 
 ```
+listener/
+  index.js                     <- Node.js listener: streams JSONL → narrative events (run this)
 scripts/
   prototype_narrative.py       <- Python validation prototype (run this first)
   synthesize_test_fixture.py   <- Generate synthetic JSONL test fixtures
