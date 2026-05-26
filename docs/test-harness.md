@@ -1,13 +1,13 @@
 # Narrative Engine — Test Harness
 
-**Status:** Python prototype validated; Rust harness design specified  
+**Status:** Implemented — 17 unit tests + 3 integration tests passing
 **Companion documents:** [architecture.md](architecture.md) · [data-models.md](data-models.md)
 
 ---
 
 ## 1. Testing Philosophy
 
-The engine must produce **deterministic, reproducible narrative events** from a given telemetry stream. The correctness criteria are race-domain facts — "does the engine fire `PUSH_DETECTED` on the right lap, for the right opponent, at the right slope?" — not just "does the Rust compile without warnings?"
+The engine must produce **deterministic, reproducible narrative events** from a given telemetry stream. The correctness criteria are race-domain facts — “does the engine fire `PUSH` on the right lap, for the right opponent, at the right slope?” — not just “does the Rust compile without warnings?”
 
 The test strategy has three tiers:
 
@@ -15,7 +15,7 @@ The test strategy has three tiers:
 |---|---|---|
 | Unit | OLS regression math, AnchorSampler bucket logic, LapTimer duration | `cargo test` |
 | Scenario | Full pipeline: JSONL stream → expected events sequence | `cargo test` + JSONL fixtures |
-| Regression | Real Nürburgring session produces identical event timeline to Python prototype | `cargo test` with `nurburgring_5lap.jsonl` fixture |
+| Regression | Real Nürburgring session produces identical event timeline to Python prototype | `cargo test` (requires `data/session.jsonl` — gitignored) |
 
 ---
 
@@ -63,9 +63,7 @@ GAP_TO_TARGET_PER_LAP = {
 | Fixture | Description | Expected events |
 |---|---|---|
 | `data/test_fixture.jsonl` | Synthetic 10-lap race, accelerating close | PUSH (lap 3), ATTACK_SETUP (lap 4), CLOSE_APPROACH (lap 6), OVERTAKE (lap 8), PIT (lap 9) |
-| `data/session.jsonl` | Real Nürburgring race (47 cars, 5 laps) | 8× CLOSE_APPROACH, 4× LAP_COMPLETE, 2× OVERTAKE, 1× PIT_ENTRY, 1× PIT_EXIT, 0× PUSH/ATTACK |
-| `tests/fixtures/synthetic_yellow.jsonl` | Yellow flag on lap 3 contaminates 2 consecutive anchor readings | PUSH delayed to lap 5 (not lap 3) due to dirty reading exclusion |
-| `tests/fixtures/synthetic_opponent_change.jsonl` | Car ahead pits at lap 4, new opponent takes position | PUSH/ATTACK series resets at lap 4; new series starts from lap 5 |
+| `data/session.jsonl` | Real Nürburgring race (47 cars, 5 laps) — **gitignored** | 8× CLOSE_APPROACH, 4× LAP_COMPLETE, 2× OVERTAKE, 1× PIT_ENTRY, 1× PIT_EXIT, 0× PUSH/ATTACK |
 
 ---
 
@@ -101,232 +99,153 @@ The Rust implementation must reproduce this exact event sequence from the same J
 
 ## 4. Rust Unit Tests
 
-### 4.1 OLS Regression (`tests/ols_test.rs`)
+### 4.1 OLS Regression (`src/regression_store.rs`)
+
+The `ols_slope` function is public and directly testable:
 
 ```rust
 #[cfg(test)]
-mod ols_tests {
-    use director_narrative_core::math::ols::ols_slope;
+mod tests {
+    use super::ols_slope;
 
     #[test]
-    fn slope_of_perfect_line() {
+    fn ols_slope_known_values() {
         // gap decreasing 0.5 s per lap
-        let laps = vec![2, 3, 4];
-        let gaps = vec![4.5, 4.0, 3.5];
+        let laps = vec![2.0_f32, 3.0, 4.0];
+        let gaps = vec![4.5_f32, 4.0, 3.5];
         let slope = ols_slope(&laps, &gaps).unwrap();
         assert!((slope - (-0.5)).abs() < 1e-4, "slope={slope}");
     }
 
     #[test]
-    fn slope_of_two_points_returns_exact_delta() {
-        let laps = vec![1, 2];
-        let gaps = vec![3.0, 2.0];
-        let slope = ols_slope(&laps, &gaps).unwrap();
-        assert!((slope - (-1.0)).abs() < 1e-6);
-    }
-
-    #[test]
-    fn fewer_than_two_points_returns_none() {
-        assert!(ols_slope(&[1], &[2.5]).is_none());
+    fn ols_slope_returns_none_for_single_point() {
+        assert!(ols_slope(&[1.0], &[2.5]).is_none());
         assert!(ols_slope(&[], &[]).is_none());
-    }
-
-    #[test]
-    fn zero_variance_in_lap_returns_none() {
-        // All readings on the same lap — can't fit a line
-        let laps = vec![3, 3, 3];
-        let gaps = vec![1.0, 2.0, 3.0];
-        assert!(ols_slope(&laps, &gaps).is_none());
     }
 }
 ```
 
-### 4.2 AnchorSampler (`tests/anchor_detector_test.rs`)
+### 4.2 AnchorSampler (`src/anchor_sampler.rs`)
 
 ```rust
 #[test]
-fn first_crossing_only_per_lap_bucket() {
+fn first_crossing_captured() {
     let mut sampler = AnchorSampler::new(10);  // 10 buckets
 
     // Lap 1, ldp=0.05 → bucket 0
     let recorded = sampler.update(1, 0.05, 2.0, 7, true);
     assert!(recorded);
+    assert_eq!(sampler.samples.len(), 1);
+}
 
+#[test]
+fn duplicate_crossing_ignored() {
+    let mut sampler = AnchorSampler::new(10);
+    sampler.update(1, 0.05, 2.0, 7, true);
     // Same lap, same bucket again — should be dropped
     let recorded = sampler.update(1, 0.08, 1.8, 7, true);
     assert!(!recorded);
+    assert_eq!(sampler.samples.len(), 1);
+}
 
+#[test]
+fn different_car_idx_tracked_independently() {
+    let mut sampler = AnchorSampler::new(10);
+    sampler.update(1, 0.05, 2.0, 7, true);
     // Same bucket, different lap — should record
     let recorded = sampler.update(2, 0.05, 1.7, 7, true);
     assert!(recorded);
-
     assert_eq!(sampler.samples.len(), 2);
-}
-
-#[test]
-fn dirty_samples_stored_but_not_used_in_regression() {
-    let mut sampler = AnchorSampler::new(10);
-    sampler.update(1, 0.15, 3.0, 7, false);  // dirty
-    sampler.update(2, 0.15, 2.5, 7, true);   // clean
-
-    let mut store = RegressionStore::new();
-    store.ingest(&sampler, Some(2));
-
-    // (bucket=1, car=7) has only 1 clean reading → no qualifying slope
-    let slopes = store.per_bucket_slopes(2);
-    assert!(slopes.is_empty(), "Expected no qualifying slopes with 1 clean reading");
 }
 ```
 
-### 4.3 Lap Boundary `max_lap` Guard (`tests/regression_test.rs`)
+### 4.3 RegressionStore max_lap guard (`src/regression_store.rs`)
 
 ```rust
 #[test]
-fn max_lap_excludes_first_frame_of_new_lap() {
+fn ingest_excludes_frames_beyond_max_lap() {
     // Simulate the first-frame lookahead bug: sampler has laps 1, 2, AND
     // the first frame of lap 3 when the "lap 2 complete" event fires.
-    let mut sampler = AnchorSampler::new(4);
+    let mut sampler = AnchorSampler::new(28);
     sampler.update(1, 0.1, 3.0, 7, true);
     sampler.update(2, 0.1, 2.5, 7, true);
     sampler.update(3, 0.1, 2.1, 7, true);  // first frame of lap 3 — must be excluded
 
     let mut store = RegressionStore::new();
-    store.ingest(&sampler, Some(2));  // max_lap=2
+    store.ingest(&sampler, 2);  // max_lap=2 (u8)
 
-    // Should only see laps 1 and 2 in the regression
-    let points = store.points_for(1, 7).unwrap();  // bucket=1, car=7
-    assert_eq!(points.len(), 2);
-    assert_eq!(points[0].lap, 1);
-    assert_eq!(points[1].lap, 2);
+    // Should only qualify slopes from laps 1 and 2
+    let slopes = store.per_car_median_slopes(2);
+    let info = slopes.get(&7).unwrap();
+    assert!((info.median - (-0.5)).abs() < 0.01, "slope should be ≈0.5");
 }
 ```
 
 ---
 
-## 5. Rust Scenario Tests
+## 5. Rust Integration Tests (`tests/fixture.rs`)
 
-### 5.1 Full Pipeline: PUSH Detection
+All three tests use the single `data/test_fixture.jsonl` fixture (7000 frames, 10 laps, CarIdx 18 = player, 28 anchor buckets). The fixture is generated by `python3 scripts/synthesize_test_fixture.py` and is gitignored.
+
+### 5.1 PUSH fires at lap 3 for car 7
 
 ```rust
 #[test]
-fn push_fires_on_sustained_closing() {
-    let frames = load_fixture("tests/fixtures/synthetic_push.jsonl");
-    let config = AnchorDetectorConfig::default();
-    let mut engine = TelemetryEngine::new();
-    engine.register_detector(Box::new(DynamicAnchorDetector::new(config)));
+fn lap3_push_car7() {
+    let frames = load_fixture();
+    let events = replay_frames(&frames);
 
-    let mut all_events: Vec<RaceEvent> = Vec::new();
-    for frame in frames {
-        all_events.extend(engine.process_tick(frame));
+    let push = events.iter().find(|e| {
+        matches!(e, RaceEvent::Push { car_ahead_idx: 7, .. })
+    });
+    assert!(push.is_some(), "expected a PUSH event for car_ahead_idx=7");
+
+    if let Some(RaceEvent::Push { lap, slope_info, .. }) = push {
+        assert_eq!(*lap, 3, "PUSH should be emitted at lap 3, got lap {lap}");
+        assert!(
+            (slope_info.median_slope - (-0.4998)).abs() < 0.01,
+            "expected slope ≈ -0.500 s/lap, got {:.4}",
+            slope_info.median_slope,
+        );
     }
-
-    // Exactly one PUSH_DETECTED event
-    let push_events: Vec<&RaceEvent> = all_events.iter()
-        .filter(|e| e.event_type == "PUSH_DETECTED")
-        .collect();
-    assert_eq!(push_events.len(), 1, "Expected exactly 1 PUSH_DETECTED");
-
-    let push = push_events[0];
-    assert_eq!(push.lap, 3, "PUSH expected on lap 3");
-
-    let slope = push.narrative_context.closing_rate_s_per_lap.unwrap();
-    assert!(slope < -0.04, "Slope {slope} should be < -0.04 s/lap");
-    assert!(slope > -1.0, "Slope {slope} implausibly steep — check fixture");
 }
 ```
 
-### 5.2 Full Pipeline: ATTACK_SETUP Requires Acceleration
+### 5.2 ATTACK_SETUP fires at lap 4 for car 7
 
 ```rust
 #[test]
-fn attack_setup_requires_accelerating_slope() {
-    let frames = load_fixture("tests/fixtures/synthetic_attack.jsonl");
-    // ... engine setup ...
+fn lap4_attack_setup_car7() {
+    let frames = load_fixture();
+    let events = replay_frames(&frames);
 
-    let push_events: Vec<&RaceEvent> = all_events.iter()
-        .filter(|e| e.event_type == "PUSH_DETECTED").collect();
-    let attack_events: Vec<&RaceEvent> = all_events.iter()
-        .filter(|e| e.event_type == "ATTACK_SETUP").collect();
+    let attack = events.iter().find(|e| {
+        matches!(e, RaceEvent::AttackSetup { car_ahead_idx: 7, .. })
+    });
+    assert!(attack.is_some(), "expected an ATTACK_SETUP event for car_ahead_idx=7");
 
-    // PUSH must precede ATTACK_SETUP
-    assert!(!push_events.is_empty(), "Expected PUSH before ATTACK_SETUP");
-    assert!(!attack_events.is_empty(), "Expected ATTACK_SETUP on accelerating close");
-    assert!(push_events[0].session_time < attack_events[0].session_time);
-
-    // Acceleration: attack slope must be more negative than push slope
-    let push_slope  = push_events[0].narrative_context.closing_rate_s_per_lap.unwrap();
-    let attack_slope = attack_events[0].narrative_context.closing_rate_s_per_lap.unwrap();
-    assert!(attack_slope < push_slope,
-        "Attack slope {attack_slope} must be more negative than push slope {push_slope}");
+    if let Some(RaceEvent::AttackSetup { lap, slope_info, .. }) = attack {
+        assert_eq!(*lap, 4);
+        assert!(
+            (slope_info.median_slope - (-0.5999)).abs() < 0.01,
+            "expected slope ≈ -0.600 s/lap",
+        );
+    }
 }
 ```
 
-### 5.3 Yellow Flag Invalidation
+### 5.3 CLOSE_APPROACH fires for car 7
 
 ```rust
 #[test]
-fn yellow_flag_lap_excluded_from_regression() {
-    // synthetic_yellow.jsonl: lap 3 has session_flags=0x100 for 40% of the lap
-    // PUSH should fire on lap 4 (laps 2 and 4 clean) not lap 3
-    let frames = load_fixture("tests/fixtures/synthetic_yellow.jsonl");
-    // ...
+fn close_approach_car7() {
+    let frames = load_fixture();
+    let events = replay_frames(&frames);
 
-    let push_events: Vec<&RaceEvent> = all_events.iter()
-        .filter(|e| e.event_type == "PUSH_DETECTED").collect();
-    assert!(!push_events.is_empty());
-    assert!(push_events[0].lap >= 4,
-        "PUSH should not fire on contaminated lap 3; fired on lap {}", push_events[0].lap);
-}
-```
-
-### 5.4 Opponent Identity Reset
-
-```rust
-#[test]
-fn opponent_change_resets_regression_series() {
-    // synthetic_opponent_change.jsonl:
-    //   Laps 1-3: car_ahead = CarIdx 7 (gap closing)
-    //   Lap 4: CarIdx 7 pits; new car_ahead = CarIdx 12 (gap opens)
-    //   Laps 5-7: car_ahead = CarIdx 12 (gap closing again)
-    // Expected: BATTLE_RESET_OPPONENT event at lap 4; PUSH fires at lap 6 for CarIdx 12
-    let frames = load_fixture("tests/fixtures/synthetic_opponent_change.jsonl");
-    // ...
-
-    let reset_events: Vec<&RaceEvent> = all_events.iter()
-        .filter(|e| e.event_type == "BATTLE_RESET_OPPONENT").collect();
-    assert_eq!(reset_events.len(), 1, "Expected 1 opponent reset");
-    assert_eq!(reset_events[0].lap, 4);
-
-    let push_events: Vec<&RaceEvent> = all_events.iter()
-        .filter(|e| e.event_type == "PUSH_DETECTED").collect();
-    // PUSH for lap 6 CarIdx 12; NOT a spurious PUSH from the lap 1-3 CarIdx 7 series
-    assert!(push_events.iter().all(|e| {
-        e.narrative_context.opponent_car_idx == Some(12)
-    }), "All PUSH events should be against CarIdx 12 after reset");
-}
-```
-
-### 5.5 Regression Against Real Data
-
-```rust
-#[test]
-fn nurburgring_real_session_matches_prototype_output() {
-    // data/session.jsonl — 9985 frames, 5 laps, 47 cars
-    // This is the canonical regression test. The Rust output must match
-    // the Python prototype's event timeline exactly.
-    let frames = load_fixture("data/session.jsonl");
-    // ...
-
-    // Event counts (from prototype run)
-    let close_approach_count = all_events.iter().filter(|e| e.event_type == "CLOSE_APPROACH").count();
-    let overtake_count       = all_events.iter().filter(|e| e.event_type == "OVERTAKE_DETECTED").count();
-    let pit_entry_count      = all_events.iter().filter(|e| e.event_type == "PIT_ENTRY").count();
-    let push_count           = all_events.iter().filter(|e| e.event_type == "PUSH_DETECTED").count();
-
-    assert_eq!(close_approach_count, 8,  "8 CLOSE_APPROACH events (per prototype)");
-    assert_eq!(overtake_count,       2,  "2 OVERTAKE events: +8 lap 2, +2 lap 3");
-    assert_eq!(pit_entry_count,      1,  "1 PIT_ENTRY: lap 3");
-    assert_eq!(push_count,           0,  "0 PUSH: opponent changed every lap");
+    let ca = events.iter().find(|e| {
+        matches!(e, RaceEvent::CloseApproach { car_ahead_idx: 7, .. })
+    });
+    assert!(ca.is_some(), "expected a CLOSE_APPROACH event for car_ahead_idx=7");
 }
 ```
 
@@ -335,18 +254,21 @@ fn nurburgring_real_session_matches_prototype_output() {
 ## 6. Running the Test Suite
 
 ```bash
-# All tests
+# Generate the test fixture (required once)
+python3 scripts/synthesize_test_fixture.py
+
+# All tests (17 unit + 3 integration)
 cargo test
 
 # Unit tests only (fast, no fixture I/O)
 cargo test --lib
 
-# Scenario tests only
-cargo test --test anchor_detector_test
-cargo test --test regression_test
+# Integration tests only
+cargo test --test fixture
 
 # With output (useful when a test fails and you want the event list)
 cargo test -- --nocapture
+```
 
 # Specific test
 cargo test push_fires_on_sustained_closing -- --nocapture

@@ -189,7 +189,7 @@ enum BattleState {
 
 ## 8. Input Contract — `TelemetryFrame`
 
-The concrete input type passed to every `StoryDetector` on each tick. Fields are split into two groups based on data source availability.
+The concrete input type passed to `NarrativeEngine::process_frame()` on each call. Fields are split into two groups based on data source availability.
 
 ```rust
 #[derive(Debug, Deserialize, Clone)]
@@ -214,7 +214,7 @@ pub struct TelemetryFrame {
 }
 ```
 
-**Key design note:** `car_ahead_idx` and `car_dist_ahead` are no longer top-level fields. The `DynamicAnchorDetector` derives `car_ahead_idx` internally on each tick by scanning `car_idx_lap_dist_pct` for the entry with the smallest positive delta relative to the focus car's `lap_dist_pct`. `CarIdxF2Time` is used in preference to `CarDistAhead / Speed` because it is the official iRacing time-gap computation and is not subject to speed-conversion error at low speeds.
+**Key design note:** `car_ahead_idx` and `car_dist_ahead` are no longer top-level fields. The engine derives `car_ahead_idx` internally on each call by scanning `car_idx_lap_dist_pct` for the entry with the smallest positive delta relative to the focus car's `lap_dist_pct`. `CarIdxF2Time` is used in preference to `CarDistAhead / Speed` because it is the official iRacing time-gap computation and is not subject to speed-conversion error at low speeds.
 
 `session_flags` is required for `is_clean` tagging (§5.3). Relevant bitmasks: `YELLOW_WAVE = 0x100`, `CAUTION = 0x4000`.
 
@@ -227,101 +227,75 @@ pub struct TelemetryFrame {
 
 ---
 
-## 9. Pluggable StoryDetector Architecture
+## 9. NarrativeEngine Architecture
 
-### 9.1 Motivation
+### 9.1 Design
 
-The engine must eventually compute diverse heuristic metrics beyond spatial closing rates: tyre thermal dynamics, fuel load delta, undercut window detection. Embedding all of this logic in a single struct creates an unmaintainable God Object. Instead, the core `TelemetryEngine` is a **dumb pipeline** — it owns no domain-specific math. All narrative intelligence lives in pluggable detectors registered at startup.
+The `NarrativeEngine` struct is the single entry point. It owns all state (anchor samplers, regression ring buffers, lap timer, battle state machines) and is constructed once per session with a computed `anchor_count`.
 
-### 9.2 The Trait
+In Phase 1 all detection logic lives directly inside `NarrativeEngine`. The pluggable-detector architecture (Phase 2) is the correct pattern for adding `TireDegradationDetector`, `FuelWindowDetector`, and similar future detectors without creating a God Object.
 
-The trait is defined as an **extension of the director's `RaceEvent`** — detectors produce `RaceEvent` structs (the existing downstream contract) with the `narrative_context` field populated. There is no separate internal event type: the output of every detector is already in the shape the `director` cloud ingestion expects.
+### 9.2 Public API
 
 ```rust
-trait StoryDetector {
-    fn on_telemetry_tick(
-        &mut self,
-        tick: &TelemetryTick,
-    ) -> Vec<RaceEvent>;  // director's existing type, decorated with narrative_context
+pub struct NarrativeEngine { /* private */ }
 
-    fn name(&self) -> &'static str;
+impl NarrativeEngine {
+    /// Construct a new engine.
+    ///
+    /// `anchor_count` — number of equally-spaced spatial buckets around the track.
+    /// Derive from the first completed lap time: `floor(lap_time_s / 5.0).max(10)`.
+    pub fn new(anchor_count: usize) -> Self;
+
+    /// Process one telemetry frame (call at 5 Hz).
+    /// Returns zero or more narrative events.
+    pub fn process_frame(&mut self, frame: &TelemetryFrame) -> Vec<RaceEvent>;
 }
 ```
 
-Each detector is fully self-contained: it owns its own `HashMap` of battle state machines, its own `VecDeque` ring buffers, and all derivative math. The engine does not know or care what any detector does internally.
-
-### 9.3 TelemetryEngine as Dispatcher
-
-The engine holds a list of registered detectors via a public `register_detector` method and fans each tick out to all of them. It owns **no history** — all state lives inside the detectors.
-
-For the v0.1.0 prototype, `process_tick` returns `Vec<RaceEvent>` directly (synchronous). This is the simplest shape across the napi boundary. A `Sender<RaceEvent>` channel is the appropriate production pattern for async streaming, but adds complexity that is not needed until the engine runs in a background thread.
+For batch replay:
 
 ```rust
-struct TelemetryEngine {
-    detectors: Vec<Box<dyn StoryDetector>>,
-}
-
-impl TelemetryEngine {
-    pub fn new() -> Self {
-        Self { detectors: Vec::new() }
-    }
-
-    pub fn register_detector(&mut self, detector: Box<dyn StoryDetector>) {
-        self.detectors.push(detector);
-    }
-
-    pub fn process_tick(&mut self, frame: TelemetryFrame) -> Vec<RaceEvent> {
-        self.detectors
-            .iter_mut()
-            .flat_map(|d| d.on_telemetry_tick(&frame))
-            .collect()
-    }
-}
+// replay.rs
+pub fn compute_anchor_count(frames: &[TelemetryFrame]) -> usize;
+pub fn replay_frames(frames: &[TelemetryFrame]) -> Vec<RaceEvent>;
 ```
 
-### 9.4 Known Detector Implementations
+### 9.3 Internal Components
+
+| Component | Role |
+|---|---|
+| `AnchorSampler` | Records first gap reading per `(lap, bucket)` |
+| `RegressionStore` | Per-`(bucket, car_idx)` OLS ring buffer |
+| `LapTimer` | Lap-crossing detection, lap time estimation |
+| `BattleState` FSM | `IDLE → TRACKING → PUSH → ATTACK_SETUP` transitions |
+| `find_cars_ahead()` | Identifies opponent and computes gap from `CarIdxLapDistPct` |
+| Frame-level detectors | `CLOSE_APPROACH`, `OVERTAKE`, `PIT_ENTRY/EXIT`, `PRESSURE_BEHIND` |
+
+### 9.4 Known Future Detector Implementations
 
 | Detector | Domain | Primary input |
 |---|---|---|
-| `DynamicAnchorDetector` | Spatial closing rate | `CarIdxF2Time`, `LapDistPct` |
 | `TireDegradationDetector` | Tyre thermal trend | `TyreTemp*`, lap delta |
 | `FuelWindowDetector` | Undercut opportunity | `FuelLevel`, pit delta estimate |
 
-Each detector is independently unit-testable by constructing it in isolation and feeding synthetic `TelemetryTick` sequences without running the full engine.
-
 ---
 
-## 10. napi-rs Public API — `NativeTelemetryPublisher`
+## 10. napi-rs Public API
 
-The public contract that Node.js/Electron sees. JSON-in / JSON-out across the napi boundary avoids complex napi type mappings for nested Rust structs.
+The napi crate (`napi/`) wraps `NarrativeEngine` behind a JavaScript class. All struct fields cross the napi boundary as camelCase.
 
-```rust
-#[napi]
-pub struct NativeTelemetryPublisher {
-    engine: TelemetryEngine,
-}
-
-#[napi]
-impl NativeTelemetryPublisher {
-    #[napi(constructor)]
-    pub fn new() -> Self {
-        let mut engine = TelemetryEngine::new();
-        engine.register_detector(Box::new(DynamicAnchorDetector::new()));
-        Self { engine }
-    }
-
-    #[napi]
-    pub fn process_tick(&mut self, frame_json: String) -> Result<String> {
-        let frame: TelemetryFrame = serde_json::from_str(&frame_json)
-            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
-        let events = self.engine.process_tick(frame);
-        serde_json::to_string(&events)
-            .map_err(|e| napi::Error::from_reason(e.to_string()))
-    }
+```typescript
+// JavaScript API (generated by napi-rs)
+class NarrativeEngine {
+  constructor(anchorCount: number);
+  processFrame(frame: TelemetryFrame): RaceEvent[];
 }
 ```
 
-Errors from malformed JSON are surfaced as typed napi errors — not panics. The `.unwrap()` pattern must not be used on any input crossing the napi boundary.
+The `anchor_count` is computed from the first completed lap time (see `replay::compute_anchor_count`) and is passed as a constructor argument. This allows the caller to tune spatial resolution without recompiling.
+
+Errors from malformed input are surfaced as typed napi errors — not panics. The `.unwrap()` pattern is not used on any input crossing the napi boundary.
 
 ---
 
@@ -337,39 +311,39 @@ Two modes exist depending on whether the engine is running against a live sessio
 
 **Mode 1 — Pull (v0.1.0, replay harness)**
 
-Node.js drives the tick loop. It reads frames from a JSONL fixture file and calls `publisher.process_tick(frameJson)` synchronously. Events are returned immediately and forwarded to the `director`. This is the correct model for CI validation and development without a running sim.
+Node.js drives the tick loop. It reads frames from a JSONL fixture file and calls `engine.processFrame(frame)` synchronously. Events are returned immediately and forwarded to the `director`. This is the correct model for CI validation and development without a running sim.
 
 ```
 ┌────────────────────────────────────────────────────────────────┐
 │ Node.js                                                         │
 │                                                                 │
 │  setInterval(200ms) ──► read next JSONL line                    │
-│                    ──► publisher.process_tick(frameJson) ──► Rust│
-│                    ◄── Vec<RaceEvent> (JSON string)      ◄── Rust│
+│                    ──► engine.processFrame(frame) ──► Rust     │
+│                    ◄── RaceEvent[]                ◄── Rust     │
 │                    ──► emit to director                         │
 └────────────────────────────────────────────────────────────────┘
 ```
 
 **Mode 2 — Push (production, live iRacing session)**
 
-Rust owns the polling loop. A background thread blocks on `ir.wait_for_data(200ms)`, builds a `TelemetryFrame`, calls `engine.process_tick`, and pushes any resulting `RaceEvent`s to the Node.js main thread via a napi `ThreadSafeFunction` callback. Node.js is purely a receiver — it never calls `process_tick` directly.
+Rust owns the polling loop. A background thread blocks on `ir.wait_for_data(200ms)`, builds a `TelemetryFrame`, calls `engine.process_frame`, and pushes any resulting `RaceEvent`s to the Node.js main thread via a napi `ThreadSafeFunction` callback. Node.js is purely a receiver — it never calls `process_frame` directly.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
 │ Rust background thread                    │ Node.js main thread       │
 │                                           │                           │
-│  loop {                                   │  publisher.on_event =     │
+│  loop {                                   │  engine.on_event =     │
 │    ir.wait_for_data(200ms)                │    (eventJson) => {       │
 │    frame = build_frame(&ir)               │      director.emit(event) │
-│    events = engine.process_tick(frame)    │    }                      │
+│    events = engine.process_frame(&frame)    │    }                      │
 │    for e in events {                      │                           │
-│      tsf.call(e.to_json())  ─────────────►│                           │
+│      tsf.call(e)  ─────────────►│                           │
 │    }                                      │                           │
 │  }                                        │                           │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-The `NativeTelemetryPublisher` in §10 implements Mode 1. Mode 2 requires extending it with a `start_live(callback: ThreadsafeFunction)` method and is a Phase 3+ concern.
+The `NarrativeEngine` napi class (see §10) implements Mode 1. Mode 2 requires a `start_live(callback: ThreadsafeFunction)` method and is a Phase 3+ concern.
 
 ### 11.3 Connection Lifecycle
 
@@ -398,32 +372,33 @@ This is the **Decorator Pattern** applied to an event schema: wrap the existing 
 
 ```json
 {
-  "event_type": "PUSH_DETECTED",
-  "car_idx": 5,
-  "opponent_car_idx": 12,
-  "session_time": 1482.3,
+  "event_type": "PUSH",
   "lap": 3,
-  "anchor_bucket": 62,
-  "narrative_context": {
-    "battle_duration_seconds": 187,
-    "closing_rate_dx_dt": -0.043,
-    "clean_laps_in_regression": 3,
-    "overtake_style": "sustained_pressure",
-    "ai_prompt_hint": "Driver 5 has been systematically closing on car 12 for three laps. This is calculated, not opportunistic."
+  "session_time": 480.2,
+  "car_ahead_idx": 7,
+  "slope_info": {
+    "median_slope": -0.4998,
+    "hotspot_bucket": 8,
+    "qualifying_anchors": 28
   }
 }
 ```
 
 ### 12.3 Event types
 
-| Event | Trigger | Key narrative_context fields |
+| Event | Trigger | Key fields |
 |---|---|---|
-| `BATTLE_OPENED` | First anchor reading for `(focus, opponent)` pair | `car_idx`, `opponent_car_idx`, `anchor_bucket` |
-| `PUSH_DETECTED` | Negative regression slope, ≥ min_clean_push readings | `closing_rate_dx_dt`, `clean_laps_in_regression` |
-| `ATTACK_SETUP` | Accelerating negative slope, ≥ min_clean_attack readings | `closing_rate_dx_dt`, `battle_duration_seconds` |
-| `BATTLE_RESET_OPPONENT` | Car-ahead identity changed | `previous_opponent_car_idx` |
-| `BATTLE_RESET_YELLOW` | Yellow contamination exhausted clean history | `contaminated_lap_count` |
-| `OVERTAKE_DETECTED` | Position change confirmed at start/finish | `overtake_style`, `battle_duration_seconds` |
+| `PUSH` | Negative regression slope, ≥ min_push readings | `car_ahead_idx`, `slope_info.median_slope` |
+| `ATTACK_SETUP` | Accelerating negative slope, ≥ min_attack readings | `car_ahead_idx`, `slope_info.median_slope` |
+| `CLOSE_APPROACH` | Gap ≤ `CLOSE_APPROACH_THRESH_S` for ≥ N frames | `car_ahead_idx`, `gap_s` |
+| `OVERTAKE` | Position gain confirmed at start/finish crossing | `position_from`, `position_to`, `positions_gained` |
+| `POSITION_LOST` | Position loss confirmed at start/finish crossing | `position_from`, `position_to`, `positions_lost` |
+| `DEFEND_PUSH` | Car behind closing at Push threshold | `car_behind_idx`, `slope_info` |
+| `DEFEND_ATTACK` | Car behind closing at Attack threshold | `car_behind_idx`, `slope_info` |
+| `PRESSURE_BEHIND` | Car behind within gap threshold | `car_behind_idx`, `gap_s` |
+| `LAP_COMPLETE` | Start/finish crossing | `lap`, `lap_time_s`, `position`, `pit_frames` |
+| `PIT_ENTRY` | Car transitions to pit road | `lap`, `position` |
+| `PIT_EXIT` | Car leaves pit road | `lap`, `position` |
 
 ### 12.4 `ai_prompt_hint`
 
@@ -477,7 +452,7 @@ None of these are available in `.ibt` recordings — they are only present in th
 
 **Mode A — Driver-centric (Phase 1 target)**
 
-The engine runs on a single driver's PC. `player_car_idx` is set to that driver's CarIdx. `DynamicAnchorDetector` tracks only battles involving the focus car.
+The engine runs on a single driver's PC. `player_car_idx` is set to that driver's CarIdx. `NarrativeEngine` tracks only battles involving the focus car.
 
 ```
 Driver PC
@@ -493,7 +468,7 @@ Driver PC
 
 **Mode B — Full-field broadcast (Phase 2)**
 
-The engine still runs on a driver's PC (or an iRacing observer connection), but `DynamicAnchorDetector` iterates over **all active car pairs** — not just those involving the focus driver. Every `CarIdx` entry where `car_idx_position[i] > 0` is treated as a potential battle subject; for each such car, the car at `car_idx_position[i] - 1` is the potential opponent.
+The engine still runs on a driver's PC (or an iRacing observer connection), but the engine iterates over **all active car pairs** — not just those involving the focus driver. Every `CarIdx` entry where `car_idx_position[i] > 0` is treated as a potential battle subject; for each such car, the car at `car_idx_position[i] - 1` is the potential opponent.
 
 ```
 Driver PC (or observer connection)
@@ -527,7 +502,7 @@ Driver C PC  ─── Rust engine (full field) ─┘     de-duplicates by even
 
 | Concern | Mode A | Mode B | Mode C |
 |---|---|---|---|
-| `DynamicAnchorDetector` scope | player only | all active cars | all active cars |
+| `NarrativeEngine` scope | player only | all active cars | all active cars |
 | State machine count | 1–3 at a time | up to N_cars | up to N_cars |
 | `RaceEvent.car_idx` | always `player_car_idx` | any car | any car |
 | Director de-duplication needed | no | no | yes |
@@ -535,7 +510,7 @@ Driver C PC  ─── Rust engine (full field) ─┘     de-duplicates by even
 
 ### 15.4 When Two Drivers Fight Each Other
 
-If Driver A and Driver B are in the same race and both run the engine, they will each emit a `PUSH_DETECTED` event for the same battle from opposite perspectives:
+If Driver A and Driver B are in the same race and both run the engine, they will each emit a `PUSH` event for the same battle from opposite perspectives:
 
 - Engine A: `{ subject: A, object: B, closing_rate: -0.12 }` — A closing on B
 - Engine B: `{ subject: B, object: A, closing_rate: +0.12 }` — B sees A behind

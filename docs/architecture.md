@@ -183,12 +183,12 @@ In the Nürburgring data, yellow flags at `LapDistPct ≈ 0.62` on both Lap 1 an
                                      │ 5Hz (200 ms poll or fixture replay)
                                      ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│  TelemetryEngine                                                             │
+│  NarrativeEngine                                                             │
 │                                                                               │
 │  ┌──────────────────────────────────────────────────────────────────────┐    │
-│  │  DynamicAnchorDetector                                               │    │
+│  │  Regression-driven battle detection (lap-level)                      │    │
 │  │                                                                      │    │
-│  │   find_car_ahead_ldp()   →  (car_ahead_idx, gap_s)                  │    │
+│  │   find_cars_ahead()      →  (car_ahead_idx, gap_s)                  │    │
 │  │                                                                      │    │
 │  │   AnchorSampler          →  first crossing of each bucket per lap   │    │
 │  │   (HashMap<(lap,bucket), sample>)                                    │    │
@@ -204,7 +204,7 @@ In the Nürburgring data, yellow flags at `LapDistPct ≈ 0.62` on both Lap 1 an
 │  └──────────────────────────────────────────────────────────────────────┘    │
 │                                                                               │
 │  ┌──────────────────────────────────────────────────────────────────────┐    │
-│  │  FrameEventDetector  (CLOSE_APPROACH, OVERTAKE, PIT_ENTRY/EXIT)     │    │
+│  │  Frame-level detectors  (CLOSE_APPROACH, OVERTAKE, PIT_ENTRY/EXIT)  │    │
 │  └──────────────────────────────────────────────────────────────────────┘    │
 │                                                                               │
 │  [ Future: TireDegradationDetector, FuelWindowDetector ]                    │
@@ -213,7 +213,8 @@ In the Nürburgring data, yellow flags at `LapDistPct ≈ 0.62` on both Lap 1 an
                                      ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │  napi-rs boundary                                                            │
-│  NativeTelemetryPublisher::process_tick(frame_json) → events_json           │
+│  NarrativeEngine::process_frame(&frame) → Vec<RaceEvent>                    │
+│  napi: engine.processFrame(frame: TelemetryFrame) → RaceEvent[]             │
 └────────────────────────────────────┬─────────────────────────────────────────┘
                                      │
                                      ▼
