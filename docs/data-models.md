@@ -9,7 +9,7 @@ These are the complete Rust type definitions for `director-narrative-core`. Fiel
 
 ## 1. Input Contract — `TelemetryFrame`
 
-The concrete struct passed to every `StoryDetector` on each tick. Deserialised from JSON on the napi boundary and from JSONL lines in the test harness.
+The concrete struct passed to `NarrativeEngine::process_frame()` on each call. Deserialised from JSONL lines in the test harness and from the iRacing memory-mapped API in production.
 
 ```rust
 use serde::{Deserialize, Serialize};
@@ -130,7 +130,7 @@ pub struct AnchorReading {
 /// specific opponent, computed at each lap crossing.
 ///
 /// State is stored in a HashMap<(opponent_car_idx, anchor_bucket), BattleState>
-/// inside DynamicAnchorDetector. The state machine transitions are driven by
+/// inside NarrativeEngine. The state machine transitions are driven by
 /// the two-tier regression (see architecture.md §4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BattleState {
@@ -168,111 +168,62 @@ pub enum BattleState {
 
 ## 4. Narrative Events — Output Contract
 
-All detectors produce `RaceEvent` structs. These are the values that cross the napi boundary to Node.js and are forwarded to the cloud director.
-
-The `narrative_context` field implements the Decorator Pattern (spec §12): it extends the existing director event schema without breaking downstream consumers that do not read it.
+The `RaceEvent` enum is the sole output type. Values serialise to JSON with the `event_type` discriminator injected as a top-level key (`SCREAMING_SNAKE_CASE`). All fields cross the napi boundary as camelCase.
 
 ```rust
-use std::collections::HashMap;
-use serde_json::Value;
+use serde::Serialize;
+use crate::battle_state::SlopeInfo;
 
-/// A semantic narrative event emitted by the engine.
+/// All narrative events emitted by the engine.
 ///
-/// This struct is a superset of the director's existing RaceEvent schema.
-/// The `narrative_context` field is an extension — legacy consumers that
-/// do not read it continue to work without modification.
-#[derive(Debug, Clone, Serialize)]
-pub struct RaceEvent {
-    /// Canonical event type string consumed by the director.
-    /// Values: "BATTLE_OPENED", "PUSH_DETECTED", "ATTACK_SETUP",
-    ///         "OVERTAKE_DETECTED", "CLOSE_APPROACH", "PIT_ENTRY",
-    ///         "PIT_EXIT", "LAP_COMPLETE", "BATTLE_RESET_OPPONENT",
-    ///         "BATTLE_RESET_YELLOW", "POSITION_LOST"
-    pub event_type: &'static str,
-
-    /// Focus car's slot index in CarIdx arrays.
-    pub car_idx: usize,
-
-    /// Session time in seconds at the moment of emission.
-    pub session_time: f64,
-
-    /// Lap number on which the event occurred.
-    pub lap: u32,
-
-    /// Narrative metadata. All fields are optional — their presence
-    /// depends on event_type. The downstream AI narrator reads
-    /// `ai_prompt_hint` directly; it does not interpret raw telemetry.
-    pub narrative_context: NarrativeContext,
+/// `event_type` is injected by serde's internally-tagged format using
+/// `SCREAMING_SNAKE_CASE` renaming (`Push` → `"PUSH"`, `AttackSetup` → `"ATTACK_SETUP"`).
+/// `lap` and `session_time` are present in every variant.
+#[derive(Debug, Serialize)]
+#[serde(tag = "event_type", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RaceEvent {
+    // ── Lap-level (regression-driven) ─────────────────────────────────────
+    Push { lap: u8, session_time: f32, car_ahead_idx: u8, slope_info: SlopeInfo },
+    AttackSetup { lap: u8, session_time: f32, car_ahead_idx: u8, slope_info: SlopeInfo },
+    DefendPush { lap: u8, session_time: f32, car_behind_idx: u8, slope_info: SlopeInfo },
+    DefendAttack { lap: u8, session_time: f32, car_behind_idx: u8, slope_info: SlopeInfo },
+    // ── Frame-level (gap threshold) ────────────────────────────────────────
+    CloseApproach { lap: u8, session_time: f32, car_ahead_idx: u8, gap_s: f32, car_race_position: u8 },
+    PressureBehind { lap: u8, session_time: f32, car_behind_idx: u8, gap_s: f32, car_race_position: u8 },
+    // ── Position / pit ─────────────────────────────────────────────────────
+    LapComplete { lap: u8, session_time: f32, lap_time_s: Option<f32>, position: u8, pit_frames: u32 },
+    Overtake { lap: u8, session_time: f32, position_from: u8, position_to: u8, positions_gained: u8 },
+    PositionLost { lap: u8, session_time: f32, position_from: u8, position_to: u8, positions_lost: u8 },
+    PitEntry { lap: u8, session_time: f32, position: u8 },
+    PitExit { lap: u8, session_time: f32, position: u8 },
 }
 
-/// Narrative enrichment attached to every RaceEvent.
-///
-/// Fields are populated by the emitting detector. All fields are optional
-/// (None serialises as null in JSON). The ai_prompt_hint is a pre-computed
-/// English sentence the LLM can use directly in TTS output.
-#[derive(Debug, Clone, Serialize, Default)]
-pub struct NarrativeContext {
-    /// Opponent car's slot index (present for battle events).
-    pub opponent_car_idx: Option<usize>,
-
-    /// Median OLS slope across qualifying anchors (seconds per lap).
-    /// Negative = closing. Present for PUSH_DETECTED and ATTACK_SETUP.
-    pub closing_rate_s_per_lap: Option<f32>,
-
-    /// Rate of change of the regression slope (second derivative).
-    /// Negative = accelerating close. Present for ATTACK_SETUP only.
-    pub closing_rate_acceleration: Option<f32>,
-
-    /// LapDistPct of the anchor with the steepest negative per-anchor slope.
-    /// Lets the narrator say "closing hardest into Turn 3."
-    pub hotspot_lap_dist_pct: Option<f32>,
-
-    /// Number of anchors whose qualifying slope is < 0 (confidence signal).
-    pub anchors_agreeing: Option<usize>,
-
-    /// Count of clean laps included in the regression.
-    pub clean_laps_in_regression: Option<u32>,
-
-    /// Duration in seconds since BATTLE_OPENED for this opponent pair.
-    pub battle_duration_seconds: Option<f64>,
-
-    /// Gap in seconds at time of emission (for CLOSE_APPROACH events).
-    pub gap_seconds: Option<f32>,
-
-    /// Position at time of emission.
-    pub race_position: Option<u32>,
-
-    /// Net positions gained (+) or lost (-) relative to previous lap.
-    pub position_delta: Option<i32>,
-
-    /// Lap time in seconds (for LAP_COMPLETE events).
-    pub lap_time_seconds: Option<f32>,
-
-    /// Pre-computed English sentence for the AI narrator.
-    /// Example: "Paul has been closing on Car 31 at 0.43 s/lap for three
-    /// laps — hardest into the Karussell. An overtake attempt is likely."
-    pub ai_prompt_hint: Option<String>,
+/// Slope metadata attached to regression-driven events (Push, AttackSetup, DefendPush, DefendAttack).
+#[derive(Debug, Serialize)]
+pub struct SlopeInfo {
+    /// Median OLS slope across all qualifying anchors (s/lap). Negative = closing.
+    pub median_slope: f32,
+    /// Index of the anchor bucket with the steepest negative per-anchor slope.
+    pub hotspot_bucket: usize,
+    /// Number of anchors whose qualifying slope passed the threshold.
+    pub qualifying_anchors: usize,
 }
 ```
 
 ### 4.1 Serialised Example Payloads
 
-**`PUSH_DETECTED`** — emitted at lap crossing when `BattleState` first transitions to `Push`:
+**`PUSH`** — emitted at lap crossing when `BattleState` first transitions to `Push`:
 
 ```json
 {
-  "event_type": "PUSH_DETECTED",
-  "car_idx": 18,
-  "session_time": 480.2,
+  "event_type": "PUSH",
   "lap": 3,
-  "narrative_context": {
-    "opponent_car_idx": 31,
-    "closing_rate_s_per_lap": -0.43,
-    "hotspot_lap_dist_pct": 0.29,
-    "anchors_agreeing": 28,
-    "clean_laps_in_regression": 2,
-    "battle_duration_seconds": 187.4,
-    "ai_prompt_hint": "Paul has been closing on Car 31 at 0.43 s/lap for two clean laps — hardest at 29% of the lap (approaching the Karussell). An overtake attempt is developing."
+  "session_time": 480.2,
+  "car_ahead_idx": 7,
+  "slope_info": {
+    "median_slope": -0.4998,
+    "hotspot_bucket": 8,
+    "qualifying_anchors": 28
   }
 }
 ```
@@ -282,18 +233,13 @@ pub struct NarrativeContext {
 ```json
 {
   "event_type": "ATTACK_SETUP",
-  "car_idx": 18,
-  "session_time": 620.4,
   "lap": 4,
-  "narrative_context": {
-    "opponent_car_idx": 31,
-    "closing_rate_s_per_lap": -0.60,
-    "closing_rate_acceleration": -0.10,
-    "hotspot_lap_dist_pct": 0.29,
-    "anchors_agreeing": 28,
-    "clean_laps_in_regression": 3,
-    "battle_duration_seconds": 327.8,
-    "ai_prompt_hint": "The closing rate is accelerating — Paul is now hunting Car 31 harder each lap. This looks like a deliberate setup for an overtake attempt."
+  "session_time": 620.4,
+  "car_ahead_idx": 7,
+  "slope_info": {
+    "median_slope": -0.5999,
+    "hotspot_bucket": 8,
+    "qualifying_anchors": 28
   }
 }
 ```
@@ -303,15 +249,11 @@ pub struct NarrativeContext {
 ```json
 {
   "event_type": "CLOSE_APPROACH",
-  "car_idx": 18,
-  "session_time": 892.3,
   "lap": 6,
-  "narrative_context": {
-    "opponent_car_idx": 7,
-    "gap_seconds": 0.60,
-    "race_position": 11,
-    "ai_prompt_hint": "Paul is within 0.6 s of Car 7 — switch to battle cam."
-  }
+  "session_time": 892.3,
+  "car_ahead_idx": 7,
+  "gap_s": 0.60,
+  "car_race_position": 11
 }
 ```
 
@@ -416,128 +358,90 @@ impl LapTimer {
 }
 ```
 
-### 5.4 `DynamicAnchorDetector`
+### 5.4 `NarrativeEngine` internals
 
-The main state machine. Implements `StoryDetector`.
+All state is owned by `NarrativeEngine` (see §6). The internal layout mirrors the pipeline:
 
-```rust
-/// Spatial anchor battle detector.
-///
-/// Implements the full two-tier pipeline from architecture.md:
-///   1. find_car_ahead_ldp() — identify opponent and compute gap
-///   2. AnchorSampler — record first anchor crossing per lap
-///   3. RegressionStore — per-(bucket, car_idx) OLS at lap crossing
-///   4. Two-tier median slope → BattleState transition
-///   5. Emit RaceEvent with narrative_context
-///
-/// One instance tracks one focus driver (player_car_idx).
-pub struct DynamicAnchorDetector {
-    config: AnchorDetectorConfig,
-    lap_timer: LapTimer,
-    sampler: AnchorSampler,     // rebuilt from anchor_count at first lap crossing
-    regression: RegressionStore,
-    state: BattleState,
-    prev_regression_slope: Option<f32>,
-    pit_frame_count: HashMap<u32, u32>,    // lap → pit frame count
-    pit_laps: HashSet<u32>,
-    prev_lap: Option<u32>,
-    prev_position: Option<u32>,
-    lap_end_positions: HashMap<u32, u32>,  // lap → position at crossing
-    anchor_count: usize,                   // recomputed from first completed lap time
-}
-
-/// Configuration constants for DynamicAnchorDetector.
-#[derive(Debug, Clone)]
-pub struct AnchorDetectorConfig {
-    pub target_cadence_s: f64,       // default: 5.0
-    pub min_push_readings: usize,    // default: 2
-    pub min_attack_readings: usize,  // default: 3
-    pub push_slope_threshold: f32,   // default: -0.05 s/lap
-    pub attack_slope_threshold: f32, // default: -0.10 s/lap
-    pub max_battle_gap_s: f32,       // default: 5.0 s
-    pub pit_lap_frame_thresh: u32,   // default: 20 frames
-    pub close_approach_thresh_s: f32, // default: 1.5 s
-    pub close_approach_min_frames: u32, // default: 5 frames
-    pub fallback_lap_time_s: f64,    // default: 540.0 (Nürburgring Combined)
-    pub known_yellow_zones: Vec<(u32, f32, f32)>, // (lap, ldp_start, ldp_end)
-}
+```
+NarrativeEngine
+  ├─ anchor_sampler:   AnchorSampler       — per-lap gap readings per bucket
+  ├─ regression_store: RegressionStore     — per-(bucket, car_idx) OLS ring buffers
+  ├─ lap_timer:        LapTimer            — lap-crossing detection
+  ├─ battle_state:     BattleState         — IDLE / TRACKING / PUSH / ATTACK_SETUP FSM
+  └─ (position/pit tracking)              — frame-level event detection
 ```
 
 ---
 
-## 6. Engine and Detector Trait
+## 6. Engine API
+
+The `NarrativeEngine` struct is the single entry point. It owns all state (samplers, regression stores, lap timer) and is constructed once per session.
 
 ```rust
-/// Interface implemented by every narrative detector.
-///
-/// Detectors are fully self-contained: each owns its own ring buffers,
-/// state machines, and derivative math. The TelemetryEngine does not
-/// know what any detector does internally — it only calls on_tick().
-pub trait StoryDetector: Send {
+pub struct NarrativeEngine { /* private */ }
+
+impl NarrativeEngine {
+    /// Create a new engine.
+    ///
+    /// `anchor_count`: number of equally-spaced spatial buckets around the
+    /// track. Use `replay::compute_anchor_count(frames)` to derive this from
+    /// the first completed lap time (target cadence = 5 s/anchor).
+    pub fn new(anchor_count: usize) -> Self;
+
     /// Process one telemetry frame. Returns zero or more narrative events.
-    /// Called at 5Hz (every 200 ms) in both live and replay modes.
-    fn on_tick(&mut self, frame: &TelemetryFrame) -> Vec<RaceEvent>;
-
-    /// Unique detector name for logging and metrics.
-    fn name(&self) -> &'static str;
+    /// Called at 5Hz in both live and JSONL-replay modes.
+    pub fn process_frame(&mut self, frame: &TelemetryFrame) -> Vec<RaceEvent>;
 }
+```
 
-/// The engine. Owns a list of detectors and fans each tick out to all of them.
-/// Holds no state of its own — all domain logic lives inside detectors.
-pub struct TelemetryEngine {
-    detectors: Vec<Box<dyn StoryDetector>>,
-}
+For batch / replay use:
 
-impl TelemetryEngine {
-    pub fn new() -> Self;
-    pub fn register_detector(&mut self, detector: Box<dyn StoryDetector>);
-    
-    /// Process one frame. Returns all events from all detectors.
-    pub fn process_tick(&mut self, frame: TelemetryFrame) -> Vec<RaceEvent>;
-}
+```rust
+// replay.rs
+pub fn compute_anchor_count(frames: &[TelemetryFrame]) -> usize;
+pub fn replay_frames(frames: &[TelemetryFrame]) -> Vec<RaceEvent>;
 ```
 
 ---
 
 ## 7. napi-rs Public API
 
-The Node.js-visible entry point. JSON-in / JSON-out across the napi boundary.
+The Node.js-visible entry point. The napi crate (`napi/`) wraps `NarrativeEngine` behind a JavaScript class. All fields cross the napi boundary as camelCase.
 
-```rust
-#[napi]
-pub struct NativeTelemetryPublisher {
-    engine: TelemetryEngine,
+```typescript
+// JavaScript / TypeScript API (generated by napi-rs)
+
+interface TelemetryFrame {
+  lap: number;
+  sessionTime: number;
+  lapDistPct: number;
+  playerCarIdx: number;
+  carIdxLapDistPct: number[];
+  carIdxF2Time: number[];
+  carIdxPosition: number[];
+  carIdxOnPitRoad: boolean[];
+  sessionFlags: number;
 }
 
-#[napi]
-impl NativeTelemetryPublisher {
-    /// Construct a publisher with the default detector set registered.
-    /// config_json: JSON-serialised AnchorDetectorConfig.
-    #[napi(constructor)]
-    pub fn new(config_json: String) -> napi::Result<Self> {
-        let config: AnchorDetectorConfig = serde_json::from_str(&config_json)
-            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
-        let mut engine = TelemetryEngine::new();
-        engine.register_detector(Box::new(DynamicAnchorDetector::new(config)));
-        Ok(Self { engine })
-    }
-
-    /// Process one telemetry frame.
-    ///
-    /// frame_json: JSON-serialised TelemetryFrame.
-    /// Returns: JSON array of RaceEvent (may be empty).
-    ///
-    /// Errors: malformed JSON is surfaced as a typed napi error — not a panic.
-    /// Never call .unwrap() on input crossing this boundary.
-    #[napi]
-    pub fn process_tick(&mut self, frame_json: String) -> napi::Result<String> {
-        let frame: TelemetryFrame = serde_json::from_str(&frame_json)
-            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
-        let events = self.engine.process_tick(frame);
-        serde_json::to_string(&events)
-            .map_err(|e| napi::Error::from_reason(e.to_string()))
-    }
+interface RaceEvent {
+  eventType: string;       // "PUSH", "ATTACK_SETUP", "CLOSE_APPROACH", etc.
+  lap: number;
+  sessionTime: number;
+  narrativeContext: Record<string, unknown>;  // event-specific fields, camelCase
 }
+
+class NarrativeEngine {
+  constructor(anchorCount: number);
+  processFrame(frame: TelemetryFrame): RaceEvent[];
+}
+```
+
+Usage in Node.js:
+
+```javascript
+const { NarrativeEngine } = require('./napi/index.node');
+const engine = new NarrativeEngine(28);
+const events = engine.processFrame(frame);  // returns RaceEvent[]
 ```
 
 ---
@@ -546,35 +450,27 @@ impl NativeTelemetryPublisher {
 
 ```
 director-narrative-core/
-├── Cargo.toml
+├── Cargo.toml                  # Workspace root: members [".", "napi"]
 ├── src/
-│   ├── lib.rs                  # napi-rs public API (NativeTelemetryPublisher)
-│   ├── engine.rs               # TelemetryEngine + StoryDetector trait
-│   ├── models.rs               # TelemetryFrame, RaceEvent, NarrativeContext
-│   ├── detectors/
-│   │   ├── mod.rs
-│   │   ├── anchor.rs           # DynamicAnchorDetector (primary)
-│   │   ├── frame_events.rs     # CLOSE_APPROACH, PIT_ENTRY/EXIT, OVERTAKE
-│   │   └── future/
-│   │       ├── tyre_deg.rs     # TireDegradationDetector (Phase 2)
-│   │       └── fuel_window.rs  # FuelWindowDetector (Phase 2)
-│   ├── math/
-│   │   ├── ols.rs              # ols_slope() — linear regression
-│   │   ├── sampler.rs          # AnchorSampler + AnchorSample
-│   │   └── regression.rs       # RegressionStore
-│   └── lap_timer.rs            # LapTimer
+│   ├── lib.rs                  # Module declarations
+│   ├── engine.rs               # NarrativeEngine — process_frame() entry point
+│   ├── anchor_sampler.rs       # Per-lap gap sampling at fixed track positions
+│   ├── regression_store.rs     # Per-anchor OLS ring buffers
+│   ├── battle_state.rs         # BattleState FSM + classify()
+│   ├── gap_finder.rs           # find_cars_ahead() / find_cars_behind()
+│   ├── lap_timer.rs            # Lap crossing detection
+│   ├── race_event.rs           # RaceEvent enum (all narrative output types)
+│   ├── replay.rs               # replay_frames() + compute_anchor_count()
+│   ├── telemetry_frame.rs      # TelemetryFrame input struct
+│   └── bin/replay.rs           # CLI binary
+├── napi/
+│   ├── Cargo.toml              # cdylib with napi4 + serde-json features
+│   └── src/lib.rs              # NarrativeEngine napi class + JS type definitions
 ├── tests/
-│   ├── fixtures/
-│   │   ├── nurburgring_5lap.jsonl       # Real-world: 5 laps, no PUSH/ATTACK
-│   │   ├── synthetic_push.jsonl         # Slow approach → PUSH at lap 3
-│   │   ├── synthetic_attack.jsonl       # Accelerating close → ATTACK_SETUP lap 4
-│   │   ├── synthetic_yellow.jsonl       # Yellow flag contamination scenario
-│   │   └── synthetic_opponent_change.jsonl  # Opponent identity change mid-battle
-│   ├── anchor_detector_test.rs
-│   ├── regression_test.rs
-│   └── ols_test.rs
-└── scripts/
-    ├── prototype_narrative.py       # Python validation prototype (reference)
-    ├── synthesize_test_fixture.py   # Generates synthetic JSONL fixtures
-    └── export_replay.py             # Windows: exports iRacing replay to JSONL
+│   └── fixture.rs              # Integration tests: PUSH @ lap 3, ATTACK_SETUP @ lap 4, CLOSE_APPROACH @ lap 6
+├── listener/
+│   └── index.js                # Node.js end-to-end demo
+└── data/
+    ├── test_fixture.jsonl      # Synthetic fixture (gitignored, 7000 frames)
+    └── session.jsonl           # Real Nürburgring session (gitignored, 31 MB)
 ```
