@@ -4,6 +4,7 @@ pub mod config;
 pub mod engine;
 pub mod gap_finder;
 pub mod lap_timer;
+pub mod lifecycle;
 pub mod publisher_event;
 pub mod race_event;
 pub mod regression_store;

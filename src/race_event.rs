@@ -96,4 +96,24 @@ pub enum RaceEvent {
         session_time: f32,
         position:     u8,
     },
+    // ── Lifecycle ─────────────────────────────────────────────────────────────
+    /// Sent once after successful registration, before any telemetry events.
+    PublisherHello {
+        lap:          u8,
+        session_time: f32,
+        /// Binary version string (e.g. `"0.1.0"`).
+        version:      String,
+        /// Publisher scope — always `"driver"` for this binary.
+        scope:        String,
+    },
+    /// Liveness heartbeat — sent every 30 s while the session is bound.
+    PublisherHeartbeat {
+        lap:          u8,
+        session_time: f32,
+    },
+    /// Sent on clean shutdown (Ctrl-C / SIGTERM) before process exit.
+    PublisherGoodbye {
+        lap:          u8,
+        session_time: f32,
+    },
 }
