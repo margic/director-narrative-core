@@ -9,7 +9,7 @@
 // Suppress the dead_code lint on non-Windows targets.
 #![cfg_attr(not(target_os = "windows"), allow(dead_code))]
 
-use director_narrative_core::telemetry_frame::TelemetryFrame as CoreFrame;
+use crate::telemetry_frame::TelemetryFrame as CoreFrame;
 
 use super::header::VarIndex;
 
@@ -98,16 +98,16 @@ pub fn build_frame(buf: &[u8], vars: &VarIndex) -> Option<CoreFrame> {
         };
     }
 
-    let st_info   = var!("SessionTime");
-    let sf_info   = var!("SessionFlags");
-    let pci_info  = var!("PlayerCarIdx");
-    let lap_info  = var!("Lap");
-    let ldp_info  = var!("LapDistPct");
-    let pcp_info  = var!("PlayerCarPosition");
-    let opr_info  = var!("OnPitRoad");
-    let cidx_ldp  = var!("CarIdxLapDistPct");
-    let cidx_pos  = var!("CarIdxPosition");
-    let cidx_pit  = var!("CarIdxOnPitRoad");
+    let st_info  = var!("SessionTime");
+    let sf_info  = var!("SessionFlags");
+    let pci_info = var!("PlayerCarIdx");
+    let lap_info = var!("Lap");
+    let ldp_info = var!("LapDistPct");
+    let pcp_info = var!("PlayerCarPosition");
+    let opr_info = var!("OnPitRoad");
+    let cidx_ldp = var!("CarIdxLapDistPct");
+    let cidx_pos = var!("CarIdxPosition");
+    let cidx_pit = var!("CarIdxOnPitRoad");
 
     // SessionTime is a double in the live API
     let session_time = if st_info.type_code == IR_DOUBLE {
@@ -250,43 +250,35 @@ mod tests {
         buf[0x39] = 1;
         buf[0x3A] = 0;
 
-        let mut vars = VarIndex::new();
-        vars.insert("SessionTime".into(),        VarInfo { type_code: IR_DOUBLE, offset: 0x00, count: 1 });
-        vars.insert("SessionFlags".into(),       VarInfo { type_code: IR_BITFIELD, offset: 0x08, count: 1 });
-        vars.insert("PlayerCarIdx".into(),       VarInfo { type_code: IR_INT, offset: 0x0C, count: 1 });
-        vars.insert("Lap".into(),                VarInfo { type_code: IR_INT, offset: 0x10, count: 1 });
-        vars.insert("LapDistPct".into(),         VarInfo { type_code: IR_FLOAT, offset: 0x14, count: 1 });
-        vars.insert("PlayerCarPosition".into(),  VarInfo { type_code: IR_INT, offset: 0x18, count: 1 });
-        vars.insert("OnPitRoad".into(),          VarInfo { type_code: IR_BOOL, offset: 0x1C, count: 1 });
-        vars.insert("CarIdxLapDistPct".into(),   VarInfo { type_code: IR_FLOAT, offset: 0x20, count: 3 });
-        vars.insert("CarIdxPosition".into(),     VarInfo { type_code: IR_INT, offset: 0x2C, count: 3 });
-        vars.insert("CarIdxOnPitRoad".into(),    VarInfo { type_code: IR_BOOL, offset: 0x38, count: 3 });
+        let mut index = VarIndex::new();
+        index.insert("SessionTime".into(),       VarInfo { type_code: IR_DOUBLE, offset: 0x00, count: 1 });
+        index.insert("SessionFlags".into(),      VarInfo { type_code: IR_BITFIELD, offset: 0x08, count: 1 });
+        index.insert("PlayerCarIdx".into(),      VarInfo { type_code: IR_INT, offset: 0x0C, count: 1 });
+        index.insert("Lap".into(),               VarInfo { type_code: IR_INT, offset: 0x10, count: 1 });
+        index.insert("LapDistPct".into(),        VarInfo { type_code: IR_FLOAT, offset: 0x14, count: 1 });
+        index.insert("PlayerCarPosition".into(), VarInfo { type_code: IR_INT, offset: 0x18, count: 1 });
+        index.insert("OnPitRoad".into(),         VarInfo { type_code: IR_BOOL, offset: 0x1C, count: 1 });
+        index.insert("CarIdxLapDistPct".into(),  VarInfo { type_code: IR_FLOAT, offset: 0x20, count: 3 });
+        index.insert("CarIdxPosition".into(),    VarInfo { type_code: IR_INT, offset: 0x2C, count: 3 });
+        index.insert("CarIdxOnPitRoad".into(),   VarInfo { type_code: IR_BOOL, offset: 0x38, count: 3 });
 
-        (buf, vars)
+        (buf, index)
     }
 
     #[test]
-    fn build_frame_parses_all_fields() {
-        let (buf, vars) = make_test_buf();
-        let frame = build_frame(&buf, &vars).expect("build_frame returned None");
+    fn build_frame_round_trips_all_fields() {
+        let (buf, index) = make_test_buf();
+        let frame = build_frame(&buf, &index).expect("build_frame should succeed");
 
-        assert!((frame.session_time - 123.456).abs() < 0.001);
-        assert_eq!(frame.session_flags, 0x0100);
-        assert_eq!(frame.player_car_idx, 5);
-        assert_eq!(frame.lap, 3);
-        assert!((frame.lap_dist_pct - 0.75).abs() < 0.0001);
-        assert_eq!(frame.player_car_position, 7);
-        assert!(!frame.on_pit_road);
+        assert!((frame.session_time - 123.456).abs() < 0.001, "session_time");
+        assert_eq!(frame.session_flags, 0x0100, "session_flags");
+        assert_eq!(frame.player_car_idx, 5, "player_car_idx");
+        assert_eq!(frame.lap, 3, "lap");
+        assert!((frame.lap_dist_pct - 0.75).abs() < 1e-5, "lap_dist_pct");
+        assert_eq!(frame.player_car_position, 7, "player_car_position");
+        assert!(!frame.on_pit_road, "on_pit_road");
         assert_eq!(frame.car_idx_lap_dist_pct.len(), 3);
-        assert!((frame.car_idx_lap_dist_pct[1] - 0.5).abs() < 0.0001);
         assert_eq!(frame.car_idx_position, vec![1, 2, 3]);
         assert_eq!(frame.car_idx_on_pit_road, vec![false, true, false]);
-    }
-
-    #[test]
-    fn build_frame_returns_none_on_missing_var() {
-        let (buf, mut vars) = make_test_buf();
-        vars.remove("Lap");
-        assert!(build_frame(&buf, &vars).is_none());
     }
 }

@@ -10,54 +10,59 @@ use crate::battle_state::SlopeInfo;
 #[derive(Debug, Serialize)]
 #[serde(tag = "event_type", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum RaceEvent {
-    // ── Lap-level (regression-driven) ────────────────────────────────────────
-    Push {
-        lap:           u8,
-        session_time:  f32,
-        car_ahead_idx: u8,
-        slope_info:    SlopeInfo,
-    },
-    AttackSetup {
-        lap:           u8,
-        session_time:  f32,
-        car_ahead_idx: u8,
-        slope_info:    SlopeInfo,
-    },
-    DefendPush {
-        lap:            u8,
-        session_time:   f32,
-        car_behind_idx: u8,
-        slope_info:     SlopeInfo,
-    },
-    DefendAttack {
-        lap:            u8,
-        session_time:   f32,
-        car_behind_idx: u8,
-        slope_info:     SlopeInfo,
-    },
-    // ── Frame-level (gap threshold) ───────────────────────────────────────────
-    CloseApproach {
+    // ── Battle / gap ─────────────────────────────────────────────────────────
+    /// Gap to a nearby car is below the battle threshold.
+    /// Fires from lap 1 — no OLS regression required.
+    BattleEngaged {
         lap:               u8,
         session_time:      f32,
-        car_ahead_idx:     u8,
+        /// Opponent car index (ahead or behind the player).
+        car_idx:           u8,
         gap_s:             f32,
         car_race_position: u8,
     },
-    PressureBehind {
-        lap:               u8,
-        session_time:      f32,
-        car_behind_idx:    u8,
-        gap_s:             f32,
-        car_race_position: u8,
-    },
-    // ── Position / pit ────────────────────────────────────────────────────────
-    LapComplete {
+    /// Gap that previously triggered `BATTLE_ENGAGED` has widened beyond the threshold.
+    BattleBroken {
         lap:          u8,
         session_time: f32,
-        lap_time_s:   Option<f32>,
-        position:     u8,
-        pit_frames:   u32,
+        /// Opponent car index that was the subject of the prior `BATTLE_ENGAGED`.
+        car_idx:      u8,
+        gap_s:        f32,
     },
+    /// OLS regression confirms a sustained closing rate to a nearby opponent.
+    /// Covers both attacker (closing on car ahead) and defender (car behind closing)
+    /// perspectives; the `car_idx` field identifies the opponent.
+    BattleClosing {
+        lap:                      u8,
+        session_time:             f32,
+        car_idx:                  u8,
+        /// Closing rate in seconds per lap (positive = closing, from |median_slope|).
+        closing_rate_sec_per_lap: f32,
+        slope_info:               SlopeInfo,
+    },
+    // ── Session / flag ────────────────────────────────────────────────────────
+    /// `SessionState` transitioned to Racing (4) and the green flag bit is set.
+    RaceGreen {
+        lap:          u8,
+        session_time: f32,
+    },
+    /// Full-course yellow flag (Caution) became active.
+    FlagYellowFullCourse {
+        lap:          u8,
+        session_time: f32,
+    },
+    /// Local (sector) yellow flag became active.
+    FlagYellowLocal {
+        lap:          u8,
+        session_time: f32,
+    },
+    /// `SessionState` transitioned to Checkered (5).
+    RaceCheckered {
+        lap:          u8,
+        session_time: f32,
+    },
+    // ── Position ──────────────────────────────────────────────────────────────
+    /// Player gained at least one position at a lap crossing (non-pit lap).
     Overtake {
         lap:              u8,
         session_time:     f32,
@@ -65,12 +70,21 @@ pub enum RaceEvent {
         position_to:      u8,
         positions_gained: u8,
     },
-    PositionLost {
-        lap:             u8,
-        session_time:    f32,
-        position_from:   u8,
-        position_to:     u8,
-        positions_lost:  u8,
+    /// Player gained the lead at a lap crossing.
+    OvertakeForLead {
+        lap:              u8,
+        session_time:     f32,
+        position_from:    u8,
+        positions_gained: u8,
+    },
+    // ── Lap / pit ─────────────────────────────────────────────────────────────
+    LapCompleted {
+        lap:           u8,
+        session_time:  f32,
+        lap_time_s:    Option<f32>,
+        best_lap_time_s: Option<f32>,
+        position:      u8,
+        pit_frames:    u32,
     },
     PitEntry {
         lap:          u8,
@@ -81,5 +95,25 @@ pub enum RaceEvent {
         lap:          u8,
         session_time: f32,
         position:     u8,
+    },
+    // ── Lifecycle ─────────────────────────────────────────────────────────────
+    /// Sent once after successful registration, before any telemetry events.
+    PublisherHello {
+        lap:          u8,
+        session_time: f32,
+        /// Binary version string (e.g. `"0.1.0"`).
+        version:      String,
+        /// Publisher scope — always `"driver"` for this binary.
+        scope:        String,
+    },
+    /// Liveness heartbeat — sent every 30 s while the session is bound.
+    PublisherHeartbeat {
+        lap:          u8,
+        session_time: f32,
+    },
+    /// Sent on clean shutdown (Ctrl-C / SIGTERM) before process exit.
+    PublisherGoodbye {
+        lap:          u8,
+        session_time: f32,
     },
 }

@@ -52,6 +52,10 @@ pub struct NarrativeEngine {
     pit_laps:           HashSet<u8>,
     lap_end_positions:  HashMap<u8, u8>,
     lap_pit_frames:     HashMap<u8, u32>,
+    best_lap_time_s:    Option<f32>,
+    // Battle-engaged tracking — cars currently within battle gap
+    engaged_cars:       HashSet<u8>,
+    engaged_cars_beh:   HashSet<u8>,
     // Close-approach tracking (forward + defensive)
     consecutive_close:      u32,
     last_close_t:           f32,
@@ -59,6 +63,9 @@ pub struct NarrativeEngine {
     consecutive_close_beh:  u32,
     last_close_beh_t:       f32,
     tracking_car_beh:       Option<u8>,
+    // Session/flag carry-over
+    prev_session_state: i32,
+    prev_session_flags: u32,
     // Frame-level carry-over (overwritten each call, plain fields not references)
     prev_lap:           Option<u8>,
     prev_on_pit:        bool,
@@ -83,12 +90,17 @@ impl NarrativeEngine {
             pit_laps:           HashSet::new(),
             lap_end_positions:  HashMap::new(),
             lap_pit_frames:     HashMap::new(),
+            best_lap_time_s:    None,
+            engaged_cars:       HashSet::new(),
+            engaged_cars_beh:   HashSet::new(),
             consecutive_close:      0,
             last_close_t:           f32::NEG_INFINITY,
             tracking_car:           None,
             consecutive_close_beh:  0,
             last_close_beh_t:       f32::NEG_INFINITY,
             tracking_car_beh:       None,
+            prev_session_state: 0,
+            prev_session_flags: 0,
             prev_lap:           None,
             prev_on_pit:        false,
             prev_position:      None,
@@ -104,6 +116,24 @@ impl NarrativeEngine {
         let pos   = frame.player_car_position;
         let ldp   = frame.lap_dist_pct;
         let on_pit = frame.on_pit_road;
+
+        let session_state = frame.session_state;
+        let session_flags = frame.session_flags;
+
+        // ── Session / flag transitions ─────────────────────────────────────
+        if session_state == 4 && self.prev_session_state != 4 {
+            events.push(RaceEvent::RaceGreen { lap, session_time: t });
+        }
+        if session_state == 5 && self.prev_session_state != 5 {
+            events.push(RaceEvent::RaceCheckered { lap, session_time: t });
+        }
+        if session_flags & CAUTION != 0 && self.prev_session_flags & CAUTION == 0 {
+            events.push(RaceEvent::FlagYellowFullCourse { lap, session_time: t });
+        } else if session_flags & YELLOW_WAVE != 0 && self.prev_session_flags & YELLOW_WAVE == 0 {
+            events.push(RaceEvent::FlagYellowLocal { lap, session_time: t });
+        }
+        self.prev_session_state = session_state;
+        self.prev_session_flags = session_flags;
 
         // Skip frames before the race starts
         if pos == 0 || lap < 1 {
@@ -146,7 +176,7 @@ impl NarrativeEngine {
             events.push(RaceEvent::PitExit { lap, session_time: t, position: pos });
         }
 
-        // ── Close approach (cars ahead) ────────────────────────────────────
+        // ── Battle engaged / broken (cars ahead) ──────────────────────────
         match nearest_ahead {
             Some((car_idx, gap)) if gap < CLOSE_APPROACH_THRESH_S => {
                 self.consecutive_close += 1;
@@ -156,12 +186,13 @@ impl NarrativeEngine {
                 {
                     self.tracking_car  = Some(car_idx);
                     self.last_close_t  = t;
+                    self.engaged_cars.insert(car_idx);
                     let car_race_position = frame.car_idx_position
                         .get(car_idx as usize).copied().unwrap_or(0);
-                    events.push(RaceEvent::CloseApproach {
+                    events.push(RaceEvent::BattleEngaged {
                         lap,
                         session_time:      t,
-                        car_ahead_idx:     car_idx,
+                        car_idx,
                         gap_s:             gap,
                         car_race_position,
                     });
@@ -171,12 +202,24 @@ impl NarrativeEngine {
                 self.consecutive_close = 0;
                 let current_idx = other.map(|(c, _)| c);
                 if current_idx != self.tracking_car {
+                    // Emit BATTLE_BROKEN for any car that was engaged but is now gone
+                    if let Some(prev_car) = self.tracking_car {
+                        if self.engaged_cars.remove(&prev_car) {
+                            let gap_s = other.map(|(_, g)| g).unwrap_or(f32::MAX);
+                            events.push(RaceEvent::BattleBroken {
+                                lap,
+                                session_time: t,
+                                car_idx: prev_car,
+                                gap_s,
+                            });
+                        }
+                    }
                     self.tracking_car = None;
                 }
             }
         }
 
-        // ── Pressure behind ────────────────────────────────────────────────
+        // ── Battle engaged / broken (cars behind) ─────────────────────────
         match nearest_behind {
             Some((car_idx, gap)) if gap < CLOSE_APPROACH_THRESH_S => {
                 self.consecutive_close_beh += 1;
@@ -186,12 +229,13 @@ impl NarrativeEngine {
                 {
                     self.tracking_car_beh  = Some(car_idx);
                     self.last_close_beh_t  = t;
+                    self.engaged_cars_beh.insert(car_idx);
                     let car_race_position = frame.car_idx_position
                         .get(car_idx as usize).copied().unwrap_or(0);
-                    events.push(RaceEvent::PressureBehind {
+                    events.push(RaceEvent::BattleEngaged {
                         lap,
                         session_time:      t,
-                        car_behind_idx:    car_idx,
+                        car_idx,
                         gap_s:             gap,
                         car_race_position,
                     });
@@ -201,6 +245,17 @@ impl NarrativeEngine {
                 self.consecutive_close_beh = 0;
                 let current_idx = other.map(|(c, _)| c);
                 if current_idx != self.tracking_car_beh {
+                    if let Some(prev_car) = self.tracking_car_beh {
+                        if self.engaged_cars_beh.remove(&prev_car) {
+                            let gap_s = other.map(|(_, g)| g).unwrap_or(f32::MAX);
+                            events.push(RaceEvent::BattleBroken {
+                                lap,
+                                session_time: t,
+                                car_idx: prev_car,
+                                gap_s,
+                            });
+                        }
+                    }
                     self.tracking_car_beh = None;
                 }
             }
@@ -220,11 +275,19 @@ impl NarrativeEngine {
                 let end_pos = self.prev_position.unwrap_or(pos);
                 self.lap_end_positions.insert(done_lap, end_pos);
 
-                events.push(RaceEvent::LapComplete {
-                    lap:        done_lap,
-                    session_time: t,
-                    lap_time_s: self.lap_timer.completed(done_lap),
-                    position:   end_pos,
+                let lap_time_s = self.lap_timer.completed(done_lap);
+                if let Some(lt) = lap_time_s {
+                    self.best_lap_time_s = Some(match self.best_lap_time_s {
+                        Some(best) if best <= lt => best,
+                        _ => lt,
+                    });
+                }
+                events.push(RaceEvent::LapCompleted {
+                    lap:            done_lap,
+                    session_time:   t,
+                    lap_time_s,
+                    best_lap_time_s: self.best_lap_time_s,
+                    position:       end_pos,
                     pit_frames,
                 });
 
@@ -233,19 +296,20 @@ impl NarrativeEngine {
                     if done_lap > 0 {
                         let delta = prev_pos as i16 - end_pos as i16;
                         if delta > 0 && !self.pit_laps.contains(&done_lap) {
-                            events.push(RaceEvent::Overtake {
-                                lap: done_lap, session_time: t,
-                                position_from:    prev_pos,
-                                position_to:      end_pos,
-                                positions_gained: delta as u8,
-                            });
-                        } else if delta < 0 {
-                            events.push(RaceEvent::PositionLost {
-                                lap: done_lap, session_time: t,
-                                position_from:   prev_pos,
-                                position_to:     end_pos,
-                                positions_lost:  (-delta) as u8,
-                            });
+                            if end_pos == 1 {
+                                events.push(RaceEvent::OvertakeForLead {
+                                    lap: done_lap, session_time: t,
+                                    position_from:    prev_pos,
+                                    positions_gained: delta as u8,
+                                });
+                            } else {
+                                events.push(RaceEvent::Overtake {
+                                    lap: done_lap, session_time: t,
+                                    position_from:    prev_pos,
+                                    position_to:      end_pos,
+                                    positions_gained: delta as u8,
+                                });
+                            }
                         }
                     }
                 }
@@ -263,19 +327,13 @@ impl NarrativeEngine {
 
                 if fwd.state != self.engine_state {
                     match &fwd.state {
-                        BattleState::Push => {
+                        BattleState::Push | BattleState::AttackSetup => {
                             if let (Some(car_idx), Some(si)) = (fwd.threat_car, fwd.slope_info.clone()) {
-                                events.push(RaceEvent::Push {
+                                events.push(RaceEvent::BattleClosing {
                                     lap: done_lap, session_time: t,
-                                    car_ahead_idx: car_idx, slope_info: si,
-                                });
-                            }
-                        }
-                        BattleState::AttackSetup => {
-                            if let (Some(car_idx), Some(si)) = (fwd.threat_car, fwd.slope_info.clone()) {
-                                events.push(RaceEvent::AttackSetup {
-                                    lap: done_lap, session_time: t,
-                                    car_ahead_idx: car_idx, slope_info: si,
+                                    car_idx,
+                                    closing_rate_sec_per_lap: si.median_slope.abs(),
+                                    slope_info: si,
                                 });
                             }
                         }
@@ -300,19 +358,13 @@ impl NarrativeEngine {
 
                 if def.state != self.defensive_state {
                     match &def.state {
-                        BattleState::Push => {
+                        BattleState::Push | BattleState::AttackSetup => {
                             if let (Some(car_idx), Some(si)) = (def.threat_car, def.slope_info.clone()) {
-                                events.push(RaceEvent::DefendPush {
+                                events.push(RaceEvent::BattleClosing {
                                     lap: done_lap, session_time: t,
-                                    car_behind_idx: car_idx, slope_info: si,
-                                });
-                            }
-                        }
-                        BattleState::AttackSetup => {
-                            if let (Some(car_idx), Some(si)) = (def.threat_car, def.slope_info.clone()) {
-                                events.push(RaceEvent::DefendAttack {
-                                    lap: done_lap, session_time: t,
-                                    car_behind_idx: car_idx, slope_info: si,
+                                    car_idx,
+                                    closing_rate_sec_per_lap: si.median_slope.abs(),
+                                    slope_info: si,
                                 });
                             }
                         }
@@ -347,5 +399,119 @@ fn synthesize_flags(lap: u8, ldp: f32) -> u32 {
         }
     }
     0
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal TelemetryFrame. Player is car_idx=0 at position 5.
+    /// `opponent_ldp` places car 1 just ahead with a ~0.54 s gap (540 s fallback lap).
+    fn frame_with_gap(lap: u8, t: f32, session_state: i32, opponent_ldp: f32) -> TelemetryFrame {
+        TelemetryFrame {
+            lap,
+            session_time:            t,
+            lap_dist_pct:            0.500,
+            player_car_idx:          0,
+            player_car_position:     5,
+            on_pit_road:             false,
+            session_flags:           0,
+            car_idx_lap_dist_pct:    vec![0.500, opponent_ldp],
+            car_idx_position:        vec![5, 4], // player=5, car1=4 (ahead)
+            car_idx_on_pit_road:     vec![false, false],
+            lap_last_lap_time:       0.0,
+            session_info_update:     0,
+            session_tick:            0,
+            session_state,
+            session_num:             0,
+            car_idx_lap_completed:   vec![],
+        }
+    }
+
+    /// Frame with no car ahead — triggers BattleBroken when previously engaged.
+    fn frame_no_opponent(lap: u8, t: f32) -> TelemetryFrame {
+        TelemetryFrame {
+            lap,
+            session_time:            t,
+            lap_dist_pct:            0.500,
+            player_car_idx:          0,
+            player_car_position:     5,
+            on_pit_road:             false,
+            session_flags:           0,
+            car_idx_lap_dist_pct:    vec![0.500, -1.0], // car 1 inactive
+            car_idx_position:        vec![5, 0],
+            car_idx_on_pit_road:     vec![false, false],
+            lap_last_lap_time:       0.0,
+            session_info_update:     0,
+            session_tick:            0,
+            session_state:           4,
+            session_num:             0,
+            car_idx_lap_completed:   vec![],
+        }
+    }
+
+    #[test]
+    fn battle_engaged_fires_on_lap_1() {
+        // Gap 0.001 * 540 (fallback) = 0.54 s < CLOSE_APPROACH_THRESH_S (1.5 s)
+        let mut engine = NarrativeEngine::new(10);
+        let mut all_events: Vec<RaceEvent> = Vec::new();
+        for i in 0..6u8 {
+            let evs = engine.process_frame(&frame_with_gap(1, i as f32, 4, 0.501));
+            all_events.extend(evs);
+        }
+        let engaged = all_events.iter().find(|e| {
+            matches!(e, RaceEvent::BattleEngaged { lap: 1, car_idx: 1, .. })
+        });
+        assert!(engaged.is_some(), "BATTLE_ENGAGED should fire on lap 1");
+    }
+
+    #[test]
+    fn battle_broken_fires_after_engaged() {
+        let mut engine = NarrativeEngine::new(10);
+        let mut all_events: Vec<RaceEvent> = Vec::new();
+
+        // Trigger BattleEngaged (5+ frames within gap)
+        for i in 0..6u8 {
+            let evs = engine.process_frame(&frame_with_gap(1, i as f32, 4, 0.501));
+            all_events.extend(evs);
+        }
+        assert!(
+            all_events.iter().any(|e| matches!(e, RaceEvent::BattleEngaged { car_idx: 1, .. })),
+            "prerequisite: BattleEngaged should fire first"
+        );
+
+        // Now remove the opponent — BattleBroken should fire
+        let evs = engine.process_frame(&frame_no_opponent(1, 6.0));
+        let broken = evs.iter().any(|e| matches!(e, RaceEvent::BattleBroken { car_idx: 1, .. }));
+        assert!(broken, "BATTLE_BROKEN should fire when the engaged opponent disappears");
+    }
+
+    #[test]
+    fn race_green_fires_on_session_state_transition() {
+        let mut engine = NarrativeEngine::new(10);
+
+        // Frame in ParadeLaps (state=3) — no RACE_GREEN
+        let evs1 = engine.process_frame(&frame_with_gap(0, 0.0, 3, 0.501));
+        assert!(
+            !evs1.iter().any(|e| matches!(e, RaceEvent::RaceGreen { .. })),
+            "RACE_GREEN should NOT fire for state 3"
+        );
+
+        // Transition to Racing (state=4) — RACE_GREEN fires
+        let evs2 = engine.process_frame(&frame_with_gap(1, 1.0, 4, 0.501));
+        assert!(
+            evs2.iter().any(|e| matches!(e, RaceEvent::RaceGreen { .. })),
+            "RACE_GREEN should fire when SessionState transitions to 4"
+        );
+
+        // Second Racing frame — RACE_GREEN should NOT fire again
+        let evs3 = engine.process_frame(&frame_with_gap(1, 2.0, 4, 0.501));
+        assert!(
+            !evs3.iter().any(|e| matches!(e, RaceEvent::RaceGreen { .. })),
+            "RACE_GREEN should only fire once per transition"
+        );
+    }
 }
 

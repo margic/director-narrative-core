@@ -1,10 +1,15 @@
 pub mod anchor_sampler;
 pub mod battle_state;
+pub mod config;
 pub mod engine;
 pub mod gap_finder;
+pub mod irsdk;
 pub mod lap_timer;
+pub mod lifecycle;
+pub mod publisher_event;
 pub mod race_event;
 pub mod regression_store;
 pub mod replay;
 pub mod session_info;
 pub mod telemetry_frame;
+pub mod transport;

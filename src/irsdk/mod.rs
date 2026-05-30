@@ -2,15 +2,15 @@
 //!
 //! Opens `Local\IRSDKMemMapFileName` and `Local\IRSDKDataValidEvent`,
 //! parses the variable index once on connect, then provides
-//! `wait_for_frame()` / `read_frame()` for the background thread.
+//! `wait_for_frame()` / `read_frame()` / `read_session_info()` for the
+//! publisher main loop.
 //!
-//! The single `unsafe` boundary is in `IrsdkReader::connect()` where the
+//! The single `unsafe` boundary is in `IrsdkReader::try_connect()` where the
 //! `MapViewOfFile` result is validated and wrapped into a `&[u8]` slice.
 //! All downstream reads (`header.rs`, `reader.rs`) are safe slice operations.
 
 pub mod header;
 pub mod reader;
-pub mod thread;
 
 #[cfg(target_os = "windows")]
 mod platform {
@@ -30,14 +30,15 @@ mod platform {
     // SYNCHRONIZE is a standard Windows access-rights constant (not exported by windows-sys 0.59).
     const SYNCHRONIZE: u32 = 0x0010_0000;
 
-    use director_narrative_core::telemetry_frame::TelemetryFrame as CoreFrame;
+    use crate::telemetry_frame::TelemetryFrame as CoreFrame;
 
     use super::header::{build_var_index, is_connected, latest_buf, parse_header, VarIndex};
     use super::reader::{build_frame, REQUIRED_VARS};
 
-    const MMAP_NAME:  &str = "Local\\IRSDKMemMapFileName";
-    const EVENT_NAME: &str = "Local\\IRSDKDataValidEvent";
+    const MMAP_NAME:      &str = "Local\\IRSDKMemMapFileName";
+    const EVENT_NAME:     &str = "Local\\IRSDKDataValidEvent";
     const WAIT_TIMEOUT_MS: u32 = 1_000;
+    const MAX_MMAP_SIZE:  usize = 4 * 1024 * 1024;
 
     #[derive(Debug)]
     pub enum IrsdkError {
@@ -75,8 +76,7 @@ mod platform {
     }
 
     // SAFETY: IrsdkReader owns its handles and the map_view pointer.
-    // It is only ever moved into and used from the single background thread,
-    // so Send is safe. It is not shared across threads (not Sync).
+    // It is only ever moved into and used from the publisher main thread.
     unsafe impl Send for IrsdkReader {}
 
     impl IrsdkReader {
@@ -100,9 +100,6 @@ mod platform {
                 return Err(IrsdkError::NotRunning);
             }
 
-            // Read the header to determine total mmap size (bufOffset + bufLen covers it).
-            // We use a conservative initial slice of 4 MB — the irsdk mmap is always ≤1 MB.
-            const MAX_MMAP_SIZE: usize = 4 * 1024 * 1024;
             let mmap_slice = unsafe { std::slice::from_raw_parts(map_view, MAX_MMAP_SIZE) };
 
             let hdr = parse_header(mmap_slice).ok_or(IrsdkError::BadHeader)?;
@@ -118,10 +115,13 @@ mod platform {
             let var_index = build_var_index(mmap_slice, &hdr, REQUIRED_VARS)
                 .ok_or(IrsdkError::BadHeader)?;
 
-            if REQUIRED_VARS.iter()
-                .filter(|&&n| n != "LapLastLapTime")  // LapLastLapTime is optional
-                .any(|name| !var_index.contains_key(*name))
-            {
+            // Verify that non-optional required vars are present.
+            let optional = ["LapLastLapTime", "SessionInfoUpdate", "SessionTick",
+                            "SessionState", "SessionNum", "CarIdxLapCompleted"];
+            let missing = REQUIRED_VARS.iter()
+                .filter(|&&n| !optional.contains(&n))
+                .any(|name| !var_index.contains_key(*name));
+            if missing {
                 unsafe {
                     UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: map_view as *mut _ });
                     CloseHandle(mmap_handle);
@@ -140,26 +140,21 @@ mod platform {
                 return Err(IrsdkError::NotRunning);
             }
 
-            // Compute the true mmap size for safe slice bounds.
-            let latest = latest_buf(&hdr.var_bufs);
-            let buf_len = hdr.buf_len as usize;
-            let _ = latest.buf_offset as usize + buf_len; // used for bounds in read_frame
-
             Ok(Self {
                 map_view,
                 mmap_handle,
                 event_handle,
                 var_index,
-                buf_len,
+                buf_len: hdr.buf_len as usize,
             })
         }
 
-        /// Block until iRacing signals a new 60 Hz frame or the timeout elapses.
+        /// Block until iRacing signals a new 60 Hz frame or the 1 s timeout elapses.
         ///
         /// Returns:
         /// - `Ok(true)`  — new frame is ready
-        /// - `Ok(false)` — timeout (1 s); iRacing may still be running
-        /// - `Err`       — iRacing disconnected or OS error
+        /// - `Ok(false)` — timeout; iRacing may still be running
+        /// - `Err`       — OS error
         pub fn wait_for_frame(&self) -> Result<bool, IrsdkError> {
             let result = unsafe { WaitForSingleObject(self.event_handle, WAIT_TIMEOUT_MS) };
             match result {
@@ -170,14 +165,8 @@ mod platform {
         }
 
         /// Read the latest telemetry frame from the mmap.
-        ///
-        /// Picks the `varBuf` with the highest `tickCount` (most recently written),
-        /// then delegates to `reader::build_frame`.
         pub fn read_frame(&self) -> Option<CoreFrame> {
-            // Re-read header on every call — the varBuf tickCounts change each 60 Hz tick.
-            const MAX_MMAP_SIZE: usize = 4 * 1024 * 1024;
-            let mmap = unsafe { std::slice::from_raw_parts(self.map_view, MAX_MMAP_SIZE) };
-
+            let mmap   = unsafe { std::slice::from_raw_parts(self.map_view, MAX_MMAP_SIZE) };
             let hdr    = parse_header(mmap)?;
             let latest = latest_buf(&hdr.var_bufs);
             let start  = latest.buf_offset as usize;
@@ -190,9 +179,28 @@ mod platform {
             build_frame(&mmap[start..end], &self.var_index)
         }
 
+        /// Read the SessionInfo YAML blob from the mmap.
+        ///
+        /// The blob changes whenever `SessionInfoUpdate` increments.
+        /// Returns `None` if the header is malformed or the UTF-8 decode fails.
+        pub fn read_session_info(&self) -> Option<String> {
+            let mmap   = unsafe { std::slice::from_raw_parts(self.map_view, MAX_MMAP_SIZE) };
+            let hdr    = parse_header(mmap)?;
+            let start  = hdr.session_info_offset as usize;
+            let len    = hdr.session_info_len    as usize;
+
+            if start == 0 || len == 0 || start + len > mmap.len() {
+                return None;
+            }
+
+            let bytes = &mmap[start..start + len];
+            // The YAML string is null-terminated; trim to first null.
+            let end = bytes.iter().position(|&b| b == 0).unwrap_or(len);
+            String::from_utf8(bytes[..end].to_vec()).ok()
+        }
+
         /// `true` if the iRacing status field still shows a live session.
         pub fn is_connected(&self) -> bool {
-            const MAX_MMAP_SIZE: usize = 4 * 1024 * 1024;
             let mmap = unsafe { std::slice::from_raw_parts(self.map_view, MAX_MMAP_SIZE) };
             parse_header(mmap).map_or(false, |h| is_connected(h.status))
         }

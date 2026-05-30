@@ -21,13 +21,13 @@ fn lap3_push_car7() {
     let frames = load_fixture();
     let events = replay_frames(&frames);
 
-    let push = events.iter().find(|e| {
-        matches!(e, RaceEvent::Push { car_ahead_idx: 7, .. })
+    let battle_closing = events.iter().find(|e| {
+        matches!(e, RaceEvent::BattleClosing { car_idx: 7, .. })
     });
-    assert!(push.is_some(), "expected a PUSH event for car_ahead_idx=7");
+    assert!(battle_closing.is_some(), "expected a BATTLE_CLOSING event for car_idx=7");
 
-    if let Some(RaceEvent::Push { lap, slope_info, .. }) = push {
-        assert_eq!(*lap, 3, "PUSH should be emitted at lap 3, got lap {lap}");
+    if let Some(RaceEvent::BattleClosing { lap, slope_info, .. }) = battle_closing {
+        assert_eq!(*lap, 3, "BATTLE_CLOSING should first be emitted at lap 3, got lap {lap}");
         assert!(
             (slope_info.median_slope - (-0.4998)).abs() < 0.01,
             "expected slope ≈ -0.500 s/lap, got {:.4}",
@@ -41,13 +41,16 @@ fn lap4_attack_setup_car7() {
     let frames = load_fixture();
     let events = replay_frames(&frames);
 
-    let attack = events.iter().find(|e| {
-        matches!(e, RaceEvent::AttackSetup { car_ahead_idx: 7, .. })
-    });
-    assert!(attack.is_some(), "expected an ATTACK_SETUP event for car_ahead_idx=7");
+    // BATTLE_CLOSING covers both Push and AttackSetup phases.
+    // The second BATTLE_CLOSING for car 7 should be at lap 4 with a steeper slope.
+    let attack = events
+        .iter()
+        .filter(|e| matches!(e, RaceEvent::BattleClosing { car_idx: 7, .. }))
+        .nth(1);
+    assert!(attack.is_some(), "expected a second BATTLE_CLOSING event for car_idx=7 (AttackSetup phase)");
 
-    if let Some(RaceEvent::AttackSetup { lap, slope_info, .. }) = attack {
-        assert_eq!(*lap, 4, "ATTACK_SETUP should be emitted at lap 4, got lap {lap}");
+    if let Some(RaceEvent::BattleClosing { lap, slope_info, .. }) = attack {
+        assert_eq!(*lap, 4, "second BATTLE_CLOSING should be emitted at lap 4, got lap {lap}");
         assert!(
             (slope_info.median_slope - (-0.5999)).abs() < 0.01,
             "expected slope ≈ -0.600 s/lap, got {:.4}",
@@ -62,14 +65,14 @@ fn close_approach_car7() {
     let events = replay_frames(&frames);
 
     let close = events.iter().find(|e| {
-        matches!(e, RaceEvent::CloseApproach { car_ahead_idx: 7, .. })
+        matches!(e, RaceEvent::BattleEngaged { car_idx: 7, .. })
     });
-    assert!(close.is_some(), "expected a CLOSE_APPROACH event for car_ahead_idx=7");
+    assert!(close.is_some(), "expected a BATTLE_ENGAGED event for car_idx=7");
 
-    if let Some(RaceEvent::CloseApproach { lap, gap_s, .. }) = close {
+    if let Some(RaceEvent::BattleEngaged { lap, gap_s, .. }) = close {
         assert!(
             *lap >= 5 && *lap <= 7,
-            "CLOSE_APPROACH should be around lap 6, got lap {lap}",
+            "BATTLE_ENGAGED should be around lap 6, got lap {lap}",
         );
         assert!(
             *gap_s < CLOSE_APPROACH_THRESH_S,
