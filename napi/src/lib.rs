@@ -1,5 +1,7 @@
 #![deny(clippy::all)]
 
+mod irsdk;
+
 use std::collections::HashMap;
 
 use napi_derive::napi;
@@ -57,6 +59,8 @@ pub struct RaceEvent {
 #[napi]
 pub struct NarrativeEngine {
     inner: CoreEngine,
+    /// Active live session. Only used on Windows; always `None` on other platforms.
+    live_session: Option<irsdk::thread::LiveSession>,
 }
 
 #[napi]
@@ -68,10 +72,15 @@ impl NarrativeEngine {
     /// Use 108 as the fallback for live Nürburgring sessions.
     #[napi(constructor)]
     pub fn new(anchor_count: u32) -> Self {
-        NarrativeEngine { inner: CoreEngine::new(anchor_count as usize) }
+        NarrativeEngine {
+            inner: CoreEngine::new(anchor_count as usize),
+            live_session: None,
+        }
     }
 
     /// Feed one telemetry frame and return any narrative events it triggers.
+    ///
+    /// Used by the JSONL / CI batch path. Not called in live mode.
     #[napi]
     pub fn process_frame(&mut self, frame: TelemetryFrame) -> Vec<RaceEvent> {
         let core_frame = into_core_frame(frame);
@@ -80,6 +89,51 @@ impl NarrativeEngine {
             .into_iter()
             .map(into_js_event)
             .collect()
+    }
+
+    /// Start live iRacing telemetry ingestion.
+    ///
+    /// On Windows: spawns a background thread that connects to the iRacing
+    /// shared-memory file, waits on `IRSDKDataValidEvent` at 60 Hz, and calls
+    /// `callback` with any narrative events produced each frame.
+    ///
+    /// On non-Windows platforms: returns an error immediately.
+    ///
+    /// `callback` signature: `(events: RaceEvent[]) => void`
+    #[napi]
+    pub fn start_live(
+        &mut self,
+        callback: napi::JsFunction,
+    ) -> napi::Result<()> {
+        #[cfg(target_os = "windows")]
+        {
+            use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction};
+            use irsdk::thread::{LiveSession, DEFAULT_ANCHOR_COUNT};
+
+            let tsfn: ThreadsafeFunction<Vec<RaceEvent>, ErrorStrategy::Fatal> =
+                callback.create_threadsafe_function(0, |ctx| Ok(vec![ctx.value]))?;
+
+            self.live_session = Some(LiveSession::spawn(DEFAULT_ANCHOR_COUNT, tsfn));
+            Ok(())
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = callback;
+            Err(napi::Error::from_reason(
+                "startLive is only supported on Windows (iRacing platform)",
+            ))
+        }
+    }
+
+    /// Stop the live iRacing background thread.
+    ///
+    /// Sets the shutdown flag and blocks until the thread exits cleanly.
+    /// No-op if `startLive` was not called or already stopped.
+    #[napi]
+    pub fn stop_live(&mut self) {
+        if let Some(mut session) = self.live_session.take() {
+            session.stop();
+        }
     }
 }
 
@@ -97,10 +151,11 @@ fn into_core_frame(js: TelemetryFrame) -> CoreFrame {
         car_idx_lap_dist_pct: js.car_idx_lap_dist_pct.iter().map(|&x| x as f32).collect(),
         car_idx_position:     js.car_idx_position.iter().map(|&x| x as u8).collect(),
         car_idx_on_pit_road:  js.car_idx_on_pit_road,
+        lap_last_lap_time:    0.0,  // not available from the JS batch API
     }
 }
 
-fn into_js_event(event: CoreEvent) -> RaceEvent {
+pub(crate) fn into_js_event(event: CoreEvent) -> RaceEvent {
     // Serialise the enum to { event_type, lap, session_time, ...fields }.
     let mut obj = match serde_json::to_value(&event) {
         Ok(serde_json::Value::Object(m)) => m,

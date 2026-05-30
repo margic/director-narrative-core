@@ -171,19 +171,22 @@ In the Nürburgring data, yellow flags at `LapDistPct ≈ 0.62` on both Lap 1 an
 
 ## 6. Component Diagram
 
+### 6.1 Single-rig (per-machine)
+
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│  iRacing (live session)  OR  JSONL fixture file (replay / CI)                │
+│  iRacing  (Windows shared memory — Local\IRSDKMemMapFileName)                │
+│  60 Hz mmap read, event-gated on Local\IRSDKDataValidEvent                  │
 │                                                                               │
 │   TelemetryFrame                                                              │
-│   { session_time, lap, lap_dist_pct, session_flags,                          │
-│     car_idx_lap_dist_pct[], car_idx_position[],                               │
-│     car_idx_on_pit_road[], ... }                                              │
+│   { session_time, session_tick, lap, lap_dist_pct, session_flags,            │
+│     sub_session_id, car_idx_lap_dist_pct[], car_idx_position[],              │
+│     car_idx_on_pit_road[], driver_roster[], ... }                            │
 └────────────────────────────────────┬─────────────────────────────────────────┘
-                                     │ 5Hz (200 ms poll or fixture replay)
+                                     │ 60 Hz mmap poll (iRacing-gated)
                                      ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│  NarrativeEngine                                                             │
+│  NarrativeEngine  (Rust, src/)                                               │
 │                                                                               │
 │  ┌──────────────────────────────────────────────────────────────────────┐    │
 │  │  Regression-driven battle detection (lap-level)                      │    │
@@ -209,17 +212,67 @@ In the Nürburgring data, yellow flags at `LapDistPct ≈ 0.62` on both Lap 1 an
 │                                                                               │
 │  [ Future: TireDegradationDetector, FuelWindowDetector ]                    │
 └────────────────────────────────────┬─────────────────────────────────────────┘
-                                     │ Vec<RaceEvent>
+                                     │ Vec<PublisherEvent>
                                      ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│  napi-rs boundary                                                            │
-│  NarrativeEngine::process_frame(&frame) → Vec<RaceEvent>                    │
-│  napi: engine.processFrame(frame: TelemetryFrame) → RaceEvent[]             │
+│  Publisher binary  (src/bin/publisher.rs)                                    │
+│                                                                               │
+│  • Azure AD client_credentials token  (azure_identity crate)                │
+│  • Batch queue → POST /api/publisher/v2/ingest  every 500ms                 │
+│  • lifecycle: HELLO / HEARTBEAT / GOODBYE  on envelope                      │
+│  • egui status window  (connection health, event log, token TTL)            │
 └────────────────────────────────────┬─────────────────────────────────────────┘
-                                     │
+                                     │ HTTPS  Bearer <JWT>
                                      ▼
-                        Node.js Director  →  AI Narrator  →  TTS / Camera
+                             Race Control API
 ```
+
+### 6.2 Multi-center deployment topology
+
+Multiple sim centers may have rigs in the **same iRacing session** simultaneously. Each center runs its own publisher binary on each rig, focused on its own entrant cars. Race Control aggregates events from all rigs into a single shared session record keyed by `subSessionId`.
+
+```
+iRacing Session #12345678
+│
+├─ Rig A1  (Center A)  →  focus car #42  →  publisher (centerId=A, rigId=oid-A1)
+├─ Rig A2  (Center A)  →  focus car #18  →  publisher (centerId=A, rigId=oid-A2)
+└─ Rig B1  (Center B)  →  focus car  #7  →  publisher (centerId=B, rigId=oid-B1)
+           │
+           │  all three POST to /api/publisher/v2/ingest
+           ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  Race Control  (Azure — simracecenter.com)                                   │
+│                                                                               │
+│  RaceSession { subSessionId: 12345678 }  ← global key, no center ownership  │
+│                                                                               │
+│  Events stored with centerId tag (derived from token.oid → centerId mapping)│
+│                                                                               │
+│  ┌─────────────────────┐   ┌─────────────────────┐                          │
+│  │  Director Agent     │   │  Director Agent     │                          │
+│  │  Center A           │   │  Center B           │                          │
+│  │  entrants: [#42,#18]│   │  entrants: [#7]     │                          │
+│  │                     │   │                     │                          │
+│  │ BATTLE_CLOSING      │   │ BATTLE_CLOSING      │                          │
+│  │   #42 chasing #7 ✓  │   │   #7 defending ✓    │                          │
+│  │ LAP_COMPLETED #18 ✓ │   │ OVERTAKE #7>#18 ✓   │                          │
+│  │ LAP_COMPLETED #7  ✗ │   │ LAP_COMPLETED #42 ✗ │                          │
+│  └──────────┬──────────┘   └──────────┬──────────┘                          │
+│             │                         │                                      │
+│             ▼                         ▼                                      │
+│        AI Narrator               AI Narrator                                │
+│        TTS / Camera              TTS / Camera                               │
+│        (Center A broadcast)      (Center B broadcast)                       │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Key properties of this model:**
+
+- The `RaceSession` is **globally keyed by `subSessionId`** — it is not owned by any center. Any rig in the session contributes events to the same record.
+- Each rig's Azure AD identity (`token.oid`) maps to a `centerId` via an RC-side provisioning record. No `centerId` appears in `publisher.toml`.
+- Each `PublisherEvent` is tagged with the publishing rig's `centerId` at ingest time.
+- The **Director Agent** at each center filters events by its entrant roster. It generates commentary only for events involving its own cars — but it has full visibility of the field for context (e.g. "Car #42 has closed to within 1.2s of the leader, Car #7").
+- **Deduplication**: if two rigs observe the same battle from opposite perspectives, events are keyed on the subject `carIdx` — these are distinct events (`#42 chasing #7` and `#7 being chased by #42`) and both are stored. Each Director agent uses the event keyed on its own entrant.
+- The `subSessionId` lookup is scoped to `(centerId, subSessionId)` **within the rig provisioning table** only. The session record itself uses `subSessionId` globally, preventing duplicate session creation across centers for the same race.
 
 ---
 
@@ -255,7 +308,7 @@ For reference: the original RFC (May 2026) proposed battle state detection using
 
 | RFC proposal | Status | Reason |
 |---|---|---|
-| Rust native addon via napi-rs | ✅ Adopted | Correct — Node.js GC pauses on 60Hz telemetry is a real problem |
+| Rust native addon via napi-rs | ⚠️ Superseded | Built and validated; replaced by pure Rust publisher binary — no Node.js required |
 | 5Hz polling is sufficient | ✅ Adopted | Validated — narrative signals are lap-scale, not frame-scale |
 | Focus-driver-only scope for v0.1 | ✅ Adopted | Correct for Phase 1 |
 | Edge compute stays local | ✅ Adopted | Cost and latency reasons confirmed |
@@ -264,5 +317,74 @@ For reference: the original RFC (May 2026) proposed battle state detection using
 | `STALKING / PRESSURE / ATTACKING` gap thresholds | ❌ Not implemented | Point-in-time gap thresholds fire in every braking zone |
 | Tracking top-10 for broadcast | ⏳ Deferred to Phase 2 | Correct goal, but requires observer connection (§15 of spec) |
 | Heuristic inference (brake bias, tyre temp) | ⏳ Future work | Valid extension in TireDegradationDetector — not Phase 1 |
+| Single center per session | ⚠️ Revised | Multi-center model: multiple centers' rigs can publish into the same iRacing session; each Director Agent filters by its own entrant roster |
 
 The core insight the RFC lacked — and that the Nürburgring data validation surfaced — is that **the battle story is written in space, not time**. Measuring gap at fixed track locations rather than at fixed time intervals is what separates a signal from noise.
+
+---
+
+## 9. The Case for Dramatic Simplification: Rust Binary vs. Electron
+
+The original Director app was built in Electron — a framework designed for cross-platform desktop applications, built on Chromium and Node.js. For the Director's actual job — reading iRacing telemetry and posting events to Race Control — Electron is a category error. This section documents what was removed, what replaced it, and why it matters.
+
+### 9.1 What Electron Brought to the Rig
+
+An Electron application embeds a full Chromium browser engine and a Node.js runtime. When the Director app launched on a sim rig, the operator was implicitly running:
+
+- **Chromium** — a multi-process web browser with GPU compositing, V8 heap, sandbox child processes, and a full HTML/CSS/JavaScript rendering pipeline. None of this renders race events.
+- **Node.js** — a general-purpose JavaScript runtime with an event loop, garbage collector, and libuv I/O layer. The GC runs unpredictably. On a 60Hz telemetry feed, a GC pause of even 4ms drops a frame.
+- **napi-rs bridge** — a C FFI boundary between the Rust engine and the Node.js runtime. Every call to `engine.processFrame()` crosses this boundary, marshalling Rust structs into V8 heap objects and back.
+- **IPC channels** — Electron's main process and renderer process communicate via serialised JSON over an IPC channel. Telemetry state crossed this channel on every frame.
+- **npm dependency tree** — hundreds of transitive Node.js packages loaded at startup for the application shell, even when the active code path touched a handful.
+
+At idle on a sim rig, a modern Electron app consumes **150–300 MB of RAM** just to exist. Under telemetry load, the Node.js heap and Chromium compositor add further pressure. On a sim rig running iRacing at high settings — already consuming 4–8 GB of GPU and system RAM — this is not a rounding error.
+
+### 9.2 What the Rust Binary Does Instead
+
+The publisher binary is a single native executable. Its entire job is:
+
+1. Open the iRacing Windows shared-memory file
+2. On each 60Hz frame, deserialise the relevant variables from the mmap into a `TelemetryFrame`
+3. Call `engine.process_frame(&frame)` — a pure Rust function call, no FFI
+4. Enqueue any emitted events
+5. Every 500ms, POST the batch to Race Control with a cached Azure AD JWT
+6. Draw a status window via `egui`
+
+There is no browser engine. There is no garbage collector. There is no IPC channel. There is no JavaScript.
+
+### 9.3 Resource Comparison
+
+| Metric | Electron Director | Rust Publisher |
+|---|---|---|
+| **Resident memory at idle** | ~200 MB | ~8–12 MB |
+| **Resident memory under load** | ~350 MB+ | ~12–15 MB |
+| **Processes at runtime** | 4–6 (main, renderer, GPU, crashpad, …) | 1 |
+| **Cold start to first frame processed** | 3–6 s (Chromium init, V8, module graph) | <100 ms |
+| **Frame processing latency** | ~1–3 ms + GC jitter | <50 µs deterministic |
+| **Binary / install size** | ~200 MB (Electron runtime bundled) | ~8–12 MB (static binary + egui) |
+| **Runtime dependencies** | Node.js, Chromium, MSVC CRT | MSVC CRT only |
+| **GC pauses** | Yes — V8 generational GC, unpredictable | None |
+
+The memory reduction is **20×**. On a rig with 32GB RAM this is academic; on a rig with 16GB running iRacing VR, it is the difference between headroom and swap thrashing.
+
+The more important property is **determinism**. The Rust engine processes every frame in a tight, predictable budget. There is no GC pause at lap 8 that delays the `ATTACK_SETUP` event by 40ms. In a live broadcast this doesn't matter much — the commentary is generated seconds after the event, not in real time. But determinism is the foundation that makes the system auditable: if an event was not emitted, it was because the engine logic did not fire, not because the runtime was busy collecting garbage.
+
+### 9.4 The FFI Boundary Was the Biggest Risk
+
+The napi-rs bridge was the correct approach when Node.js was the host. It was built, validated, and shipped. But the existence of the bridge created a category of bugs that no amount of engine-level testing could eliminate:
+
+- **Marshalling bugs**: a `f32` in Rust may arrive as a JavaScript `number` (64-bit float) on the Node.js side. Precision is silently promoted. Null handling differs. Optional fields require explicit `undefined` checks.
+- **Lifetime hazards**: the `ThreadSafeFunction` used to push events from the background mmap thread to the Node.js main thread requires careful Arc/Mutex discipline. A missed `call()` under backpressure could silently drop events.
+- **Version coupling**: napi-rs, Node.js ABI versions, and the `.node` binary must all agree at build time. A Node.js version bump on the rig requires a full native rebuild.
+
+The Rust publisher binary has none of these. `engine.process_frame()` is a normal function call. The return value is `Vec<PublisherEvent>`. There is no boundary.
+
+### 9.5 Operator Simplicity
+
+Installing the Electron Director required: Node.js runtime, npm, a build of the napi module (Cargo + napi-rs CLI), and the Electron application bundle. Updating it required repeating this on every rig.
+
+The publisher binary is a single `.exe`. Copy it to the rig, drop `publisher.toml` alongside it, double-click. `publisher.toml` has four fields: `tenant_id`, `client_id`, `client_secret`, `scope`. Updating the binary is `xcopy`. There is nothing to install, no runtime to manage, no npm to run.
+
+### 9.6 What Was Deliberately Not Built
+
+The publisher binary has no configuration UI, no session management UI, no driver roster management UI, no stream preview. These features belong to Race Control's web frontend — the place where an operator with a keyboard and a monitor should manage them. The publisher's job is to watch iRacing and report what it sees. Keeping that scope hard and narrow is what makes the binary small, auditable, and deployable in under a minute.
