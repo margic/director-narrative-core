@@ -12,4 +12,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 toml = "0.8"
+ureq = { version = "2", default-features = false, features = ["json"] }
 uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+mockito = "1"

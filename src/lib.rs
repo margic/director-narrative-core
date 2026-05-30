@@ -10,3 +10,4 @@ pub mod regression_store;
 pub mod replay;
 pub mod session_info;
 pub mod telemetry_frame;
+pub mod transport;
