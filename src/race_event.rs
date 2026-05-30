@@ -131,7 +131,7 @@ pub enum RaceEvent {
         bucket_to:         u8,
         lap_dist_pct_from: f32,
         lap_dist_pct_to:   f32,
-        cumulative_delta_s:f32,
+        cumulative_delta_s: f32,
         technique_hint:    String,
     },
     MicroSectorLoss {
@@ -141,7 +141,7 @@ pub enum RaceEvent {
         bucket_to:         u8,
         lap_dist_pct_from: f32,
         lap_dist_pct_to:   f32,
-        cumulative_delta_s:f32,
+        cumulative_delta_s: f32,
     },
     BrakingProfile {
         lap:                  u8,
@@ -204,7 +204,7 @@ pub enum RaceEvent {
         window_end_pct:         f32,
         traffic_car_idxs:       Vec<u8>,
         compression_score:      u8,
-        first_intercept_car_idx:u8,
+        first_intercept_car_idx: u8,
         first_intercept_time_s: f32,
         first_intercept_bucket: u8,
     },

@@ -184,7 +184,7 @@ impl CarRegistry {
                 time_in_attack_s: 0.0,
                 skirmish_count: 0,
             });
-            car.opponent_history.last_mut().expect("history just pushed")
+            car.opponent_history.last_mut().expect("opponent history entry should exist after insertion")
         };
 
         if !is_pit_lap {
