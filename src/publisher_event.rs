@@ -1,0 +1,234 @@
+//! `PublisherEvent` envelope — wire format for `/api/publisher/v2/ingest`.
+//!
+//! Every [`RaceEvent`] emitted by the engine is wrapped in a [`PublisherEvent`]
+//! before being batched and POSTed to Race Control. The envelope carries
+//! identity, timing, and session-context metadata that the engine itself does
+//! not need.
+
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::Serialize;
+use serde_json::Value;
+use uuid::Uuid;
+
+use crate::race_event::RaceEvent;
+use crate::session_info::{CarRef, SessionRoster};
+use crate::telemetry_frame::TelemetryFrame;
+
+// ── Envelope types ────────────────────────────────────────────────────────────
+
+/// Wire envelope — serialises to the Race Control API schema exactly.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublisherEvent {
+    /// UUID v4 — idempotency key; unique per event emission.
+    pub id: String,
+    pub race_session_id: String,
+    pub rig_id: String,
+    /// `PublisherEventType` string value (e.g. `"BATTLE_CLOSING"`).
+    #[serde(rename = "type")]
+    pub event_type: String,
+    /// Wall-clock milliseconds since Unix epoch at the moment of construction.
+    pub timestamp: i64,
+    /// iRacing `SessionTime` in seconds.
+    pub session_time: f64,
+    /// iRacing `SessionTick` counter.
+    pub session_tick: i64,
+    /// Car identity resolved from the session roster.
+    pub car: CarRef,
+    /// Event-specific fields (all fields of the `RaceEvent` variant except
+    /// the `event_type` discriminator tag, which is hoisted to the envelope).
+    pub payload: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<PublisherEventContext>,
+}
+
+/// Supplementary session context attached to every envelope.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublisherEventContext {
+    /// Highest value in `CarIdxLapCompleted` — the leader's completed laps.
+    pub leader_lap: Option<i32>,
+    pub session_state: Option<i32>,
+    pub session_flags: Option<u32>,
+}
+
+// ── Builder ───────────────────────────────────────────────────────────────────
+
+/// Wrap a [`RaceEvent`] in a [`PublisherEvent`] envelope ready for serialisation.
+///
+/// * `roster` — optional current session roster. When `None` or when the
+///   car slot is absent, `car` falls back to a stub containing only
+///   `carIdx` and the stringified index as `carNumber`.
+pub fn build_event(
+    race_event: &RaceEvent,
+    frame: &TelemetryFrame,
+    roster: Option<&SessionRoster>,
+    race_session_id: &str,
+    rig_id: &str,
+) -> PublisherEvent {
+    let id = Uuid::new_v4().to_string();
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+
+    // Serialise the event, hoist the discriminator tag, use remainder as payload.
+    let mut event_value =
+        serde_json::to_value(race_event).expect("RaceEvent is always serialisable");
+    let event_type = event_value
+        .as_object_mut()
+        .and_then(|m| m.remove("event_type"))
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_default();
+    let payload = event_value;
+
+    let car_idx = primary_car_idx(race_event, frame.player_car_idx);
+    let car = resolve_car(car_idx, roster);
+
+    let leader_lap = frame.car_idx_lap_completed.iter().copied().max();
+    let context = Some(PublisherEventContext {
+        leader_lap,
+        session_state: Some(frame.session_state),
+        session_flags: Some(frame.session_flags),
+    });
+
+    PublisherEvent {
+        id,
+        race_session_id: race_session_id.to_owned(),
+        rig_id: rig_id.to_owned(),
+        event_type,
+        timestamp,
+        session_time: frame.session_time as f64,
+        session_tick: frame.session_tick,
+        car,
+        payload,
+        context,
+    }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Return the primary `car_idx` for a given event.
+///
+/// Battle events are keyed on the *opponent* car; all other events
+/// (session, flag, lap, position) are keyed on the player's own car.
+fn primary_car_idx(event: &RaceEvent, player_car_idx: u8) -> u8 {
+    match event {
+        RaceEvent::BattleEngaged  { car_idx, .. }
+        | RaceEvent::BattleBroken  { car_idx, .. }
+        | RaceEvent::BattleClosing { car_idx, .. } => *car_idx,
+        _ => player_car_idx,
+    }
+}
+
+/// Resolve a [`CarRef`] from the roster.
+///
+/// Falls back to a minimal stub when the roster is unavailable or the slot
+/// is not yet populated.
+fn resolve_car(car_idx: u8, roster: Option<&SessionRoster>) -> CarRef {
+    roster
+        .and_then(|r| r.lookup(car_idx))
+        .cloned()
+        .unwrap_or_else(|| CarRef {
+            car_idx,
+            car_number: car_idx.to_string(),
+            driver_name: String::new(),
+            team_name: None,
+            car_class_short_name: None,
+            car_class_id: None,
+            user_id: None,
+        })
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::battle_state::SlopeInfo;
+    use crate::race_event::RaceEvent;
+    use crate::telemetry_frame::TelemetryFrame;
+
+    fn minimal_frame() -> TelemetryFrame {
+        TelemetryFrame {
+            lap: 4,
+            session_time: 1234.5,
+            lap_dist_pct: 0.5,
+            player_car_idx: 0,
+            player_car_position: 5,
+            on_pit_road: false,
+            session_flags: 0,
+            car_idx_lap_dist_pct: vec![0.5, 0.51],
+            car_idx_position: vec![5, 4],
+            car_idx_on_pit_road: vec![false, false],
+            lap_last_lap_time: 540.0,
+            session_info_update: 1,
+            session_tick: 9876,
+            session_state: 4,
+            session_num: 0,
+            car_idx_lap_completed: vec![3, 3],
+        }
+    }
+
+    #[test]
+    fn battle_closing_json_shape() {
+        let event = RaceEvent::BattleClosing {
+            lap: 4,
+            session_time: 1234.5,
+            car_idx: 1,
+            closing_rate_sec_per_lap: 0.43,
+            slope_info: SlopeInfo {
+                median_slope: -0.43,
+                anchors_qualifying: 5,
+                anchors_agreeing: 4,
+                hotspot_lap_dist_pct: 0.62,
+            },
+        };
+
+        let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001");
+        let json: Value = serde_json::to_value(&env).unwrap();
+
+        // Envelope-level fields
+        assert!(json["id"].as_str().map(|s| s.len() == 36).unwrap_or(false),
+            "id should be a UUID string");
+        assert_eq!(json["type"], "BATTLE_CLOSING");
+        assert_eq!(json["raceSessionId"], "session-abc");
+        assert_eq!(json["rigId"], "rig-001");
+        assert_eq!(json["sessionTime"], 1234.5_f64);
+        assert_eq!(json["sessionTick"], 9876_i64);
+
+        // Car fallback (no roster)
+        assert_eq!(json["car"]["carIdx"], 1);  // opponent car_idx, not player
+
+        // Payload contains event-specific fields (field names are snake_case)
+        let rate = json["payload"]["closing_rate_sec_per_lap"].as_f64().unwrap_or(0.0);
+        assert!((rate - 0.43).abs() < 1e-4, "expected ~0.43, got {rate}");
+        assert_eq!(json["payload"]["car_idx"], 1);
+        assert_eq!(json["payload"]["lap"], 4);
+        assert!(json["payload"].get("event_type").is_none(),
+            "event_type should be hoisted out of payload");
+
+        // Context block
+        assert_eq!(json["context"]["leaderLap"], 3);
+        assert_eq!(json["context"]["sessionState"], 4);
+        assert_eq!(json["context"]["sessionFlags"], 0);
+    }
+
+    #[test]
+    fn uuid_is_unique_across_calls() {
+        let event = RaceEvent::RaceGreen { lap: 1, session_time: 0.0 };
+        let frame = minimal_frame();
+        let e1 = build_event(&event, &frame, None, "s", "r");
+        let e2 = build_event(&event, &frame, None, "s", "r");
+        assert_ne!(e1.id, e2.id);
+    }
+
+    #[test]
+    fn session_events_use_player_car_idx() {
+        let event = RaceEvent::RaceGreen { lap: 1, session_time: 0.0 };
+        let frame = minimal_frame(); // player_car_idx = 0
+        let env = build_event(&event, &frame, None, "s", "r");
+        assert_eq!(env.car.car_idx, 0);
+    }
+}

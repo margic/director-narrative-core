@@ -27,10 +27,13 @@
 
 use std::collections::HashMap;
 
+use serde::Serialize;
+
 // ── Public types ─────────────────────────────────────────────────────────────
 
 /// Resolved identity for a single car slot in the iRacing entry list.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CarRef {
     pub car_idx: u8,
     /// iRacing car number string (e.g. `"42"`, `"042"`, `"P1"`).
