@@ -155,6 +155,23 @@ impl Default for RosterCache {
     }
 }
 
+// ── Public utilities ─────────────────────────────────────────────────────────
+
+/// Extract `WeekendInfo.SubSessionID` from the raw `SessionInfo` YAML string.
+///
+/// Uses a fast line scan rather than a full YAML parse so it can be called
+/// on every `SessionInfoUpdate` without the serde_yaml overhead.
+/// Returns `None` if the key is absent or not parseable as `i64`.
+pub fn parse_sub_session_id(yaml: &str) -> Option<i64> {
+    for line in yaml.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("SubSessionID:") {
+            return rest.trim().parse().ok();
+        }
+    }
+    None
+}
+
 // ── Private serde types ───────────────────────────────────────────────────────
 
 /// Normalise iRacing's empty-string sentinels to `None`.
