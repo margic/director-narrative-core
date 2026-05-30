@@ -153,6 +153,10 @@ fn into_core_frame(js: TelemetryFrame) -> CoreFrame {
         car_idx_on_pit_road:    js.car_idx_on_pit_road,
         lap_last_lap_time:      0.0,  // not available from the JS batch API
         session_info_update:    0,    // not available from the JS batch API
+        session_tick:           0,    // not available from the JS batch API
+        session_state:          0,    // not available from the JS batch API
+        session_num:            0,    // not available from the JS batch API
+        car_idx_lap_completed:  vec![],
     }
 }
 
