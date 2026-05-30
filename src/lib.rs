@@ -1,5 +1,6 @@
 pub mod anchor_sampler;
 pub mod battle_state;
+pub mod config;
 pub mod engine;
 pub mod gap_finder;
 pub mod lap_timer;
