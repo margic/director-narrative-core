@@ -157,6 +157,34 @@ impl Default for RosterCache {
 
 // ── Public utilities ─────────────────────────────────────────────────────────
 
+/// Track and session metadata parsed from the `SessionInfo` YAML.
+#[derive(Debug, Clone, Default)]
+pub struct SessionMetadata {
+    /// e.g. "Tsukuba Circuit 2k Full"
+    pub track_name: Option<String>,
+    /// e.g. "Practice", "Race", "Qualify"
+    pub session_type: Option<String>,
+    /// "unlimited" or a lap count string
+    pub session_laps: Option<String>,
+}
+
+impl SessionMetadata {
+    /// Parse track name and the active session's type/laps from the raw YAML.
+    /// `session_num` is `TelemetryFrame::session_num` (0-based index into Sessions[]).
+    pub fn parse(yaml: &str, session_num: usize) -> Self {
+        let root: YamlRootFull = match serde_yaml::from_str(yaml) {
+            Ok(r) => r,
+            Err(_) => return Self::default(),
+        };
+        let session = root.session_info.sessions.get(session_num);
+        Self {
+            track_name:   root.weekend_info.track_display_name.filter(|s| !s.is_empty()),
+            session_type: session.and_then(|s| s.session_type.clone()).filter(|s| !s.is_empty()),
+            session_laps: session.and_then(|s| s.session_laps()).filter(|s| !s.is_empty()),
+        }
+    }
+}
+
 /// Extract `WeekendInfo.SubSessionID` from the raw `SessionInfo` YAML string.
 ///
 /// Uses a fast line scan rather than a full YAML parse so it can be called
@@ -179,10 +207,52 @@ fn non_empty(s: Option<String>) -> Option<String> {
     s.and_then(|v| if v.trim().is_empty() { None } else { Some(v) })
 }
 
+// ── Roster-only YAML types (existing parser) ──────────────────────────────────
+
 #[derive(serde::Deserialize)]
 struct YamlRoot {
     #[serde(rename = "DriverInfo")]
     driver_info: YamlDriverInfo,
+}
+
+// ── Full YAML types (metadata parser) ────────────────────────────────────────
+
+#[derive(serde::Deserialize, Default)]
+struct YamlRootFull {
+    #[serde(rename = "WeekendInfo", default)]
+    weekend_info: YamlWeekendInfo,
+    #[serde(rename = "SessionInfo", default)]
+    session_info: YamlSessionInfo,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct YamlWeekendInfo {
+    #[serde(rename = "TrackDisplayName", default)]
+    track_display_name: Option<String>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct YamlSessionInfo {
+    #[serde(rename = "Sessions", default)]
+    sessions: Vec<YamlSession>,
+}
+
+#[derive(serde::Deserialize)]
+struct YamlSession {
+    #[serde(rename = "SessionType", default)]
+    session_type: Option<String>,
+    #[serde(rename = "SessionLaps", default)]
+    session_laps_raw: Option<serde_yaml::Value>,
+}
+
+impl YamlSession {
+    fn session_laps(&self) -> Option<String> {
+        self.session_laps_raw.as_ref().map(|v| match v {
+            serde_yaml::Value::Number(n) => n.to_string(),
+            serde_yaml::Value::String(s) => s.clone(),
+            other => format!("{other:?}"),
+        })
+    }
 }
 
 #[derive(serde::Deserialize)]

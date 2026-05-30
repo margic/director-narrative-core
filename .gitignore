@@ -26,3 +26,6 @@ target
 
 # napi compiled native addon
 *.node
+
+# Publisher rig config — contains client secret, must never be committed
+publisher.toml

@@ -108,9 +108,17 @@ gap_s = (car_ahead_ldp - player_ldp) × lap_time_s
 
 This uses `LapDistPct` rather than `CarIdxF2Time` because in iRacing replay mode `CarIdxF2Time` is stale (only updated at lap crossings, yielding only 2 unique values per lap). In a live session, `CarIdxF2Time` is the more accurate source; the engine can use either.
 
-### 3.3 HashMap Key
+### 3.3 RegressionStore Key
 
-The state machine is stored in a `HashMap<(u32, u32), AnchorBattle>` where the key is `(opponent_car_idx, anchor_bucket)`. When the opponent at a given anchor changes, the old entry is removed (or moved to an `archived_battles` slab for post-race analysis) and a new entry is created.
+The `RegressionStore` accumulates readings in a `HashMap<(u8, u8), Vec<(u8, f32)>>`
+where the key is `(bucket, car_idx)` and the value is a `Vec` of `(lap, gap_s)` tuples.
+The store is **rebuilt from scratch** at each lap crossing from `AnchorSampler.samples`
+via `ingest(max_lap)` — the `max_lap` guard prevents the first frame of the new lap
+from contaminating the previous lap's regression.
+
+When the opponent at a given bucket changes identity (pit stop, overtake by a third car),
+the old series is automatically displaced: the new opponent produces a different
+`car_idx` key and starts a fresh series. No explicit invalidation step is needed.
 
 ---
 
@@ -159,7 +167,7 @@ The `ATTACK_SETUP → PUSH` downgrade is correct and intentional. In the synthet
 
 ## 5. Yellow Flag Invalidation
 
-Any anchor reading captured while `SessionFlags & (YELLOW_WAVE | CAUTION) ≠ 0` is tagged `is_clean = false`. Clean-tagged entries remain in the `VecDeque` ring buffer for capacity accounting but are excluded from the regression.
+Any anchor reading captured while `SessionFlags & (YELLOW_WAVE | CAUTION) ≠ 0` is tagged `is_clean = false`. Dirty entries are excluded during `RegressionStore::ingest()` — the store is rebuilt each lap, so dirty entries from prior laps are simply not included in the regression data.
 
 This matters because a yellow flag forces all drivers to hold position and drop pace below the green-flag racing line. A gap reading under yellow is not comparable to a green-flag reading at the same anchor — it will artificially inflate or deflate the regression slope.
 
@@ -196,8 +204,8 @@ In the Nürburgring data, yellow flags at `LapDistPct ≈ 0.62` on both Lap 1 an
 │  │   AnchorSampler          →  first crossing of each bucket per lap   │    │
 │  │   (HashMap<(lap,bucket), sample>)                                    │    │
 │  │                                                                      │    │
-│  │   RegressionStore        →  VecDeque per (bucket, car_ahead_idx)    │    │
-│  │   (HashMap<(bucket, car_idx), VecDeque<AnchorReading>>)             │    │
+│  │   RegressionStore        →  Vec per (bucket, car_idx), rebuilt each lap   │    │
+│  │   (HashMap<(bucket, car_idx), Vec<(lap, gap_s)>>)                          │    │
 │  │                                                                      │    │
 │  │   Two-tier classification at lap crossing:                           │    │
 │  │     Tier 1: per-anchor OLS slope  →  hotspot_lap_dist_pct           │    │

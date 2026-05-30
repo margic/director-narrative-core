@@ -106,13 +106,17 @@ where $l_j$ is **lap number** (x-axis) and $g_j$ is the **gap in seconds at anch
 
 ```rust
 struct AnchorReading {
-    lap: u32,
-    gap_seconds: f32,
-    is_clean: bool,   // false if YELLOW_WAVE or CAUTION was active at capture
+    lap:      u8,
+    bucket:   u8,
+    gap_s:    f32,
+    car_idx:  u8,
+    is_clean: bool,  // false if YELLOW_WAVE or CAUTION was active at capture
 }
 ```
 
-Entries where `is_clean == false` remain in the buffer for capacity accounting but are excluded from the regression calculation. The effective sample size for regression is the count of clean entries only.
+Entries where `is_clean == false` are simply not added to `RegressionStore.data`
+during `ingest()`. The store is rebuilt from scratch at each lap crossing from
+`AnchorSampler.samples`, so dirty entries are filtered at rebuild time.
 
 ### 5.4 Confidence Thresholds
 
@@ -135,13 +139,18 @@ $$\text{global\_slope} = \text{median}\{\text{slope}_i : \text{clean\_count}_i \
 
 The median is used rather than the mean to suppress outlier anchors (e.g. a single anchor in a yellow-flag hotspot with marginal clean data).
 
-The spatial distribution from Tier 1 is surfaced in the emitted `RaceEvent.narrative_context` as `hotspot_lap_dist_pct` — the anchor with the steepest negative slope. This lets the narrator say "closing hard into Turn 3" rather than just "closing".
+The spatial distribution from Tier 1 is surfaced in the emitted `BattleClosing` event
+via the embedded `slope_info: SlopeInfo` struct. This lets the narrator say
+"closing hard into Turn 3" rather than just "closing".
 
 ```rust
-// narrative_context fields populated by the two-tier strategy
-hotspot_lap_dist_pct: f32,   // anchor with steepest per-lap slope (Tier 1)
-closing_rate_per_lap: f32,   // median slope across qualifying anchors (Tier 2)
-anchors_agreeing: usize,     // count of anchors with slope < 0 (confidence signal)
+/// Embedded in BattleClosing events.
+pub struct SlopeInfo {
+    pub median_slope:         f32,    // median slope across qualifying anchors (Tier 2)
+    pub anchors_qualifying:   usize,  // anchors with sufficient clean data
+    pub anchors_agreeing:     usize,  // anchors where slope < 0
+    pub hotspot_lap_dist_pct: f32,    // LapDistPct of steepest-closing anchor (Tier 1)
+}
 ```
 
 ---
@@ -150,7 +159,9 @@ anchors_agreeing: usize,     // count of anchors with slope < 0 (confidence sign
 
 Any anchor reading captured while `SessionFlags` contains `YELLOW_WAVE` (`0x100`) or `CAUTION` (`0x4000`) must be tagged `is_clean = false` and excluded from regression.
 
-The state machine transitions to `ResetYellowContamination` when accumulated dirty readings leave insufficient clean history to compute a reliable slope. It re-enters `Tracking` once the next clean lap begins adding readings.
+When a dirty lap results in too few clean readings to compute a reliable slope, the
+engine resets `BattleState` to `Tracking` at the next lap crossing. The reset is
+handled inline; there is no dedicated `ResetYellowContamination` state.
 
 In the Nürburgring race data, `YELLOW_WAVE` flags hit the same sector (LapDistPct ~0.62) on both Lap 1 and Lap 2. Without this protection, two consecutive contaminated readings would corrupt the closing rate signal for the remainder of the race at that anchor.
 
@@ -159,31 +170,28 @@ In the Nürburgring race data, `YELLOW_WAVE` flags hit the same sector (LapDistP
 ## 7. Battle State Machine
 
 ```rust
+// Defined in src/battle_state.rs
 enum BattleState {
-    // No active battle tracking for this opponent
+    // No active battle tracking. Initial state.
     Idle,
 
-    // Accumulating anchor readings — insufficient clean data yet to classify
-    Tracking {
-        anchor_readings_count: usize,
-    },
+    // Accumulating anchor readings — insufficient clean data yet to classify.
+    Tracking,
 
-    // Sustained negative regression slope across ≥ 2 clean laps
+    // Sustained negative OLS slope across ≥ MIN_PUSH_READINGS (2) clean laps.
+    // Condition: median_slope ≤ PUSH_SLOPE_THRESHOLD (-0.05 s/lap)
     Push,
 
-    // Accelerating negative slope across ≥ 3 clean laps — overtake attempt likely
+    // Accelerating negative slope across ≥ MIN_ATTACK_READINGS (3) clean laps.
+    // Condition: Push conditions met AND median_slope < prev_slope
     AttackSetup,
-
-    // Car ahead changed identity (pit stop, overtake by third car, incident)
-    // All accumulated anchor readings for the previous opponent are invalidated.
-    // Transition back to Tracking on next lap crossing.
-    ResetOpponentChanged,
-
-    // One or more laps under yellow/caution — regression slope unreliable.
-    // Wait for sufficient clean laps to re-accumulate before emitting signals.
-    ResetYellowContamination,
 }
 ```
+
+Opponent-identity changes (pit stop, third-car overtake) and yellow-flag
+contamination are handled inline by the engine. On either condition the engine
+resets the relevant `BattleState` to `Tracking` at the next lap crossing and
+discards stale regression data for the previous opponent.
 
 ---
 
@@ -192,31 +200,38 @@ enum BattleState {
 The concrete input type passed to `NarrativeEngine::process_frame()` on each call. Fields are split into two groups based on data source availability.
 
 ```rust
-#[derive(Debug, Deserialize, Clone)]
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct TelemetryFrame {
-    // ── Player scalars — available in .ibt AND live API ───────────────────────
-    pub session_time: f64,          // SessionTime
-    pub session_flags: u32,         // SessionFlags bitmask (YELLOW_WAVE=0x100, CAUTION=0x4000)
-    pub player_car_idx: i32,        // PlayerCarIdx — identifies the focus car
-    pub lap: u32,                   // Lap
-    pub lap_dist_pct: f32,          // LapDistPct
-    pub lap_current_lap_time: f32,  // LapCurrentLapTime (elapsed on current lap)
-    pub lap_last_lap_time: f32,     // LapLastLapTime (used for dynamic anchor_count)
-    pub speed: f32,                 // Speed (m/s)
+    // ── Player scalars ─────────────────────────────────────────────────────────
+    pub lap:                  u8,    // Lap
+    pub session_time:         f32,   // SessionTime
+    pub lap_dist_pct:         f32,   // LapDistPct
+    pub player_car_idx:       u8,    // PlayerCarIdx
+    pub player_car_position:  u8,    // PlayerCarPosition (1-based; 0 = not yet classified)
+    pub on_pit_road:          bool,  // OnPitRoad
+    pub session_flags:        u32,   // SessionFlags (YELLOW_WAVE=0x100, CAUTION=0x4000)
 
-    // ── Full-field arrays — live API only; must be present in JSONL fixtures ──
-    // Length = session car count (up to 63). Inactive slots carry sentinel values.
-    pub car_idx_lap_dist_pct: Vec<f32>,  // CarIdxLapDistPct  (0.0 for inactive cars)
-    pub car_idx_f2_time: Vec<f32>,       // CarIdxF2Time — official time gap to car one position ahead
-                                         // (-1.0 sentinel for inactive/not-in-world cars)
-    pub car_idx_position: Vec<i32>,      // CarIdxPosition  (0 for inactive/unknown)
-    pub car_idx_on_pit_road: Vec<bool>,  // CarIdxOnPitRoad
+    // ── Full-field arrays — live API; synthesised in JSONL fixtures ────────────
+    pub car_idx_lap_dist_pct: Vec<f32>,  // CarIdxLapDistPct (< -0.5 = inactive slot)
+    pub car_idx_position:     Vec<u8>,   // CarIdxPosition (0 = inactive)
+    pub car_idx_on_pit_road:  Vec<bool>, // CarIdxOnPitRoad
+
+    // ── Optional — absent from JSONL fixtures (default 0) ─────────────────────
+    #[serde(default)] pub lap_last_lap_time:       f32,   // used for anchor-count bootstrap
+    #[serde(default)] pub session_info_update:     u32,   // YAML roster change counter
+    #[serde(default)] pub session_tick:            i64,   // dedup key for Race Control
+    #[serde(default)] pub session_state:           i32,   // 4=Racing, 5=Checkered
+    #[serde(default)] pub session_num:             i32,   // 0=practice,1=qual,2=race
+    #[serde(default)] pub car_idx_lap_completed:   Vec<i32>, // for leaderLap context
 }
 ```
 
-**Key design note:** `car_ahead_idx` and `car_dist_ahead` are no longer top-level fields. The engine derives `car_ahead_idx` internally on each call by scanning `car_idx_lap_dist_pct` for the entry with the smallest positive delta relative to the focus car's `lap_dist_pct`. `CarIdxF2Time` is used in preference to `CarDistAhead / Speed` because it is the official iRacing time-gap computation and is not subject to speed-conversion error at low speeds.
-
-`session_flags` is required for `is_clean` tagging (§5.3). Relevant bitmasks: `YELLOW_WAVE = 0x100`, `CAUTION = 0x4000`.
+The engine derives `car_ahead_idx` internally on each call by scanning
+`car_idx_lap_dist_pct` for the car with the smallest positive delta relative to
+`player_car_idx`'s position. `CarIdxF2Time` is no longer in the struct; gap is
+always computed from `car_idx_lap_dist_pct × lap_time_s` which is correct for
+both live and replay modes.
 
 ### 8.1 Data Source Availability
 
@@ -265,12 +280,13 @@ pub fn replay_frames(frames: &[TelemetryFrame]) -> Vec<RaceEvent>;
 
 | Component | Role |
 |---|---|
-| `AnchorSampler` | Records first gap reading per `(lap, bucket)` |
-| `RegressionStore` | Per-`(bucket, car_idx)` OLS ring buffer |
+| `AnchorSampler` | Records first gap reading per `(lap, bucket, car_idx)` |
+| `RegressionStore` | Per-`(bucket, car_idx)` OLS series, rebuilt each lap |
 | `LapTimer` | Lap-crossing detection, lap time estimation |
-| `BattleState` FSM | `IDLE → TRACKING → PUSH → ATTACK_SETUP` transitions |
-| `find_cars_ahead()` | Identifies opponent and computes gap from `CarIdxLapDistPct` |
-| Frame-level detectors | `CLOSE_APPROACH`, `OVERTAKE`, `PIT_ENTRY/EXIT`, `PRESSURE_BEHIND` |
+| `BattleState` FSM | `Idle → Tracking → Push → AttackSetup` transitions |
+| `find_cars_ahead()` | Returns up to N nearest cars ahead in race order |
+| `find_cars_behind()` | Returns up to N nearest cars behind in race order |
+| Frame-level detectors | `BATTLE_ENGAGED/BROKEN`, `OVERTAKE`, `PIT_ENTRY/EXIT`, flag events |
 
 ### 9.4 Known Future Detector Implementations
 
@@ -281,128 +297,74 @@ pub fn replay_frames(frames: &[TelemetryFrame]) -> Vec<RaceEvent>;
 
 ---
 
-## 10. napi-rs Public API
+## 10. Publisher Binary
 
-The napi crate (`napi/`) wraps `NarrativeEngine` behind a JavaScript class. All struct fields cross the napi boundary as camelCase.
-
-```typescript
-// JavaScript API (generated by napi-rs)
-class NarrativeEngine {
-  constructor(anchorCount: number);
-  processFrame(frame: TelemetryFrame): RaceEvent[];
-}
-```
-
-The `anchor_count` is computed from the first completed lap time (see `replay::compute_anchor_count`) and is passed as a constructor argument. This allows the caller to tune spatial resolution without recompiling.
-
-Errors from malformed input are surfaced as typed napi errors — not panics. The `.unwrap()` pattern is not used on any input crossing the napi boundary.
-
----
-
-## 11. Streaming Consumption
-
-### 11.1 iRacing Data Model
-
-The iRacing simulator writes telemetry to a shared memory-mapped file at its internal update rate (60 Hz). The SDK exposes this via a `wait_for_data(timeout)` blocking call that unblocks when a new frame is available. The engine does not poll at 60 Hz — narrative events are lap-scale signals, not frame-scale. A **5 Hz polling rate (200 ms interval)** is sufficient: it produces a sample every 200 ms, and even at maximum speed on the longest tracks, anchor crossings are separated by seconds not milliseconds.
-
-### 11.2 Two Consumption Modes
-
-Two modes exist depending on whether the engine is running against a live session or a replay harness (Issue #9).
-
-**Mode 1 — Pull (v0.1.0, replay harness)**
-
-Node.js drives the tick loop. It reads frames from a JSONL fixture file and calls `engine.processFrame(frame)` synchronously. Events are returned immediately and forwarded to the `director`. This is the correct model for CI validation and development without a running sim.
+The `napi/` crate (Node.js bridge) was removed in issue #27. The live entry point
+is the pure Rust publisher binary (`src/bin/publisher.rs`). It reads iRacing
+directly via `src/irsdk/` and has no Node.js dependency.
 
 ```
-┌────────────────────────────────────────────────────────────────┐
-│ Node.js                                                         │
-│                                                                 │
-│  setInterval(200ms) ──► read next JSONL line                    │
-│                    ──► engine.processFrame(frame) ──► Rust     │
-│                    ◄── RaceEvent[]                ◄── Rust     │
-│                    ──► emit to director                         │
-└────────────────────────────────────────────────────────────────┘
+iRacing mmap (60 Hz)
+  └─ src/irsdk/IrsdkReader::wait_for_frame()
+       └─ reader::build_frame()  →  TelemetryFrame
+            └─ engine.process_frame(&frame)  →  Vec<RaceEvent>
+                 └─ publisher_event::build_event()  →  PublisherEvent
+                      └─ transport::PublisherTransport::enqueue()
+                           └─ POST /api/publisher/v2/ingest  (every 500ms)
 ```
 
-**Mode 2 — Push (production, live iRacing session)**
-
-Rust owns the polling loop. A background thread blocks on `ir.wait_for_data(200ms)`, builds a `TelemetryFrame`, calls `engine.process_frame`, and pushes any resulting `RaceEvent`s to the Node.js main thread via a napi `ThreadSafeFunction` callback. Node.js is purely a receiver — it never calls `process_frame` directly.
-
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│ Rust background thread                    │ Node.js main thread       │
-│                                           │                           │
-│  loop {                                   │  engine.on_event =     │
-│    ir.wait_for_data(200ms)                │    (eventJson) => {       │
-│    frame = build_frame(&ir)               │      director.emit(event) │
-│    events = engine.process_frame(&frame)    │    }                      │
-│    for e in events {                      │                           │
-│      tsf.call(e)  ─────────────►│                           │
-│    }                                      │                           │
-│  }                                        │                           │
-└──────────────────────────────────────────────────────────────────────┘
-```
-
-The `NarrativeEngine` napi class (see §10) implements Mode 1. Mode 2 requires a `start_live(callback: ThreadsafeFunction)` method and is a Phase 3+ concern.
-
-### 11.3 Connection Lifecycle
-
-iRacing can be launched, closed, and relaunched during an Electron session. The engine must handle all transitions:
+### 10.1 Connection Lifecycle
 
 | State | Condition | Engine behaviour |
 |---|---|---|
-| `Disconnected` | iRacing not running | Poll for connection every 1s; discard frames |
-| `Connected` | iRacing running, not in a session | Frames arriving but `SessionState != Racing`; discard |
-| `Racing` | Green flag | Process every tick normally |
-| `Caution` | `SessionFlags & (YELLOW_WAVE \| CAUTION)` | Process ticks; mark anchor readings `is_clean = false` |
-| `SessionEnded` | Chequered flag received | Flush final events; reset all detector state |
-| `Reconnected` | iRacing restarted mid-Electron session | Reinitialise all detector state — prior lap history is invalid |
+| Disconnected | iRacing not running | Poll for mmap every 1 s; discard |
+| Connected | Session not yet Racing | `session_state != 4`; skip regression |
+| Racing | `session_state == 4` | Process every tick normally |
+| Caution | `SessionFlags & (YELLOW_WAVE \| CAUTION)` | Process ticks; mark readings `is_clean = false` |
+| Checkered | `session_state == 5` | Flush final events; emit `RACE_CHECKERED` |
+| Reconnected | iRacing restarted | Reinitialise all engine state |
 
 ---
 
-## 12. Event Schema — The Decorator Pattern
+## 12. Event Schema
 
-### 12.1 Design Rationale
-
-The existing downstream `director` cloud ingestion already consumes `RaceEvent` structs with a defined base schema (event ID, timestamp, type, car IDs, track location). Rather than replacing this schema — which would be a breaking change to the downstream consumer — the engine **amends** it. A new `narrative_context` object is injected as an additional field. The base event routing fields remain identical, preserving full backward compatibility: a consumer that does not read `narrative_context` continues to work without modification.
-
-This is the **Decorator Pattern** applied to an event schema: wrap the existing contract with additional capability rather than replacing it.
-
-### 12.2 Example payload
+### 12.1 Example payload
 
 ```json
 {
-  "event_type": "PUSH",
+  "event_type": "BATTLE_CLOSING",
   "lap": 3,
   "session_time": 480.2,
-  "car_ahead_idx": 7,
+  "car_idx": 7,
+  "closing_rate_sec_per_lap": 0.4998,
   "slope_info": {
     "median_slope": -0.4998,
-    "hotspot_bucket": 8,
-    "qualifying_anchors": 28
+    "anchors_qualifying": 28,
+    "anchors_agreeing": 22,
+    "hotspot_lap_dist_pct": 0.29
   }
 }
 ```
 
-### 12.3 Event types
+### 12.2 Event types
 
 | Event | Trigger | Key fields |
 |---|---|---|
-| `PUSH` | Negative regression slope, ≥ min_push readings | `car_ahead_idx`, `slope_info.median_slope` |
-| `ATTACK_SETUP` | Accelerating negative slope, ≥ min_attack readings | `car_ahead_idx`, `slope_info.median_slope` |
-| `CLOSE_APPROACH` | Gap ≤ `CLOSE_APPROACH_THRESH_S` for ≥ N frames | `car_ahead_idx`, `gap_s` |
-| `OVERTAKE` | Position gain confirmed at start/finish crossing | `position_from`, `position_to`, `positions_gained` |
-| `POSITION_LOST` | Position loss confirmed at start/finish crossing | `position_from`, `position_to`, `positions_lost` |
-| `DEFEND_PUSH` | Car behind closing at Push threshold | `car_behind_idx`, `slope_info` |
-| `DEFEND_ATTACK` | Car behind closing at Attack threshold | `car_behind_idx`, `slope_info` |
-| `PRESSURE_BEHIND` | Car behind within gap threshold | `car_behind_idx`, `gap_s` |
-| `LAP_COMPLETE` | Start/finish crossing | `lap`, `lap_time_s`, `position`, `pit_frames` |
-| `PIT_ENTRY` | Car transitions to pit road | `lap`, `position` |
+| `BATTLE_ENGAGED` | Gap < threshold (≥ N frames sustained), lap-1 capable | `car_idx`, `gap_s`, `car_race_position` |
+| `BATTLE_BROKEN` | Gap that triggered BATTLE_ENGAGED widens past threshold | `car_idx`, `gap_s` |
+| `BATTLE_CLOSING` | OLS regression confirms closing (attacker or defender) | `car_idx`, `closing_rate_sec_per_lap`, `slope_info` |
+| `RACE_GREEN` | `session_state` transitions to 4 (Racing) | |
+| `FLAG_YELLOW_FULL_COURSE` | Full-course caution bit set in `SessionFlags` | |
+| `FLAG_YELLOW_LOCAL` | Local yellow bit set in `SessionFlags` | |
+| `RACE_CHECKERED` | `session_state` transitions to 5 (Checkered) | |
+| `OVERTAKE` | Position gain at start/finish crossing | `position_from`, `position_to`, `positions_gained` |
+| `OVERTAKE_FOR_LEAD` | Position gain into P1 | `position_from`, `positions_gained` |
+| `LAP_COMPLETED` | Start/finish crossing | `lap_time_s`, `best_lap_time_s`, `position`, `pit_frames` |
+| `PIT_ENTRY` | Car enters pit road | `lap`, `position` |
 | `PIT_EXIT` | Car leaves pit road | `lap`, `position` |
-
-### 12.4 `ai_prompt_hint`
-
-Computed entirely by the Rust engine from regression slope, battle duration, and clean-lap count. The downstream AI narrator reads this field directly — it does not interpret raw telemetry. This reduces LLM context window size and eliminates hallucination risk from telemetry misinterpretation.
+| `PUBLISHER_HELLO` | After successful registration | `version`, `scope` |
+| `PUBLISHER_HEARTBEAT` | Every 30 s while session bound | |
+| `PUBLISHER_GOODBYE` | Clean shutdown | |
 
 ---
 
@@ -422,13 +384,17 @@ Computed entirely by the Rust engine from regression slope, battle duration, and
 ## 14. Implementation Sequence
 
 ```
-Issue #5  — Rust ownership/lifetime strategy for HashMap + VecDeque state
-Issue #6  — VecDeque ring buffer with AnchorReading schema and regression_slope()
-Issue #7  — BattleState enum with ResetOpponentChanged and ResetYellowContamination
-Issue #3  — Second-derivative aggression metrics (slope-of-slope)
-Issue #9  — JSONL replay harness with mandatory fixture scenarios
-Issue #8  — napi-rs bindings
-Issue #10 — Narrative event emission to Node.js listener
+Issue #5  — Rust ownership/lifetime strategy for engine state (completed)
+Issue #6  — AnchorSampler + RegressionStore (completed)
+Issue #7  — BattleState FSM (completed)
+Issue #9  — JSONL replay harness (completed)
+Issue #17 — Windows iRacing mmap reader (src/irsdk/) (completed)
+Issue #20 — Align event names to PublisherEventType schema (completed)
+Issue #21 — PublisherEvent envelope + build_event() (completed)
+Issue #22 — HTTP transport + Azure AD token (completed)
+Issue #25 — Config layer (publisher.toml + env vars) (completed)
+Issue #26 — Standalone publisher binary (completed)
+Issue #27 — Remove napi/ and listener/ (completed)
 ```
 
 ---

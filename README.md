@@ -51,6 +51,46 @@ cargo test
 # 17 unit tests + 3 integration tests (PUSH @ lap 3, ATTACK_SETUP @ lap 4, CLOSE_APPROACH @ lap 6)
 ```
 
+### 5. Run against a live iRacing session (Windows only)
+
+Build the publisher binary:
+
+```powershell
+cargo build --bin publisher
+```
+
+Supply credentials via `publisher.toml` (placed next to the executable or in the working directory):
+
+```toml
+[auth]
+tenant_id     = "your-azure-tenant-id"
+client_id     = "your-azure-client-id"
+client_secret = "your-azure-client-secret"
+
+[publisher]
+rc_api_url        = "https://simracecenter.com"   # or your local Race Control endpoint
+batch_interval_ms = 500
+```
+
+Alternatively, set environment variables — these take priority over the file:
+
+```powershell
+$env:PUBLISHER_AUTH_TENANT_ID     = "your-azure-tenant-id"
+$env:PUBLISHER_AUTH_CLIENT_ID     = "your-azure-client-id"
+$env:PUBLISHER_AUTH_CLIENT_SECRET = "your-azure-client-secret"
+$env:PUBLISHER_RC_API_URL         = "https://simracecenter.com"
+```
+
+Start iRacing, then run the publisher:
+
+```powershell
+.\target\debug\publisher.exe
+# or with an explicit config path:
+.\target\debug\publisher.exe --config C:\path\to\publisher.toml
+```
+
+The publisher waits for iRacing's shared memory to become available, then streams `PublisherEvent` batches to the Race Control API at `batch_interval_ms` intervals. Press **Ctrl-C** for a clean shutdown.
+
 ### Python EDA (optional)
 
 The Python prototype in `scripts/` validates the spatial-anchor approach against the real Nürburgring session. It requires `data/session.jsonl` (gitignored, 31 MB).

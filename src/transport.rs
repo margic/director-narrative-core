@@ -51,7 +51,6 @@ impl std::error::Error for TransportError {}
 /// Synchronous HTTP transport that holds an in-memory event queue, acquires
 /// Azure AD tokens, and batch-POSTs events to Race Control.
 pub struct PublisherTransport {
-    tenant_id:         String,
     client_id:         String,
     client_secret:     String,
     scope:             String,
@@ -84,7 +83,6 @@ impl PublisherTransport {
         let ingest_url = format!("{base_url}/api/publisher/v2/ingest");
 
         Self {
-            tenant_id,
             client_id:     client_id.into(),
             client_secret: client_secret.into(),
             scope:         scope.into(),
@@ -118,21 +116,44 @@ impl PublisherTransport {
         }
     }
 
+
+    /// Like [`tick`] but returns `Ok(true)` if events were actually posted,
+    /// `Ok(false)` if the interval has not elapsed yet or the queue was empty,
+    /// or `Err` on failure.
+    pub fn tick_result(
+        &mut self,
+        session_time:   f64,
+        session_tick:   i64,
+        sub_session_id: i64,
+    ) -> Result<bool, TransportError> {
+        let elapsed = self.last_flush.elapsed().as_millis() as u64;
+        if elapsed >= self.batch_interval_ms || self.queue.len() >= BATCH_LIMIT {
+            self.flush(session_time, session_tick, sub_session_id)
+        } else {
+            Ok(false)
+        }
+    }
+
     /// Drain the entire queue synchronously. Call on shutdown to guarantee
     /// all events are delivered before the process exits.
+    /// Returns `Ok(true)` if at least one batch was posted, `Ok(false)` if
+    /// the queue was already empty.
     pub fn flush(
         &mut self,
         session_time:   f64,
         session_tick:   i64,
         sub_session_id: i64,
-    ) -> Result<(), TransportError> {
+    ) -> Result<bool, TransportError> {
+        if self.queue.is_empty() {
+            return Ok(false);
+        }
         while !self.queue.is_empty() {
             let n     = self.queue.len().min(BATCH_LIMIT);
             let batch = self.queue.drain(..n).collect::<Vec<_>>();
             self.post_batch(&batch, session_time, session_tick, sub_session_id)?;
         }
         self.last_flush = Instant::now();
-        Ok(())
+        Ok(true)
     }
 
     // ── Private ───────────────────────────────────────────────────────────────
@@ -168,12 +189,15 @@ impl PublisherTransport {
                 .set("Content-Type", "application/json")
                 .send_json(&body_value);
 
+            // ureq v2 returns non-2xx as Err(ureq::Error::Status(code, resp)).
+            // All match arms must be on the Err side for non-2xx status codes.
             match result {
-                Ok(resp) if resp.status() == 200 || resp.status() == 201 => return Ok(()),
+                Ok(_) => return Ok(()),
 
-                Ok(resp) if resp.status() == 401 => {
-                    // Stale token — attempt one forced refresh, then fatal.
+                Err(ureq::Error::Status(401, _)) => {
+                    // Stale token — attempt one forced refresh on the first 401, then fatal.
                     if attempt == 0 {
+                        eprintln!("[transport] 401 — refreshing token and retrying…");
                         self.cached_token = None;
                         let token = self.get_or_refresh_token(true)?;
                         let result2 = ureq::post(&self.ingest_url)
@@ -181,21 +205,20 @@ impl PublisherTransport {
                             .set("Content-Type", "application/json")
                             .send_json(&body_value);
                         return match result2 {
-                            Ok(r) if r.status() == 200 || r.status() == 201 => Ok(()),
-                            Ok(r) => Err(TransportError(format!(
-                                "401 after forced token refresh — fatal (status {})",
-                                r.status()
+                            Ok(_) => Ok(()),
+                            Err(ureq::Error::Status(code, _)) => Err(TransportError(format!(
+                                "HTTP {code} after forced token refresh — fatal"
                             ))),
                             Err(e) => Err(TransportError(format!(
-                                "HTTP error after token refresh: {e}"
+                                "network error after token refresh: {e}"
                             ))),
                         };
                     }
                     return Err(TransportError("401 after forced token refresh — fatal".to_owned()));
                 }
 
-                Ok(resp) => {
-                    last_error = format!("HTTP {}", resp.status());
+                Err(ureq::Error::Status(code, _)) => {
+                    last_error = format!("HTTP {code}");
                     eprintln!(
                         "[transport] {} attempt {}/{}, retrying…",
                         last_error,
@@ -242,21 +265,37 @@ impl PublisherTransport {
     }
 
     fn fetch_token(&self) -> Result<TokenResponse, TransportError> {
-        let resp = ureq::post(&self.token_url)
+        let result = ureq::post(&self.token_url)
             .set("Content-Type", "application/x-www-form-urlencoded")
             .send_form(&[
                 ("grant_type",    "client_credentials"),
                 ("client_id",     &self.client_id),
                 ("client_secret", &self.client_secret),
                 ("scope",         &self.scope),
-            ])
-            .map_err(|e| TransportError(format!("token request failed: {e}")))?;
+            ]);
+
+        let resp = match result {
+            Ok(r) => r,
+            Err(ureq::Error::Status(code, r)) => {
+                let body = r.into_string().unwrap_or_default();
+                return Err(TransportError(format!(
+                    "token request failed: status {code} — {body}"
+                )));
+            }
+            Err(e) => return Err(TransportError(format!("token request failed: {e}"))),
+        };
 
         let token_resp: TokenResponse = resp
             .into_json()
             .map_err(|e| TransportError(format!("token response parse error: {e}")))?;
 
         Ok(token_resp)
+    }
+
+    /// Wall-clock time at which the cached token expires, or `None` if no
+    /// token has been acquired yet. Used by the UI status display.
+    pub fn token_expires_at(&self) -> Option<SystemTime> {
+        self.cached_token.as_ref().map(|t| t.expires_at)
     }
 
     /// Inject a pre-built token, bypassing network calls. **Test use only.**

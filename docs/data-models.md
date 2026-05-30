@@ -12,18 +12,35 @@ These are the complete Rust type definitions for `director-narrative-core`. Fiel
 The concrete struct passed to `NarrativeEngine::process_frame()` on each call. Deserialised from JSONL lines in the test harness and from the iRacing memory-mapped API in production.
 
 ```rust
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
-/// One telemetry snapshot at 5Hz.
+/// One telemetry snapshot from the iRacing session stream.
 ///
-/// Fields are split into two groups based on data source availability.
-/// The `car_idx_*` arrays are only available from the live iRacing
-/// memory-mapped API; they must be synthesised in JSONL test fixtures.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// Fields marked `#[serde(default)]` are absent from JSONL test fixtures
+/// and default to 0/empty. All `car_idx_*` arrays are live-API only;
+/// they must be synthesised in JSONL fixtures.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct TelemetryFrame {
     // ── Player scalars ─────────────────────────────────────────────────────
+    /// Lap — current lap number (1-based). 0 before first lap start.
+    pub lap: u8,
+
     /// SessionTime — seconds since session start. Monotonic.
-    pub session_time: f64,
+    pub session_time: f32,
+
+    /// LapDistPct — fraction of lap distance completed (0.0–1.0).
+    pub lap_dist_pct: f32,
+
+    /// PlayerCarIdx — the focus car's slot index in car_idx_* arrays.
+    pub player_car_idx: u8,
+
+    /// PlayerCarPosition — race position of the focus car (1-based).
+    /// 0 means unknown (car not yet classified). Use as active-car guard.
+    pub player_car_position: u8,
+
+    /// OnPitRoad — whether the focus car is currently on pit road.
+    pub on_pit_road: bool,
 
     /// SessionFlags — bitmask. Relevant bits:
     ///   YELLOW_WAVE = 0x0100 (local yellow)
@@ -31,91 +48,88 @@ pub struct TelemetryFrame {
     /// Always 0 in .ibt replay mode; must be synthesised for offline tests.
     pub session_flags: u32,
 
-    /// PlayerCarIdx — the focus car's slot index in car_idx_* arrays.
-    pub player_car_idx: usize,
-
-    /// Lap — current lap number (1-based). 0 before first lap start.
-    pub lap: u32,
-
-    /// LapDistPct — fraction of lap distance completed (0.0–1.0).
-    pub lap_dist_pct: f32,
-
-    /// LapCurrentLapTime — elapsed time on the current lap in seconds.
-    /// Unreliable before the first full lap. Use LapTimer for duration.
-    pub lap_current_lap_time: f32,
-
-    /// LapLastLapTime — last completed lap time in seconds.
-    /// Always 0.0 in .ibt replay mode; derived from session_time deltas
-    /// by LapTimer.
-    pub lap_last_lap_time: f32,
-
-    /// PlayerCarPosition — race position of the focus car (1-based).
-    /// 0 means unknown (car not yet classified). Use as active-car guard.
-    pub player_car_position: u32,
-
-    /// OnPitRoad — whether the focus car is currently on pit road.
-    pub on_pit_road: bool,
-
     // ── Full-field arrays — live API only ──────────────────────────────────
     // Length = session car count (up to 63). Inactive car slots carry
     // sentinel values documented per field.
 
     /// CarIdxLapDistPct — lap distance fraction for every car.
-    ///
-    /// Sentinel: 0.0 for inactive/not-in-world cars. Active car guard:
-    ///   car_idx_position[i] > 0 AND car_idx_lap_dist_pct[i] > -0.5
-    ///
-    /// Used for `find_car_ahead_ldp()` — the primary gap source.
-    /// Updated every live frame. In replay mode, this updates every frame
-    /// (unlike CarIdxF2Time which is stale between lap crossings).
+    /// Sentinel: values < -0.5 are iRacing inactive-slot sentinels.
+    /// Active car guard: car_idx_position[i] > 0 AND car_idx_lap_dist_pct[i] > -0.5
     pub car_idx_lap_dist_pct: Vec<f32>,
-
-    /// CarIdxF2Time — official time gap to the car one position ahead.
-    ///
-    /// Sentinel: -1.0 for inactive/not-in-world cars.
-    ///
-    /// In live sessions, this is the most accurate gap source (iRacing's
-    /// own computation, not subject to speed-conversion error).
-    /// In .ibt replay mode this is STALE — only 2 unique values per lap.
-    /// Prefer car_idx_lap_dist_pct × lap_time_s in offline/replay contexts.
-    pub car_idx_f2_time: Vec<f32>,
 
     /// CarIdxPosition — race position of every car (1-based).
     /// 0 for cars not yet classified (pit lane, not on track).
-    pub car_idx_position: Vec<u32>,
+    pub car_idx_position: Vec<u8>,
 
     /// CarIdxOnPitRoad — whether each car is currently on pit road.
     pub car_idx_on_pit_road: Vec<bool>,
+
+    // ── Optional / live-only scalars (default to 0 in JSONL fixtures) ─────
+
+    /// LapLastLapTime — last completed lap time in seconds.
+    /// Always 0.0 in .ibt replay mode; used for anchor-count bootstrap only.
+    #[serde(default)]
+    pub lap_last_lap_time: f32,
+
+    /// SessionInfoUpdate — iRacing monotonic counter; increments when the
+    /// SessionInfo YAML blob changes. Used by RosterCache::needs_update().
+    #[serde(default)]
+    pub session_info_update: u32,
+
+    /// SessionTick — sim step counter (~16 ms resolution).
+    /// Used as the deduplication key on Race Control per (raceSessionId, session_tick, event_type).
+    #[serde(default)]
+    pub session_tick: i64,
+
+    /// SessionState — iRacing session state enum.
+    /// Values: Invalid=0, GetInCar=1, Warmup=2, ParadeLaps=3, Racing=4,
+    ///         Checkered=5, CoolDown=6.
+    #[serde(default)]
+    pub session_state: i32,
+
+    /// SessionNum — which sub-session is active (practice=0, qual=1, race=2).
+    #[serde(default)]
+    pub session_num: i32,
+
+    /// CarIdxLapCompleted — laps completed per car.
+    /// Used to provide `leaderLap` in the PublisherEvent context.
+    #[serde(default)]
+    pub car_idx_lap_completed: Vec<i32>,
 }
 ```
 
 ---
 
-## 2. Anchor Reading — Ring Buffer Entry
+## 2. Anchor Reading — Sampler Entry
 
-The unit of storage in the per-`(anchor_bucket, opponent_car_idx)` ring buffer.
+The unit of storage in `AnchorSampler`. Collected readings are ingested into
+`RegressionStore` at each lap crossing.
 
 ```rust
 /// One recorded gap measurement at a fixed spatial anchor.
 ///
-/// Stored in a VecDeque<AnchorReading> per (bucket, car_idx) key.
-/// The x-axis for the OLS regression is `lap` (integer lap number).
-/// The y-axis is `gap_seconds` (f32 is sufficient; sub-millimetre
-/// gap precision has no narrative significance).
+/// Stored in AnchorSampler::samples (a plain Vec, append-only).
+/// RegressionStore rebuilds its per-(bucket, car_idx) series from
+/// this Vec at each lap crossing via ingest().
 #[derive(Debug, Clone)]
 pub struct AnchorReading {
     /// Lap number when this reading was captured (1-based).
-    pub lap: u32,
+    pub lap: u8,
 
-    /// Gap in seconds to car_ahead at this anchor position.
-    /// Always positive (focus car is trailing). NaN is never stored —
-    /// AnchorSampler silently drops frames where gap is NaN.
-    pub gap_seconds: f32,
+    /// Spatial anchor bucket (0-based, 0..n_buckets).
+    pub bucket: u8,
+
+    /// Gap in seconds to the opponent at this anchor position.
+    /// Always positive. NaN is never stored.
+    pub gap_s: f32,
+
+    /// Opponent car index.
+    pub car_idx: u8,
 
     /// True if SessionFlags had no YELLOW_WAVE or CAUTION bits set
     /// at capture time, AND the focus car was not on pit road.
     ///
-    /// Dirty entries remain in the VecDeque for capacity accounting
+    /// Dirty entries remain in the Vec for capacity accounting
     /// but are excluded from the OLS regression.
     pub is_clean: bool,
 }
@@ -126,41 +140,34 @@ pub struct AnchorReading {
 ## 3. Battle State — FSM Enum
 
 ```rust
-/// The narrative state of the relationship between the focus car and a
-/// specific opponent, computed at each lap crossing.
+/// The narrative state for one battle direction (forward or defensive).
 ///
-/// State is stored in a HashMap<(opponent_car_idx, anchor_bucket), BattleState>
-/// inside NarrativeEngine. The state machine transitions are driven by
-/// the two-tier regression (see architecture.md §4).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// NarrativeEngine holds two flat BattleState fields:
+///   engine_state   — forward direction (player closing on car ahead)
+///   defensive_state — defensive direction (car behind closing on player)
+///
+/// Opponent-identity changes and yellow-flag contamination are handled
+/// inline by the engine; there are no dedicated reset states.
+/// The state machine transitions are driven by the two-tier regression
+/// (see architecture.md §4).
+#[derive(Debug, Clone, PartialEq)]
 pub enum BattleState {
-    /// No active battle tracking for this opponent pair.
-    /// Initial state and the target after any battle resolution.
+    /// No active battle tracking. Initial state.
     Idle,
 
-    /// Accumulating anchor readings. Insufficient clean data yet to classify
-    /// a strategic intent. Emits no narrative events.
+    /// Accumulating anchor readings. Insufficient clean data yet to
+    /// classify a strategic intent. Emits no narrative events.
     Tracking,
 
     /// Sustained negative OLS slope across ≥ MIN_PUSH_READINGS clean laps.
-    /// The focus driver is intentionally closing on the opponent.
     /// Condition: median_slope ≤ PUSH_SLOPE_THRESHOLD (-0.05 s/lap)
+    ///            AND n_buckets ≥ MIN_PUSH_READINGS (2)
     Push,
 
     /// Accelerating negative slope across ≥ MIN_ATTACK_READINGS clean laps.
-    /// Closing rate is increasing lap-over-lap — an overtake attempt is imminent.
-    /// Condition: Push conditions met AND median_slope < prev_regression_slope
+    /// Condition: Push conditions met AND median_slope < prev_slope
+    ///            AND n_buckets ≥ MIN_ATTACK_READINGS (3)
     AttackSetup,
-
-    /// Opponent identity changed (pit stop, third-car overtake, incident).
-    /// All accumulated AnchorReadings for the previous opponent are invalidated.
-    /// Transitions to Tracking on the next lap crossing.
-    ResetOpponentChanged { previous_opponent_car_idx: usize },
-
-    /// One or more laps under yellow/caution exhausted the clean-reading count
-    /// below MIN_PUSH_READINGS. Regression slope is unreliable.
-    /// Transitions to Tracking once clean readings recover.
-    ResetYellowContamination { contaminated_lap_count: u32 },
 }
 ```
 
@@ -168,92 +175,99 @@ pub enum BattleState {
 
 ## 4. Narrative Events — Output Contract
 
-The `RaceEvent` enum is the sole output type. Values serialise to JSON with the `event_type` discriminator injected as a top-level key (`SCREAMING_SNAKE_CASE`). All fields cross the napi boundary as camelCase.
+The `RaceEvent` enum is the sole output type. Values serialise to JSON with the
+`event_type` discriminator as a top-level key (`SCREAMING_SNAKE_CASE`).
 
 ```rust
 use serde::Serialize;
 use crate::battle_state::SlopeInfo;
 
-/// All narrative events emitted by the engine.
-///
-/// `event_type` is injected by serde's internally-tagged format using
-/// `SCREAMING_SNAKE_CASE` renaming (`Push` → `"PUSH"`, `AttackSetup` → `"ATTACK_SETUP"`).
-/// `lap` and `session_time` are present in every variant.
 #[derive(Debug, Serialize)]
 #[serde(tag = "event_type", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum RaceEvent {
-    // ── Lap-level (regression-driven) ─────────────────────────────────────
-    Push { lap: u8, session_time: f32, car_ahead_idx: u8, slope_info: SlopeInfo },
-    AttackSetup { lap: u8, session_time: f32, car_ahead_idx: u8, slope_info: SlopeInfo },
-    DefendPush { lap: u8, session_time: f32, car_behind_idx: u8, slope_info: SlopeInfo },
-    DefendAttack { lap: u8, session_time: f32, car_behind_idx: u8, slope_info: SlopeInfo },
-    // ── Frame-level (gap threshold) ────────────────────────────────────────
-    CloseApproach { lap: u8, session_time: f32, car_ahead_idx: u8, gap_s: f32, car_race_position: u8 },
-    PressureBehind { lap: u8, session_time: f32, car_behind_idx: u8, gap_s: f32, car_race_position: u8 },
-    // ── Position / pit ─────────────────────────────────────────────────────
-    LapComplete { lap: u8, session_time: f32, lap_time_s: Option<f32>, position: u8, pit_frames: u32 },
+    // ── Battle / gap ──────────────────────────────────────────────────────
+    /// Gap to a nearby car fell below the battle threshold.
+    /// Fires from lap 1 — no OLS regression required.
+    BattleEngaged { lap: u8, session_time: f32, car_idx: u8, gap_s: f32, car_race_position: u8 },
+    /// Gap that triggered BattleEngaged has widened past the threshold.
+    BattleBroken { lap: u8, session_time: f32, car_idx: u8, gap_s: f32 },
+    /// OLS regression confirms a sustained closing rate (forward or defensive).
+    /// car_idx is the opponent (ahead when attacker; behind when defender).
+    BattleClosing { lap: u8, session_time: f32, car_idx: u8, closing_rate_sec_per_lap: f32, slope_info: SlopeInfo },
+    // ── Session / flag ────────────────────────────────────────────────────
+    RaceGreen { lap: u8, session_time: f32 },
+    FlagYellowFullCourse { lap: u8, session_time: f32 },
+    FlagYellowLocal { lap: u8, session_time: f32 },
+    RaceCheckered { lap: u8, session_time: f32 },
+    // ── Position ──────────────────────────────────────────────────────────
     Overtake { lap: u8, session_time: f32, position_from: u8, position_to: u8, positions_gained: u8 },
-    PositionLost { lap: u8, session_time: f32, position_from: u8, position_to: u8, positions_lost: u8 },
+    OvertakeForLead { lap: u8, session_time: f32, position_from: u8, positions_gained: u8 },
+    // ── Lap / pit ─────────────────────────────────────────────────────────
+    LapCompleted { lap: u8, session_time: f32, lap_time_s: Option<f32>, best_lap_time_s: Option<f32>, position: u8, pit_frames: u32 },
     PitEntry { lap: u8, session_time: f32, position: u8 },
     PitExit { lap: u8, session_time: f32, position: u8 },
+    // ── Lifecycle ─────────────────────────────────────────────────────────
+    PublisherHello { lap: u8, session_time: f32, version: String, scope: String },
+    PublisherHeartbeat { lap: u8, session_time: f32 },
+    PublisherGoodbye { lap: u8, session_time: f32 },
 }
 
-/// Slope metadata attached to regression-driven events (Push, AttackSetup, DefendPush, DefendAttack).
-#[derive(Debug, Serialize)]
+/// Slope metadata embedded in BattleClosing events.
+#[derive(Debug, Clone, Serialize)]
 pub struct SlopeInfo {
     /// Median OLS slope across all qualifying anchors (s/lap). Negative = closing.
     pub median_slope: f32,
-    /// Index of the anchor bucket with the steepest negative per-anchor slope.
-    pub hotspot_bucket: usize,
-    /// Number of anchors whose qualifying slope passed the threshold.
-    pub qualifying_anchors: usize,
+    /// Number of anchors with sufficient clean readings that contributed.
+    pub anchors_qualifying: usize,
+    /// Number of those anchors where slope < 0 (confidence signal).
+    pub anchors_agreeing: usize,
+    /// LapDistPct of the anchor with the steepest negative slope.
+    pub hotspot_lap_dist_pct: f32,
 }
 ```
 
 ### 4.1 Serialised Example Payloads
 
-**`PUSH`** — emitted at lap crossing when `BattleState` first transitions to `Push`:
+**`BATTLE_CLOSING`** — emitted at lap crossing when OLS regression confirms closing:
 
 ```json
 {
-  "event_type": "PUSH",
+  "event_type": "BATTLE_CLOSING",
   "lap": 3,
   "session_time": 480.2,
-  "car_ahead_idx": 7,
+  "car_idx": 7,
+  "closing_rate_sec_per_lap": 0.4998,
   "slope_info": {
     "median_slope": -0.4998,
-    "hotspot_bucket": 8,
-    "qualifying_anchors": 28
+    "anchors_qualifying": 28,
+    "anchors_agreeing": 22,
+    "hotspot_lap_dist_pct": 0.29
   }
 }
 ```
 
-**`ATTACK_SETUP`** — emitted when slope accelerates past threshold:
+**`BATTLE_ENGAGED`** — fires as soon as gap drops below the threshold (lap 1 capable):
 
 ```json
 {
-  "event_type": "ATTACK_SETUP",
-  "lap": 4,
-  "session_time": 620.4,
-  "car_ahead_idx": 7,
-  "slope_info": {
-    "median_slope": -0.5999,
-    "hotspot_bucket": 8,
-    "qualifying_anchors": 28
-  }
-}
-```
-
-**`CLOSE_APPROACH`** — frame-level event (fires within a lap, not at a crossing):
-
-```json
-{
-  "event_type": "CLOSE_APPROACH",
+  "event_type": "BATTLE_ENGAGED",
   "lap": 6,
   "session_time": 892.3,
-  "car_ahead_idx": 7,
+  "car_idx": 7,
   "gap_s": 0.60,
   "car_race_position": 11
+}
+```
+
+**`BATTLE_BROKEN`** — fires when gap widens past the threshold after BATTLE_ENGAGED:
+
+```json
+{
+  "event_type": "BATTLE_BROKEN",
+  "lap": 8,
+  "session_time": 1120.0,
+  "car_idx": 7,
+  "gap_s": 2.1
 }
 ```
 
@@ -266,29 +280,16 @@ pub struct SlopeInfo {
 Records the **first** gap sample per `(lap, bucket)` — one reading per spatial anchor per lap.
 
 ```rust
-/// Records the first gap crossing of each spatial anchor bucket per lap.
+/// Records the first gap crossing of each spatial anchor bucket per lap,
+/// per opponent car.
 ///
-/// The anchor bucket is computed as:
-///   bucket = floor(lap_dist_pct × anchor_count) % anchor_count
+/// bucket = (lap_dist_pct × n_buckets) as usize % n_buckets
 ///
-/// Only the first crossing is recorded. Subsequent crossings of the
-/// same bucket within the same lap are discarded (a car can cross the
-/// same LapDistPct threshold twice in extreme cases — e.g. backing up
-/// on a caution lap).
+/// Only the first crossing per (lap, bucket, car_idx) is recorded.
 pub struct AnchorSampler {
-    anchor_count: usize,
-    seen: HashSet<(u32, usize)>,       // (lap, bucket) already recorded
-    pub samples: Vec<AnchorSample>,    // append-only history
-}
-
-/// One entry in the AnchorSampler history.
-#[derive(Debug, Clone)]
-pub struct AnchorSample {
-    pub lap: u32,
-    pub bucket: usize,
-    pub gap_seconds: f32,
-    pub car_ahead_idx: usize,
-    pub is_clean: bool,
+    n_buckets: usize,
+    seen: HashSet<(u8, u8, u8)>,    // (lap, bucket, car_idx)
+    pub samples: Vec<AnchorReading>, // append-only; see §2
 }
 ```
 
@@ -297,35 +298,37 @@ pub struct AnchorSample {
 Per-`(bucket, car_idx)` OLS regression, rebuilt from the `AnchorSampler` history at each lap crossing.
 
 ```rust
-/// Identity-aware OLS regression store.
+/// Per-(bucket, car_idx) OLS regression store.
 ///
-/// Each (bucket, car_ahead_idx) pair is an independent time series.
-/// A change of opponent does not corrupt existing series; the prior
-/// opponent's series remains in _data until explicitly cleared.
-///
-/// Rebuilt entirely from AnchorSampler.samples at each lap crossing
-/// (not incrementally updated) to simplify the max_lap boundary logic.
+/// Rebuilt entirely from AnchorSampler.samples at each lap crossing via
+/// ingest(). The full-rebuild approach is correct and fast (~2 650 ops
+/// per lap at Nürburgring).
 pub struct RegressionStore {
-    _data: HashMap<(usize, usize), Vec<(u32, f32)>>,  // (bucket, car_idx) → [(lap, gap_s)]
+    data: HashMap<(u8, u8), Vec<(u8, f32)>>,  // (bucket, car_idx) → [(lap, gap_s)]
 }
 
 impl RegressionStore {
     /// Rebuild from sampler history.
     ///
-    /// max_lap: exclude samples from laps > max_lap. This prevents the
-    /// first frame of the new lap (already in the sampler when the
-    /// lap-crossing fires) from contaminating the previous lap's regression.
-    pub fn ingest(&mut self, sampler: &AnchorSampler, max_lap: Option<u32>);
+    /// max_lap: exclude samples from laps > max_lap. Prevents the first
+    /// frame of the new lap from contaminating the prior lap's regression
+    /// (off-by-one correctness invariant — do not remove).
+    pub fn ingest(&mut self, sampler: &AnchorSampler, max_lap: u8);
 
-    /// Returns the most-negative qualifying slope per bucket.
-    /// If multiple opponents compete at the same bucket, returns the
-    /// one with the steepest closing slope (most negative).
-    /// Buckets with fewer than `min_readings` clean points are excluded.
-    pub fn per_bucket_slopes(&self, min_readings: usize) -> HashMap<usize, f32>;
+    /// Most-negative slope per bucket across all cars (used for heatmap).
+    pub fn per_bucket_slopes(&self, min_readings: usize) -> HashMap<u8, f32>;
 
-    /// OLS slope for a single (bucket, car_idx) series.
-    /// Returns None if < 2 clean readings or zero variance in lap number.
-    pub fn slope_for(&self, bucket: usize, car_idx: usize) -> Option<f32>;
+    /// Per-car two-tier analysis: median of each car's per-bucket slopes.
+    /// The state machine uses this to select the most-threatening car.
+    pub fn per_car_median_slopes(&self, min_readings: usize) -> HashMap<u8, CarSlopeInfo>;
+}
+
+/// Per-car slope summary returned by per_car_median_slopes.
+pub struct CarSlopeInfo {
+    pub median:    f32,
+    pub n_buckets: usize,
+    /// Buckets where slope < 0 (car is closing).
+    pub n_agree:   usize,
 }
 ```
 

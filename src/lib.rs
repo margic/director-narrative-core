@@ -7,6 +7,7 @@ pub mod irsdk;
 pub mod lap_timer;
 pub mod lifecycle;
 pub mod publisher_event;
+pub mod publisher_status;
 pub mod race_event;
 pub mod regression_store;
 pub mod replay;

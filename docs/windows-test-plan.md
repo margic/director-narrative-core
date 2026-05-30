@@ -11,19 +11,17 @@
 This branch adds a Rust-native Windows shared-memory reader that connects directly
 to iRacing's memory-mapped file (`Local\IRSDKMemMapFileName`) at 60 Hz, replacing
 the Python `irsdk` bridge that previously handled this. The implementation lives
-entirely in `napi/src/irsdk/` and is `#[cfg(target_os = "windows")]`-gated so Linux
+entirely in `src/irsdk/` and is `#[cfg(target_os = "windows")]`-gated so Linux
 CI is unaffected.
 
 ### What was built
 
 | File | Purpose |
 |---|---|
-| `napi/src/irsdk/header.rs` | Parses `irsdk_header` C struct; builds `VarIndex` (name → byte offset map) |
-| `napi/src/irsdk/reader.rs` | Typed read helpers + `build_frame()` from raw buffer bytes |
-| `napi/src/irsdk/mod.rs` | `IrsdkReader` — `MapViewOfFile`, `WaitForSingleObject`, `Drop` |
-| `napi/src/irsdk/thread.rs` | `LiveSession` background thread + NAPI `ThreadSafeFunction` push |
-| `napi/src/lib.rs` | `NarrativeEngine::startLive(cb)` / `stopLive()` NAPI methods added |
-| `listener/live.js` | Node.js entry point for live sessions |
+| `src/irsdk/header.rs` | Parses `irsdk_header` C struct; builds `VarIndex` (name → byte offset map) |
+| `src/irsdk/reader.rs` | Typed read helpers + `build_frame()` from raw buffer bytes |
+| `src/irsdk/mod.rs` | `IrsdkReader` — `MapViewOfFile`, `WaitForSingleObject`, `Drop` |
+| `src/bin/publisher.rs` | Main loop: mmap reader + engine + HTTP transport |
 
 ### How it works
 
@@ -32,15 +30,12 @@ iRacing (Windows)
   └─ writes telemetry to Local\IRSDKMemMapFileName @ 60 Hz
   └─ signals Local\IRSDKDataValidEvent on each write
 
-Rust background thread (spawned by startLive)
-  └─ WaitForSingleObject(IRSDKDataValidEvent)  ← 0% CPU when idle
+publisher.exe (Rust main loop)
+  └─ IrsdkReader::wait_for_frame()  ← 0% CPU when idle
   └─ reads mmap → builds TelemetryFrame
   └─ engine.process_frame() → Vec<RaceEvent>
-  └─ ThreadSafeFunction.call(events)  → Node.js event loop
-
-listener/live.js (Node.js)
-  └─ engine.startLive(callback)
-  └─ callback prints events as JSON to stdout
+  └─ build_event() → PublisherEvent → transport.enqueue()
+  └─ every 500 ms: POST /api/publisher/v2/ingest
 ```
 
 ### Anchor-count bootstrap
@@ -62,12 +57,6 @@ rustup target add x86_64-pc-windows-msvc
 # Visual Studio Build Tools (C++ workload — provides the MSVC linker)
 winget install Microsoft.VisualStudio.2022.BuildTools
 # During install select: "Desktop development with C++"
-
-# Node.js ≥ 18
-winget install OpenJS.NodeJS
-
-# napi-rs CLI
-npm install -g @napi-rs/cli
 ```
 
 ---
@@ -77,13 +66,13 @@ npm install -g @napi-rs/cli
 ```powershell
 git clone https://github.com/margic/director-narrative-core
 cd director-narrative-core
-git checkout issue-17-iracing-live-mmap
+git checkout main
 
-# Build the native module
-cargo build -p director-narrative-core-napi
-
-# Copy the .dll as the Node.js loadable .node file
-copy target\debug\director_narrative_core_napi.dll napi\index.node
+# Build the publisher binary
+cargo build --bin publisher
+# Release build (ships to rig):
+cargo build --release --bin publisher
+# Output: target\debug\publisher.exe  (or target\release\publisher.exe)
 ```
 
 ---
@@ -116,35 +105,41 @@ test result: ok. 26 passed; 0 failed
    - Use a standing or rolling start — do not use a time trial (no opponents).
 
 2. Start the race and let it run for at least one full lap before starting the
-   listener (so `LapLastLapTime` is populated for anchor-count bootstrap).
+   publisher (so `LapLastLapTime` is populated for anchor-count bootstrap).
 
-### Run the listener
+### Run the publisher
 
 ```powershell
-# In a separate terminal, from the repo root:
-node listener\live.js
+# From the repo root (ensure publisher.toml is present — see src/config.rs):
+target\debug\publisher.exe
 ```
 
 ### Expected output sequence
 
 ```
-Waiting for iRacing to open...
-[irsdk] connected — sampling at 60 Hz
-[irsdk] recomputing anchor_count: 108 → 18 (lap_time=91.4s)
+[publisher] config loaded — rig=rig-mypc api=https://simracecenter.com
+[publisher] waiting for iRacing...
+[publisher] connected — playerCarIdx=3, car=#42 Paul Crofts
+[publisher] registered with Race Control
+[publisher] publishing at 60 Hz (batch every 500ms)
+```
+
+After the green flag:
+
+```
+[publisher] RACE_GREEN — lap 1 underway
 ```
 
 After 2–3 laps running near an opponent:
 
 ```json
 {
-  "eventType": "CLOSE_APPROACH",
+  "event_type": "BATTLE_ENGAGED",
   "lap": 2,
-  "sessionTime": 185.3,
-  "narrativeContext": {
-    "carAheadIdx": 12,
-    "gapS": 0.8,
-    "carRacePosition": 3
-  }
+  "session_time": 185.3,
+  "car_idx": 12,
+  "gap_s": 0.8,
+  "car_race_position": 3
 }
 ```
 
@@ -152,16 +147,16 @@ After 3–4 laps of consistent closing on the same opponent:
 
 ```json
 {
-  "eventType": "PUSH",
+  "event_type": "BATTLE_CLOSING",
   "lap": 3,
-  "sessionTime": 274.1,
-  "narrativeContext": {
-    "carAheadIdx": 12,
-    "slopeInfo": {
-      "medianSlope": -0.42,
-      "hotspotLapDistPct": 0.31,
-      "anchorsAgreeing": 14
-    }
+  "session_time": 274.1,
+  "car_idx": 12,
+  "closing_rate_sec_per_lap": 0.42,
+  "slope_info": {
+    "median_slope": -0.42,
+    "anchors_qualifying": 14,
+    "anchors_agreeing": 11,
+    "hotspot_lap_dist_pct": 0.31
   }
 }
 ```
@@ -171,22 +166,22 @@ After 3–4 laps of consistent closing on the same opponent:
 | What to check | How |
 |---|---|
 | Anchor count adapts to track | Log line shows computed `anchor_count` matching `floor(lap_time / 5)` |
-| No events during yellow flags | `PUSH` / `ATTACK_SETUP` should not fire when session flag is CAUTION |
+| No BATTLE_CLOSING during yellow flags | `BATTLE_CLOSING` should not fire when session flag is CAUTION |
 | `OVERTAKE` fires on position change | Pass an opponent — event should appear within ~16 ms (1 frame) |
 | `PIT_ENTRY` / `PIT_EXIT` fire | Pit on lap 3 — events should appear as you enter/exit pit lane |
-| Ctrl-C exits cleanly | Process exits 0, no hanging thread |
+| Ctrl-C exits cleanly | `PUBLISHER_GOODBYE` sent; process exits 0 |
 
 ---
 
 ## Test 3 — Reconnect
 
 ```powershell
-node listener\live.js   # starts waiting
+target\debug\publisher.exe   # starts waiting
 # Launch iRacing → "connected" message appears
 # Close iRacing (Alt-F4 or crash)
-# → "[irsdk] disconnected — reconnecting" printed
+# → "[publisher] iRacing disconnected — waiting..." printed
 # Reopen iRacing and rejoin a session
-# → "[irsdk] connected" printed again, events resume
+# → "[publisher] connected" printed again, events resume
 ```
 
 ---
@@ -196,24 +191,24 @@ node listener\live.js   # starts waiting
 On any Linux/macOS machine (or WSL):
 
 ```bash
-node listener/live.js
+cargo build --bin publisher
+./target/debug/publisher
 ```
 
 **Expected:**
 ```
-ERROR: live iRacing mode requires Windows.
-For offline testing use:  node listener/index.js data/test_fixture.jsonl
+ERROR: [publisher] only supported on Windows (iRacing is Windows-only)
 ```
 
 ---
 
 ## Offline fallback (no iRacing)
 
-The original JSONL batch listener is unchanged and works on all platforms:
+The JSONL replay mode works on all platforms via `cargo test`:
 
 ```powershell
 python scripts\synthesize_test_fixture.py
-node listener\index.js data\test_fixture.jsonl
+cargo test
 ```
 
 ---

@@ -199,7 +199,7 @@ fn build_and_validate(raw: RawConfig) -> Result<PublisherConfig, ConfigError> {
             client_id:     require(raw.auth.client_id,     "client_id")?,
             client_secret: require(raw.auth.client_secret, "client_secret")?,
             scope:         raw.auth.scope.filter(|s| !s.is_empty())
-                               .unwrap_or_else(|| "api://racecontrol/.default".to_owned()),
+                               .unwrap_or_else(|| "api://racecontrol-api-a780e279-1cb6-4ed0-9ef6-49029aa50a42/.default".to_owned()),
             cert_thumbprint: raw.auth.cert_thumbprint.filter(|s| !s.is_empty()),
         },
         publisher: PublisherSection {
