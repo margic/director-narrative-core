@@ -1,5 +1,5 @@
 /// A single decoded telemetry frame from the iRacing session stream.
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Clone, Debug)]
 #[serde(rename_all = "snake_case")]
 pub struct TelemetryFrame {
     pub lap:                  u8,
@@ -15,6 +15,9 @@ pub struct TelemetryFrame {
     pub car_idx_position:     Vec<u8>,
     /// Indexed by car_idx.
     pub car_idx_on_pit_road:  Vec<bool>,
+    /// Indexed by car_idx.
+    #[serde(default)]
+    pub car_idx_track_surface: Vec<i32>,
     /// Elapsed time of the last completed lap in seconds. 0.0 until lap 1 is done.
     /// Used for anchor-count bootstrap only; absent from JSONL fixtures (defaults to 0.0).
     #[serde(default)]
@@ -46,4 +49,20 @@ pub struct TelemetryFrame {
     /// Absent from JSONL fixtures; defaults to empty vec.
     #[serde(default)]
     pub car_idx_lap_completed: Vec<i32>,
+    #[serde(default)]
+    pub lf_temp_m:             f32,
+    #[serde(default)]
+    pub rf_temp_m:             f32,
+    #[serde(default)]
+    pub lr_temp_m:             f32,
+    #[serde(default)]
+    pub rr_temp_m:             f32,
+    #[serde(default)]
+    pub fuel_level:            f32,
+    #[serde(default)]
+    pub throttle:              f32,
+    #[serde(default)]
+    pub brake:                 f32,
+    #[serde(default)]
+    pub speed:                 f32,
 }

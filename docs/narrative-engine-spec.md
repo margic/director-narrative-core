@@ -482,3 +482,12 @@ If Driver A and Driver B are in the same race and both run the engine, they will
 - Engine B: `{ subject: B, object: A, closing_rate: +0.12 }` — B sees A behind
 
 These are **not** the same event. Both are correct. The director should surface both: A has a `PUSH` narrative, B has a `DEFEND` narrative for the same physical battle. The `event_key` de-duplication (§15.2) only applies to events with the same `subject` and `object` — not to perspective-swapped pairs.
+
+
+## 9. CarRegistry architecture
+
+The engine keeps a fixed 64-slot `CarRegistry` keyed by `car_idx`. Each slot stores per-car identity, kinematics, anchor sampling state, and retained opponent history. Updates are O(active cars) per frame, stale-slot expiry is O(64), and memory is bounded by the fixed array plus per-car opponent vectors.
+
+## 12. Event table additions
+
+Added events: `HORIZON_CLOSING`, `HORIZON_CLOSING_RESOLVED`, `TIRE_DEGRADATION`, `FUEL_PROJECTION`, `FUEL_SAVING_TECHNIQUE`, `MICRO_SECTOR_GAIN`, `MICRO_SECTOR_LOSS`, `BRAKING_PROFILE`, `TRAFFIC_INTERCEPT`, `VULNERABILITY_ALERT`, `VULNERABILITY_RESOLVED`, `INCIDENT_CLUSTER`, `INCIDENT_CLUSTER_RESOLVED`, and `TRAFFIC_COMPRESSION_ZONE`.

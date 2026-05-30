@@ -53,6 +53,21 @@ pub struct SessionRoster {
 }
 
 impl SessionRoster {
+    pub fn empty() -> Self {
+        Self { cars: HashMap::new() }
+    }
+
+    pub fn from_cars<I>(cars: I) -> Self
+    where
+        I: IntoIterator<Item = CarRef>,
+    {
+        Self { cars: cars.into_iter().map(|car| (car.car_idx, car)).collect() }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &CarRef> {
+        self.cars.values()
+    }
+
     /// Look up a car by its `carIdx` slot number.
     pub fn lookup(&self, car_idx: u8) -> Option<&CarRef> {
         self.cars.get(&car_idx)
@@ -71,6 +86,12 @@ impl SessionRoster {
 /// Stateless YAML parser. Call [`SessionInfoParser::build`] whenever the
 /// `SessionInfoUpdate` counter changes.
 pub struct SessionInfoParser;
+
+impl Default for SessionRoster {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
 
 impl SessionInfoParser {
     /// Parse a raw `SessionInfo` YAML string into a [`SessionRoster`].

@@ -182,6 +182,24 @@ pub fn build_frame(buf: &[u8], vars: &VarIndex) -> Option<CoreFrame> {
         .map(|v| read_i32_array(buf, v.offset, v.count.min(64)))
         .unwrap_or_default();
 
+    let car_idx_track_surface = vars
+        .get("CarIdxTrackSurface")
+        .filter(|v| v.type_code == IR_INT)
+        .map(|v| read_i32_array(buf, v.offset, v.count.min(64)))
+        .unwrap_or_default();
+
+    let fuel_level = vars
+        .get("FuelLevel")
+        .map(|v| read_f32(buf, v.offset))
+        .unwrap_or(0.0);
+    let throttle = vars.get("Throttle").map(|v| read_f32(buf, v.offset)).unwrap_or(0.0);
+    let brake = vars.get("Brake").map(|v| read_f32(buf, v.offset)).unwrap_or(0.0);
+    let speed = vars.get("Speed").map(|v| read_f32(buf, v.offset)).unwrap_or(0.0);
+    let lf_temp_m = vars.get("LFtempM").map(|v| read_f32(buf, v.offset)).unwrap_or(0.0);
+    let rf_temp_m = vars.get("RFtempM").map(|v| read_f32(buf, v.offset)).unwrap_or(0.0);
+    let lr_temp_m = vars.get("LRtempM").map(|v| read_f32(buf, v.offset)).unwrap_or(0.0);
+    let rr_temp_m = vars.get("RRtempM").map(|v| read_f32(buf, v.offset)).unwrap_or(0.0);
+
     Some(CoreFrame {
         session_time,
         session_flags,
@@ -193,12 +211,21 @@ pub fn build_frame(buf: &[u8], vars: &VarIndex) -> Option<CoreFrame> {
         car_idx_lap_dist_pct,
         car_idx_position,
         car_idx_on_pit_road,
+        car_idx_track_surface,
         lap_last_lap_time,
         session_info_update,
         session_tick,
         session_state,
         session_num,
         car_idx_lap_completed,
+        lf_temp_m,
+        rf_temp_m,
+        lr_temp_m,
+        rr_temp_m,
+        fuel_level,
+        throttle,
+        brake,
+        speed,
     })
 }
 
