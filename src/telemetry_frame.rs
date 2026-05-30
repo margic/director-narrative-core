@@ -19,4 +19,10 @@ pub struct TelemetryFrame {
     /// Used for anchor-count bootstrap only; absent from JSONL fixtures (defaults to 0.0).
     #[serde(default)]
     pub lap_last_lap_time:    f32,
+    /// iRacing `SessionInfoUpdate` monotonic counter. Increments whenever the
+    /// `SessionInfo` YAML blob changes (driver joins/leaves, session advances).
+    /// Used by `RosterCache::needs_update()` to decide when to re-parse the YAML.
+    /// Absent from JSONL fixtures; defaults to 0.
+    #[serde(default)]
+    pub session_info_update:  u32,
 }

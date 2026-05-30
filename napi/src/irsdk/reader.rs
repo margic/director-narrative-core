@@ -75,6 +75,8 @@ pub const REQUIRED_VARS: &[&str] = &[
     "CarIdxOnPitRoad",
     // Optional — absent in some session types; defaults to 0.0.
     "LapLastLapTime",
+    // Optional — absent in very old iRacing builds; defaults to 0.
+    "SessionInfoUpdate",
 ];
 
 // ── Frame builder ─────────────────────────────────────────────────────────
@@ -148,6 +150,11 @@ pub fn build_frame(buf: &[u8], vars: &VarIndex) -> Option<CoreFrame> {
         .map(|v| read_f32(buf, v.offset))
         .unwrap_or(0.0);
 
+    let session_info_update = vars
+        .get("SessionInfoUpdate")
+        .map(|v| read_i32(buf, v.offset) as u32)
+        .unwrap_or(0);
+
     Some(CoreFrame {
         session_time,
         session_flags,
@@ -160,6 +167,7 @@ pub fn build_frame(buf: &[u8], vars: &VarIndex) -> Option<CoreFrame> {
         car_idx_position,
         car_idx_on_pit_road,
         lap_last_lap_time,
+        session_info_update,
     })
 }
 
