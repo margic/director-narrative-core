@@ -113,6 +113,7 @@ mod tests {
             car_idx_lap_dist_pct,
             car_idx_position,
             car_idx_on_pit_road,
+            lap_last_lap_time:    0.0,
         }
     }
 

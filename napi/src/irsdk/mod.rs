@@ -23,8 +23,12 @@ mod platform {
     };
     use windows_sys::Win32::System::Memory::{
         MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, FILE_MAP_READ,
+        MEMORY_MAPPED_VIEW_ADDRESS,
     };
-    use windows_sys::Win32::System::Threading::{OpenEventW, WaitForSingleObject, SYNCHRONIZE};
+    use windows_sys::Win32::System::Threading::{OpenEventW, WaitForSingleObject};
+
+    // SYNCHRONIZE is a standard Windows access-rights constant (not exported by windows-sys 0.59).
+    const SYNCHRONIZE: u32 = 0x0010_0000;
 
     use director_narrative_core::telemetry_frame::TelemetryFrame as CoreFrame;
 
@@ -84,12 +88,12 @@ mod platform {
             let mmap_handle = unsafe {
                 OpenFileMappingW(FILE_MAP_READ, 0, wide(MMAP_NAME).as_ptr())
             };
-            if mmap_handle == 0 || mmap_handle == INVALID_HANDLE_VALUE {
+            if mmap_handle == std::ptr::null_mut() || mmap_handle == INVALID_HANDLE_VALUE {
                 return Err(IrsdkError::NotRunning);
             }
 
             let map_view = unsafe {
-                MapViewOfFile(mmap_handle, FILE_MAP_READ, 0, 0, 0) as *const u8
+                MapViewOfFile(mmap_handle, FILE_MAP_READ, 0, 0, 0).Value as *const u8
             };
             if map_view.is_null() {
                 unsafe { CloseHandle(mmap_handle) };
@@ -105,7 +109,7 @@ mod platform {
 
             if !is_connected(hdr.status) {
                 unsafe {
-                    UnmapViewOfFile(map_view as _);
+                    UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: map_view as *mut _ });
                     CloseHandle(mmap_handle);
                 }
                 return Err(IrsdkError::NotRunning);
@@ -114,9 +118,12 @@ mod platform {
             let var_index = build_var_index(mmap_slice, &hdr, REQUIRED_VARS)
                 .ok_or(IrsdkError::BadHeader)?;
 
-            if REQUIRED_VARS.iter().any(|name| !var_index.contains_key(*name)) {
+            if REQUIRED_VARS.iter()
+                .filter(|&&n| n != "LapLastLapTime")  // LapLastLapTime is optional
+                .any(|name| !var_index.contains_key(*name))
+            {
                 unsafe {
-                    UnmapViewOfFile(map_view as _);
+                    UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: map_view as *mut _ });
                     CloseHandle(mmap_handle);
                 }
                 return Err(IrsdkError::MissingVars);
@@ -125,9 +132,9 @@ mod platform {
             let event_handle = unsafe {
                 OpenEventW(SYNCHRONIZE, 0, wide(EVENT_NAME).as_ptr())
             };
-            if event_handle == 0 || event_handle == INVALID_HANDLE_VALUE {
+            if event_handle == std::ptr::null_mut() || event_handle == INVALID_HANDLE_VALUE {
                 unsafe {
-                    UnmapViewOfFile(map_view as _);
+                    UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: map_view as *mut _ });
                     CloseHandle(mmap_handle);
                 }
                 return Err(IrsdkError::NotRunning);
@@ -194,7 +201,7 @@ mod platform {
     impl Drop for IrsdkReader {
         fn drop(&mut self) {
             unsafe {
-                UnmapViewOfFile(self.map_view as _);
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: self.map_view as *mut _ });
                 CloseHandle(self.mmap_handle);
                 CloseHandle(self.event_handle);
             }

@@ -151,6 +151,7 @@ fn into_core_frame(js: TelemetryFrame) -> CoreFrame {
         car_idx_lap_dist_pct: js.car_idx_lap_dist_pct.iter().map(|&x| x as f32).collect(),
         car_idx_position:     js.car_idx_position.iter().map(|&x| x as u8).collect(),
         car_idx_on_pit_road:  js.car_idx_on_pit_road,
+        lap_last_lap_time:    0.0,  // not available from the JS batch API
     }
 }
 

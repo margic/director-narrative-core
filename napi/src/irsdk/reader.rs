@@ -73,6 +73,8 @@ pub const REQUIRED_VARS: &[&str] = &[
     "CarIdxLapDistPct",
     "CarIdxPosition",
     "CarIdxOnPitRoad",
+    // Optional — absent in some session types; defaults to 0.0.
+    "LapLastLapTime",
 ];
 
 // ── Frame builder ─────────────────────────────────────────────────────────
@@ -141,6 +143,11 @@ pub fn build_frame(buf: &[u8], vars: &VarIndex) -> Option<CoreFrame> {
         return None;
     };
 
+    let lap_last_lap_time = vars
+        .get("LapLastLapTime")
+        .map(|v| read_f32(buf, v.offset))
+        .unwrap_or(0.0);
+
     Some(CoreFrame {
         session_time,
         session_flags,
@@ -152,6 +159,7 @@ pub fn build_frame(buf: &[u8], vars: &VarIndex) -> Option<CoreFrame> {
         car_idx_lap_dist_pct,
         car_idx_position,
         car_idx_on_pit_road,
+        lap_last_lap_time,
     })
 }
 
