@@ -396,3 +396,12 @@ The publisher binary is a single `.exe`. Copy it to the rig, drop `publisher.tom
 ### 9.6 What Was Deliberately Not Built
 
 The publisher binary has no configuration UI, no session management UI, no driver roster management UI, no stream preview. These features belong to Race Control's web frontend — the place where an operator with a keyboard and a monitor should manage them. The publisher's job is to watch iRacing and report what it sees. Keeping that scope hard and narrow is what makes the binary small, auditable, and deployable in under a minute.
+
+
+## 3. CarRegistry
+
+The component graph now includes a global `CarRegistry` feeding horizon, traffic, incident, and compression detectors while preserving per-car history and bounded memory use.
+
+## 6. Feature modules
+
+New modules: `car_registry`, `horizon`, `tire_degradation`, `fuel_projection`, `lift_coast`, `micro_sector`, `braking_profile`, `traffic_intercept`, `vulnerability`, `incident_cluster`, and `compression_zone`.

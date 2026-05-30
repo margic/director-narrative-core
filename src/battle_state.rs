@@ -18,7 +18,7 @@ pub const CLOSE_APPROACH_MIN_FRAMES: u32   = 5;
 // ── BattleState ──────────────────────────────────────────────────────────────
 
 /// Race-threat state for a single direction (forward or defensive).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BattleState {
     Idle,
     Tracking,

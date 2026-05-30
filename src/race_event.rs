@@ -3,88 +3,88 @@ use serde::Serialize;
 use crate::battle_state::SlopeInfo;
 
 /// All narrative events emitted by the engine.
-///
-/// `lap` and `session_time` are included in every variant so the serialised
-/// output is self-contained. The `event_type` discriminator is injected by
-/// serde's internally-tagged format.
 #[derive(Debug, Serialize)]
 #[serde(tag = "event_type", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum RaceEvent {
-    // ── Battle / gap ─────────────────────────────────────────────────────────
-    /// Gap to a nearby car is below the battle threshold.
-    /// Fires from lap 1 — no OLS regression required.
     BattleEngaged {
-        lap:               u8,
-        session_time:      f32,
-        /// Opponent car index (ahead or behind the player).
-        car_idx:           u8,
-        gap_s:             f32,
-        car_race_position: u8,
+        lap:                 u8,
+        session_time:        f32,
+        car_idx:             u8,
+        gap_s:               f32,
+        car_race_position:   u8,
+        prior_skirmishes:    u32,
+        prior_attack_time_s: f32,
     },
-    /// Gap that previously triggered `BATTLE_ENGAGED` has widened beyond the threshold.
     BattleBroken {
         lap:          u8,
         session_time: f32,
-        /// Opponent car index that was the subject of the prior `BATTLE_ENGAGED`.
         car_idx:      u8,
         gap_s:        f32,
     },
-    /// OLS regression confirms a sustained closing rate to a nearby opponent.
-    /// Covers both attacker (closing on car ahead) and defender (car behind closing)
-    /// perspectives; the `car_idx` field identifies the opponent.
     BattleClosing {
         lap:                      u8,
         session_time:             f32,
         car_idx:                  u8,
-        /// Closing rate in seconds per lap (positive = closing, from |median_slope|).
         closing_rate_sec_per_lap: f32,
         slope_info:               SlopeInfo,
+        prior_skirmishes:         u32,
+        prior_attack_time_s:      f32,
     },
-    // ── Session / flag ────────────────────────────────────────────────────────
-    /// `SessionState` transitioned to Racing (4) and the green flag bit is set.
+    HorizonClosing {
+        lap:                       u8,
+        session_time:              f32,
+        attacker_car_idx:          u8,
+        defender_car_idx:          u8,
+        attacker_position:         u8,
+        defender_position:         u8,
+        current_gap_s:             f32,
+        closing_rate_sec_per_lap:  f32,
+        estimated_laps_to_contact: u16,
+    },
+    HorizonClosingResolved {
+        lap:              u8,
+        session_time:     f32,
+        attacker_car_idx: u8,
+        defender_car_idx: u8,
+    },
     RaceGreen {
         lap:          u8,
         session_time: f32,
     },
-    /// Full-course yellow flag (Caution) became active.
     FlagYellowFullCourse {
         lap:          u8,
         session_time: f32,
     },
-    /// Local (sector) yellow flag became active.
     FlagYellowLocal {
         lap:          u8,
         session_time: f32,
     },
-    /// `SessionState` transitioned to Checkered (5).
     RaceCheckered {
         lap:          u8,
         session_time: f32,
     },
-    // ── Position ──────────────────────────────────────────────────────────────
-    /// Player gained at least one position at a lap crossing (non-pit lap).
     Overtake {
         lap:              u8,
         session_time:     f32,
+        car_idx:          u8,
         position_from:    u8,
         position_to:      u8,
         positions_gained: u8,
     },
-    /// Player gained the lead at a lap crossing.
     OvertakeForLead {
         lap:              u8,
         session_time:     f32,
+        car_idx:          u8,
         position_from:    u8,
         positions_gained: u8,
     },
-    // ── Lap / pit ─────────────────────────────────────────────────────────────
     LapCompleted {
-        lap:           u8,
-        session_time:  f32,
-        lap_time_s:    Option<f32>,
+        lap:             u8,
+        session_time:    f32,
+        lap_time_s:      Option<f32>,
         best_lap_time_s: Option<f32>,
-        position:      u8,
-        pit_frames:    u32,
+        position:        u8,
+        pit_frames:      u32,
     },
     PitEntry {
         lap:          u8,
@@ -96,22 +96,128 @@ pub enum RaceEvent {
         session_time: f32,
         position:     u8,
     },
-    // ── Lifecycle ─────────────────────────────────────────────────────────────
-    /// Sent once after successful registration, before any telemetry events.
+    TireDegradation {
+        lap:                  u8,
+        session_time:         f32,
+        lf_temp_c:            f32,
+        rf_temp_c:            f32,
+        lr_temp_c:            f32,
+        rr_temp_c:            f32,
+        lf_slope_c_per_min:   f32,
+        rf_slope_c_per_min:   f32,
+        lr_slope_c_per_min:   f32,
+        rr_slope_c_per_min:   f32,
+        hottest_corner:       String,
+    },
+    FuelProjection {
+        lap:              u8,
+        session_time:     f32,
+        fuel_remaining_l: f32,
+        fuel_per_lap_l:   f32,
+        laps_remaining:   f32,
+        is_provisional:   bool,
+    },
+    FuelSavingTechnique {
+        lap:                      u8,
+        session_time:             f32,
+        coast_duration_s:         f32,
+        coast_start_lap_dist_pct: f32,
+        coast_start_speed_mps:    f32,
+    },
+    MicroSectorGain {
+        lap:               u8,
+        session_time:      f32,
+        bucket_from:       u8,
+        bucket_to:         u8,
+        lap_dist_pct_from: f32,
+        lap_dist_pct_to:   f32,
+        cumulative_delta_s: f32,
+        technique_hint:    String,
+    },
+    MicroSectorLoss {
+        lap:               u8,
+        session_time:      f32,
+        bucket_from:       u8,
+        bucket_to:         u8,
+        lap_dist_pct_from: f32,
+        lap_dist_pct_to:   f32,
+        cumulative_delta_s: f32,
+    },
+    BrakingProfile {
+        lap:                  u8,
+        session_time:         f32,
+        anchor_bucket:        u8,
+        brake_point_pct:      f32,
+        brake_release_pct:    f32,
+        peak_brake_pct:       f32,
+        braking_energy:       f32,
+        entry_speed_mps:      f32,
+        min_speed_mps:        f32,
+        throttle_release_pct: f32,
+    },
+    TrafficIntercept {
+        lap:                    u8,
+        session_time:           f32,
+        leader_car_idx:         u8,
+        traffic_car_idx:        u8,
+        cross_class:            bool,
+        distance_m:             f32,
+        relative_speed_mps:     f32,
+        time_to_intercept_s:    f32,
+        intercept_bucket:       u8,
+        intercept_lap_dist_pct: f32,
+    },
+    VulnerabilityAlert {
+        lap:                    u8,
+        session_time:           f32,
+        vulnerability:          f32,
+        attacker_idx:           u8,
+        tire_contribution:      f32,
+        closing_contribution:   f32,
+        proximity_contribution: f32,
+        fuel_contribution:      f32,
+    },
+    VulnerabilityResolved {
+        lap:          u8,
+        session_time: f32,
+    },
+    IncidentCluster {
+        lap:               u8,
+        session_time:      f32,
+        bucket:            u8,
+        lap_dist_pct_from: f32,
+        lap_dist_pct_to:   f32,
+        car_idxs:          Vec<u8>,
+        severity:          f32,
+    },
+    IncidentClusterResolved {
+        lap:          u8,
+        session_time: f32,
+        bucket:       u8,
+    },
+    TrafficCompressionZone {
+        lap:                    u8,
+        session_time:           f32,
+        battle_attacker_idx:    u8,
+        battle_defender_idx:    u8,
+        window_start_pct:       f32,
+        window_end_pct:         f32,
+        traffic_car_idxs:       Vec<u8>,
+        compression_score:      u8,
+        first_intercept_car_idx: u8,
+        first_intercept_time_s: f32,
+        first_intercept_bucket: u8,
+    },
     PublisherHello {
         lap:          u8,
         session_time: f32,
-        /// Binary version string (e.g. `"0.1.0"`).
         version:      String,
-        /// Publisher scope — always `"driver"` for this binary.
         scope:        String,
     },
-    /// Liveness heartbeat — sent every 30 s while the session is bound.
     PublisherHeartbeat {
         lap:          u8,
         session_time: f32,
     },
-    /// Sent on clean shutdown (Ctrl-C / SIGTERM) before process exit.
     PublisherGoodbye {
         lap:          u8,
         session_time: f32,

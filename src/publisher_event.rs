@@ -162,12 +162,21 @@ mod tests {
             car_idx_lap_dist_pct: vec![0.5, 0.51],
             car_idx_position: vec![5, 4],
             car_idx_on_pit_road: vec![false, false],
+            car_idx_track_surface: vec![0, 0],
             lap_last_lap_time: 540.0,
             session_info_update: 1,
             session_tick: 9876,
             session_state: 4,
             session_num: 0,
             car_idx_lap_completed: vec![3, 3],
+            lf_temp_m: 0.0,
+            rf_temp_m: 0.0,
+            lr_temp_m: 0.0,
+            rr_temp_m: 0.0,
+            fuel_level: 0.0,
+            throttle: 0.0,
+            brake: 0.0,
+            speed: 0.0,
         }
     }
 
@@ -184,6 +193,8 @@ mod tests {
                 anchors_agreeing: 4,
                 hotspot_lap_dist_pct: 0.62,
             },
+            prior_skirmishes: 0,
+            prior_attack_time_s: 0.0,
         };
 
         let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001");
