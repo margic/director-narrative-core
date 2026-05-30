@@ -113,7 +113,12 @@ mod tests {
             car_idx_lap_dist_pct,
             car_idx_position,
             car_idx_on_pit_road,
-            lap_last_lap_time:    0.0,
+            lap_last_lap_time:       0.0,
+            session_info_update:     0,
+            session_tick:            0,
+            session_state:           0,
+            session_num:             0,
+            car_idx_lap_completed:   vec![],
         }
     }
 

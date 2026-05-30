@@ -19,4 +19,31 @@ pub struct TelemetryFrame {
     /// Used for anchor-count bootstrap only; absent from JSONL fixtures (defaults to 0.0).
     #[serde(default)]
     pub lap_last_lap_time:    f32,
+    /// iRacing `SessionInfoUpdate` monotonic counter. Increments whenever the
+    /// `SessionInfo` YAML blob changes (driver joins/leaves, session advances).
+    /// Used by `RosterCache::needs_update()` to decide when to re-parse the YAML.
+    /// Absent from JSONL fixtures; defaults to 0.
+    #[serde(default)]
+    pub session_info_update:  u32,
+    /// iRacing `SessionTick` — sim step counter (~16ms resolution).
+    /// Used as the deduplication key on Race Control: first writer wins per
+    /// `(raceSessionId, session_tick, event_type)`. Absent from JSONL fixtures.
+    #[serde(default)]
+    pub session_tick:         i64,
+    /// iRacing `SessionState` enum.
+    /// Values: Invalid=0, GetInCar=1, Warmup=2, ParadeLaps=3, Racing=4,
+    ///         Checkered=5, CoolDown=6.
+    /// Needed for flag/session lifecycle events. Absent from JSONL fixtures.
+    #[serde(default)]
+    pub session_state:        i32,
+    /// iRacing `SessionNum` — which sub-session is active.
+    /// Typical values: practice=0, qualifying=1, race=2.
+    /// Absent from JSONL fixtures; defaults to 0.
+    #[serde(default)]
+    pub session_num:          i32,
+    /// Laps completed per car, indexed by car_idx.
+    /// Used to provide `leaderLap` context in `PublisherEventContext`.
+    /// Absent from JSONL fixtures; defaults to empty vec.
+    #[serde(default)]
+    pub car_idx_lap_completed: Vec<i32>,
 }
