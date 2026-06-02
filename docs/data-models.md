@@ -208,7 +208,6 @@ pub enum RaceEvent {
     PitExit { lap: u8, session_time: f32, position: u8 },
     // ── Lifecycle ─────────────────────────────────────────────────────────
     PublisherHello { lap: u8, session_time: f32, version: String, scope: String },
-    PublisherHeartbeat { lap: u8, session_time: f32 },
     PublisherGoodbye { lap: u8, session_time: f32 },
 }
 
@@ -225,6 +224,13 @@ pub struct SlopeInfo {
     pub hotspot_lap_dist_pct: f32,
 }
 ```
+
+**Lifecycle liveness contract (v2):**
+- No dedicated `PUBLISHER_HEARTBEAT` event is emitted.
+- Liveness is refreshed by every authenticated `/api/publisher/v2/ingest` request, including `PUBLISHER_HELLO`, `PUBLISHER_GOODBYE`, and normal event batches.
+- `PUBLISHER_HELLO` is sent when the rig starts a session.
+- `PUBLISHER_GOODBYE` is sent only on clean shutdown and is the only explicit check-in clear signal.
+- If the rig is connected but idle, publisher remains silent; liveness remains valid for up to 30 minutes since the last received message.
 
 ### 4.1 Serialised Example Payloads
 

@@ -8,7 +8,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::race_event::RaceEvent;
@@ -81,7 +81,8 @@ pub fn build_event(
         .and_then(|m| m.remove("event_type"))
         .and_then(|v| v.as_str().map(str::to_owned))
         .unwrap_or_default();
-    let payload = event_value;
+    let mut payload = event_value;
+    enrich_payload(&mut payload, race_event, frame, roster);
 
     let car_idx = primary_car_idx(race_event, frame.player_car_idx);
     let car = resolve_car(car_idx, roster);
@@ -139,6 +140,61 @@ fn resolve_car(car_idx: u8, roster: Option<&SessionRoster>) -> CarRef {
             car_class_id: None,
             user_id: None,
         })
+}
+
+fn enrich_payload(
+    payload: &mut Value,
+    race_event: &RaceEvent,
+    frame: &TelemetryFrame,
+    roster: Option<&SessionRoster>,
+) {
+    let Some(obj) = payload.as_object_mut() else {
+        return;
+    };
+
+    match race_event {
+        RaceEvent::LapCompleted { lap_time_s, best_lap_time_s, .. } => {
+            obj.insert("lapTime".to_owned(), option_f32_json(*lap_time_s));
+            obj.insert("bestLapTime".to_owned(), option_f32_json(*best_lap_time_s));
+        }
+        RaceEvent::BattleEngaged { car_idx, .. }
+        | RaceEvent::BattleBroken { car_idx, .. }
+        | RaceEvent::BattleClosing { car_idx, .. } => {
+            let (leader_idx, follower_idx) =
+                leader_follower_indices(frame, frame.player_car_idx, *car_idx);
+            let leader = resolve_car(leader_idx, roster);
+            let follower = resolve_car(follower_idx, roster);
+            obj.insert("leaderCarNumber".to_owned(), Value::String(leader.car_number));
+            obj.insert("followerCarNumber".to_owned(), Value::String(follower.car_number));
+        }
+        _ => {}
+    }
+}
+
+fn option_f32_json(v: Option<f32>) -> Value {
+    match v {
+        Some(n) => json!(n),
+        None => Value::Null,
+    }
+}
+
+fn leader_follower_indices(frame: &TelemetryFrame, player_idx: u8, opponent_idx: u8) -> (u8, u8) {
+    let player_pos = frame
+        .car_idx_position
+        .get(player_idx as usize)
+        .copied()
+        .filter(|p| *p > 0);
+    let opponent_pos = frame
+        .car_idx_position
+        .get(opponent_idx as usize)
+        .copied()
+        .filter(|p| *p > 0);
+
+    match (player_pos, opponent_pos) {
+        (Some(pp), Some(op)) if op < pp => (opponent_idx, player_idx),
+        (Some(pp), Some(op)) if pp < op => (player_idx, opponent_idx),
+        _ => (player_idx, opponent_idx),
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -241,5 +297,46 @@ mod tests {
         let frame = minimal_frame(); // player_car_idx = 0
         let env = build_event(&event, &frame, None, "s", "r");
         assert_eq!(env.car.car_idx, 0);
+    }
+
+    #[test]
+    fn battle_payload_includes_leader_and_follower_car_numbers() {
+        let event = RaceEvent::BattleEngaged {
+            lap: 2,
+            session_time: 12.0,
+            car_idx: 1,
+            gap_s: 0.4,
+            car_race_position: 4,
+            prior_skirmishes: 0,
+            prior_attack_time_s: 0.0,
+        };
+
+        let env = build_event(&event, &minimal_frame(), None, "s", "r");
+        let json: Value = serde_json::to_value(&env).unwrap();
+        assert_eq!(json["payload"]["leaderCarNumber"], "1");
+        assert_eq!(json["payload"]["followerCarNumber"], "0");
+    }
+
+    #[test]
+    fn lap_completed_payload_includes_camel_case_aliases() {
+        let event = RaceEvent::LapCompleted {
+            lap: 2,
+            session_time: 99.0,
+            lap_time_s: Some(88.2),
+            best_lap_time_s: Some(87.9),
+            position: 5,
+            pit_frames: 0,
+        };
+
+        let env = build_event(&event, &minimal_frame(), None, "s", "r");
+        let json: Value = serde_json::to_value(&env).unwrap();
+        let lap_time = json["payload"]["lapTime"].as_f64().unwrap_or_default();
+        let best_lap = json["payload"]["bestLapTime"].as_f64().unwrap_or_default();
+        let lap_time_snake = json["payload"]["lap_time_s"].as_f64().unwrap_or_default();
+        let best_lap_snake = json["payload"]["best_lap_time_s"].as_f64().unwrap_or_default();
+        assert!((lap_time - 88.2).abs() < 1e-3);
+        assert!((best_lap - 87.9).abs() < 1e-3);
+        assert!((lap_time_snake - 88.2).abs() < 1e-3);
+        assert!((best_lap_snake - 87.9).abs() < 1e-3);
     }
 }

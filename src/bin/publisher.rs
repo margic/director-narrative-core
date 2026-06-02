@@ -4,8 +4,12 @@
 //! # Usage
 //!
 //! ```powershell
-//! publisher.exe [--config <path-to-publisher.toml>] [--no-ui]
+//! publisher.exe [--config <path-to-publisher.toml>] [--no-ui] [--dry-run]
 //! ```
+//!
+//! `--dry-run`  Print each JSON batch to stdout instead of POSTing to Race
+//!              Control. Use this to verify the wire format while iRacing is
+//!              running without touching the live API.
 //!
 //! Config can also be supplied entirely via environment variables
 //! (see `src/config.rs`). Press Ctrl-C for a clean shutdown.
@@ -38,6 +42,7 @@ fn run() {
 
     let config_path = parse_config_path();
     let no_ui       = std::env::args().any(|a| a == "--no-ui");
+    let dry_run     = std::env::args().any(|a| a == "--dry-run");
 
     let cfg = match config::load(config_path.as_deref()) {
         Ok(c) => c,
@@ -61,9 +66,18 @@ fn run() {
         });
 
     println!(
-        "[publisher] config loaded — api={}",
-        cfg.publisher.rc_api_url
+        "[publisher] config loaded — api={} tenant={} client_id={}…{} scope={}",
+        cfg.publisher.rc_api_url,
+        cfg.auth.tenant_id,
+        &cfg.auth.client_id[..8.min(cfg.auth.client_id.len())],
+        &cfg.auth.client_id[cfg.auth.client_id.len().saturating_sub(4)..],
+        cfg.auth.scope,
     );
+    if let Some(ref p) = resolved_config_path {
+        println!("[publisher] using config file: {p}");
+    } else {
+        println!("[publisher] no publisher.toml found — using env vars only");
+    }
 
     // ── 2. Shared state + shutdown flag ───────────────────────────────────
 
@@ -93,7 +107,7 @@ fn run() {
     let pipeline = std::thread::Builder::new()
         .name("publisher-pipeline".into())
         .spawn(move || {
-            pipeline_main(pipeline_cfg, pipeline_running, pipeline_status);
+            pipeline_main(pipeline_cfg, pipeline_running, pipeline_status, dry_run);
         })
         .expect("failed to spawn pipeline thread");
 
@@ -120,15 +134,15 @@ fn pipeline_main(
     cfg:     director_narrative_core::config::PublisherConfig,
     running: std::sync::Arc<std::sync::atomic::AtomicBool>,
     status:  std::sync::Arc<std::sync::Mutex<director_narrative_core::publisher_status::PublisherStatus>>,
+    dry_run: bool,
 ) {
     use std::sync::atomic::Ordering;
 
     use director_narrative_core::{
         engine::NarrativeEngine,
         lifecycle::LifecyclePublisher,
-        publisher_event::build_event,
-        publisher_status::EventLogEntry,
-        session_info::{parse_sub_session_id, RosterCache, SessionMetadata},
+        publisher_event::{build_event, PublisherEvent},
+        session_info::{is_ai_session, parse_sub_session_id, synthetic_sub_session_id, RosterCache, SessionMetadata},
         telemetry_frame::TelemetryFrame,
         transport::PublisherTransport,
     };
@@ -156,14 +170,24 @@ fn pipeline_main(
         &cfg.publisher.rc_api_url,
         cfg.publisher.batch_interval_ms,
     );
+    transport.set_dry_run(dry_run);
+    if dry_run {
+        println!("[publisher] dry-run mode — payloads will be printed to stdout and still sent");
+    }
     let mut lifecycle       = LifecyclePublisher::new(env!("CARGO_PKG_VERSION"));
     let mut roster_cache    = RosterCache::new();
     let mut session_meta    = SessionMetadata::default();
     let mut race_session_id = String::from("0");
     let mut sub_session_id: i64 = 0;
     let mut last_frame: Option<TelemetryFrame> = None;
+    // Car-scoped events held back while the roster hasn't yet resolved driverName.
+    // Flushed after each roster update. Capped at 64 entries.
+    let mut pending_events: Vec<PublisherEvent> = Vec::new();
 
-    // ── First frame + PUBLISHER_HELLO ─────────────────────────────────────
+    // ── First frame ───────────────────────────────────────────────────────
+    // PUBLISHER_HELLO is deferred: it is emitted once the SessionInfo YAML is
+    // parsed (so subSessionId and driverName are both resolved before the first
+    // batch is sent). The `lifecycle.is_fresh()` path in the main loop handles it.
 
     if let Some(frame) = reader.read_frame() {
         let car_info = roster_cache
@@ -173,24 +197,12 @@ fn pipeline_main(
             .unwrap_or_else(|| format!("carIdx={}", frame.player_car_idx));
         println!("[publisher] connected — {car_info}");
 
-        let hello = lifecycle.on_activate(frame.lap, frame.session_time);
-        let pe    = build_event(&hello, &frame, None, &race_session_id, &rig_id);
-        transport.enqueue(pe);
-
         {
             let mut s = status.lock().unwrap();
             s.iracing_connected     = true;
             s.current_lap           = frame.lap;
             s.session_tick          = frame.session_tick;
             s.session_time_secs     = frame.session_time as f64;
-            s.events_enqueued_total += 1;
-            let car = roster_cache.roster().and_then(|r| r.lookup(frame.player_car_idx));
-            s.push_event_log(EventLogEntry {
-                session_time: frame.session_time as f64,
-                event_type:   "PUBLISHER_HELLO".into(),
-                car_number:   car.map(|c| c.car_number.clone()).unwrap_or_default(),
-                driver_name:  car.map(|c| c.driver_name.clone()).unwrap_or_default(),
-            });
         }
 
         last_frame = Some(frame);
@@ -218,9 +230,13 @@ fn pipeline_main(
                 Some(r) => r,
                 None    => break,
             };
-            engine       = NarrativeEngine::new(10);
-            roster_cache = RosterCache::new();
-            session_meta = SessionMetadata::default();
+            engine         = NarrativeEngine::new(10);
+            lifecycle      = LifecyclePublisher::new(env!("CARGO_PKG_VERSION"));
+            roster_cache   = RosterCache::new();
+            session_meta   = SessionMetadata::default();
+            pending_events.clear();
+            sub_session_id  = 0;
+            race_session_id = String::new();
             println!("[publisher] reconnected");
             status.lock().unwrap().iracing_connected = true;
             continue;
@@ -233,11 +249,87 @@ fn pipeline_main(
                 // Refresh roster + session metadata when SessionInfo changes.
                 if roster_cache.needs_update(frame.session_info_update) {
                     if let Some(yaml) = reader.read_session_info() {
-                        if let Some(sid) = parse_sub_session_id(&yaml) {
+                        // For AI/offline sessions iRacing never assigns a real
+                        // SubSessionID (always 0). Detect this and synthesise a
+                        // stable negative ID so events are still published.
+                        let new_sid = parse_sub_session_id(&yaml).or_else(|| {
+                            if is_ai_session(&yaml) {
+                                let sid = synthetic_sub_session_id(&yaml);
+                                println!("[publisher] AI session detected — using synthetic subSessionId {sid}");
+                                Some(sid)
+                            } else {
+                                None
+                            }
+                        });
+
+                        // ── Session transition (practice→qualify→race etc.) ────────
+                        // When SubSessionID changes to a new non-zero value the iRacing
+                        // session has advanced. Reset all session-scoped state so stale
+                        // engine signals, pending events, and lifecycle from the old
+                        // session don't bleed into the new one.
+                        if let Some(sid) = new_sid {
+                            if sid != sub_session_id {
+                                if sub_session_id > 0 {
+                                    // Flush whatever was in flight for the old session.
+                                    println!(
+                                        "[publisher] session transition {sub_session_id} → {sid} — resetting engine"
+                                    );
+                                    let (bye_lap, bye_t) = last_frame
+                                        .as_ref()
+                                        .map(|f| (f.lap, f.session_time))
+                                        .unwrap_or((0, 0.0));
+                                    let goodbye = lifecycle.on_deactivate(bye_lap, bye_t);
+                                    if let Some(lf) = &last_frame {
+                                        let pe = build_event(
+                                            &goodbye,
+                                            lf,
+                                            roster_cache.roster(),
+                                            &race_session_id,
+                                            &rig_id,
+                                        );
+                                        transport.enqueue(pe);
+                                    }
+                                    let _ = transport.flush(
+                                        bye_t as f64,
+                                        last_frame.as_ref().map(|f| f.session_tick).unwrap_or(0),
+                                        sub_session_id,
+                                    );
+                                }
+                                // Reset session-scoped state.
+                                engine        = NarrativeEngine::new(10);
+                                lifecycle     = LifecyclePublisher::new(env!("CARGO_PKG_VERSION"));
+                                roster_cache  = RosterCache::new();
+                                session_meta  = SessionMetadata::default();
+                                pending_events.clear();
+                            }
                             sub_session_id  = sid;
                             race_session_id = sid.to_string();
                         }
+
                         roster_cache.update(frame.session_info_update, &yaml).ok();
+
+                        // Flush car-scoped events buffered before driverName and
+                        // subSessionId were both resolved. Both must be ready before
+                        // any event is handed to the transport — a subSessionId of 0
+                        // would persist events against a ghost session in Cosmos DB.
+                        if sub_session_id > 0 && !pending_events.is_empty() {
+                            let held = std::mem::take(&mut pending_events);
+                            for mut pe in held {
+                                if let Some(car) = roster_cache
+                                    .roster()
+                                    .and_then(|r| r.lookup(pe.car.car_idx))
+                                {
+                                    if !car.driver_name.is_empty() {
+                                        pe.car.driver_name = car.driver_name.clone();
+                                        transport.enqueue(pe);
+                                        status.lock().unwrap().events_enqueued_total += 1;
+                                        continue;
+                                    }
+                                }
+                                pending_events.push(pe); // still unresolved
+                            }
+                        }
+
                         session_meta = SessionMetadata::parse(&yaml, frame.session_num as usize);
                         {
                             let mut s = status.lock().unwrap();
@@ -245,6 +337,29 @@ fn pipeline_main(
                             s.track_name     = session_meta.track_name.clone();
                             s.session_type   = session_meta.session_type.clone();
                             s.session_laps   = session_meta.session_laps.clone();
+                        }
+
+                        // Emit HELLO for this session if lifecycle was just reset
+                        // (first parse or session transition). Guard on sub_session_id > 0
+                        // so the envelope is never posted with subSessionId=0 — the
+                        // tick_result guard would block the batch anyway, but building
+                        // and queueing a HELLO with race_session_id="0" could leave
+                        // a stale event in the transport queue after the first transition.
+                        if lifecycle.is_fresh() && sub_session_id > 0 {
+                            let hello = lifecycle.on_activate(frame.lap, frame.session_time);
+                            let pe = build_event(
+                                &hello,
+                                &frame,
+                                roster_cache.roster(),
+                                &race_session_id,
+                                &rig_id,
+                            );
+                            if pe.car.driver_name.is_empty() {
+                                pending_events.push(pe);
+                            } else {
+                                transport.enqueue(pe);
+                                status.lock().unwrap().events_enqueued_total += 1;
+                            }
                         }
                     }
                 }
@@ -256,17 +371,19 @@ fn pipeline_main(
                     log_event(event, roster, &frame);
                     let log_entry = make_log_entry(event, &frame, roster);
                     let pe        = build_event(event, &frame, roster, &race_session_id, &rig_id);
-                    transport.enqueue(pe);
-                    let mut s = status.lock().unwrap();
-                    s.events_enqueued_total += 1;
-                    s.push_event_log(log_entry);
-                }
-
-                // Heartbeat.
-                if let Some(hb) = lifecycle.tick(frame.lap, frame.session_time) {
-                    let pe = build_event(&hb, &frame, roster, &race_session_id, &rig_id);
-                    transport.enqueue(pe);
-                    status.lock().unwrap().events_enqueued_total += 1;
+                    // Gate on roster: hold back events whose driverName is not yet resolved
+                    // (server rejects car-scoped events with an empty driverName).
+                    if pe.car.driver_name.is_empty() {
+                        status.lock().unwrap().push_event_log(log_entry);
+                        if pending_events.len() < 64 {
+                            pending_events.push(pe);
+                        }
+                    } else {
+                        transport.enqueue(pe);
+                        let mut s = status.lock().unwrap();
+                        s.events_enqueued_total += 1;
+                        s.push_event_log(log_entry);
+                    }
                 }
 
                 // Frame-level status.
@@ -278,7 +395,11 @@ fn pipeline_main(
                     s.token_expires_at  = transport.token_expires_at();
                 }
 
-                // Flush.
+                // Flush — skip until subSessionId is resolved to avoid persisting
+                // events against a ghost session keyed on subSessionId=0.
+                if sub_session_id == 0 {
+                    continue;
+                }
                 match transport.tick_result(
                     frame.session_time as f64,
                     frame.session_tick,

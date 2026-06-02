@@ -258,7 +258,7 @@ tenant_id     = "t"
 client_id     = "c"
 client_secret = "s"
 "#);
-        assert_eq!(cfg.auth.scope,                   "api://racecontrol/.default");
+        assert_eq!(cfg.auth.scope,                   "api://racecontrol-api-a780e279-1cb6-4ed0-9ef6-49029aa50a42/.default");
         assert_eq!(cfg.publisher.rc_api_url,         "https://simracecenter.com");
         assert_eq!(cfg.publisher.batch_interval_ms,  500);
     }

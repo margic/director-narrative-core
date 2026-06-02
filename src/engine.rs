@@ -284,7 +284,8 @@ impl NarrativeEngine {
                 }
                 let end_pos = self.prev_position.unwrap_or(pos);
                 self.lap_end_positions.insert(done_lap, end_pos);
-                let lap_time_s = self.lap_timer.completed(done_lap);
+                let lap_time_s = valid_lap_time(frame.lap_last_lap_time)
+                    .or_else(|| self.lap_timer.completed(done_lap).and_then(valid_lap_time));
                 if let Some(lt) = lap_time_s {
                     self.best_lap_time_s = Some(match self.best_lap_time_s {
                         Some(best) if best <= lt => best,
@@ -503,6 +504,11 @@ fn synthesize_flags(lap: u8, ldp: f32) -> u32 {
     0
 }
 
+fn valid_lap_time(v: f32) -> Option<f32> {
+    // Guard against zero/negative/NaN artifacts observed in replay and reset edges.
+    (v.is_finite() && v > 0.1).then_some(v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -598,5 +604,41 @@ mod tests {
         assert!(evs2.iter().any(|e| matches!(e, RaceEvent::RaceGreen { .. })));
         let evs3 = engine.process_frame(&frame_with_gap(1, 2.0, 4, 0.501));
         assert!(!evs3.iter().any(|e| matches!(e, RaceEvent::RaceGreen { .. })));
+    }
+
+    #[test]
+    fn lap_completed_uses_iracing_lap_time_when_timer_value_is_invalid() {
+        let mut engine = NarrativeEngine::new(10);
+
+        let mut f1 = frame_no_opponent(1, 100.0);
+        f1.session_state = 4;
+        f1.lap_last_lap_time = 0.0;
+        let _ = engine.process_frame(&f1);
+
+        let mut f2 = frame_no_opponent(2, 200.0);
+        f2.session_state = 4;
+        f2.lap_last_lap_time = 152.1;
+        let _ = engine.process_frame(&f2);
+
+        let mut f3 = frame_no_opponent(3, 10.0);
+        f3.session_state = 4;
+        f3.lap_last_lap_time = 153.9;
+        let evs = engine.process_frame(&f3);
+
+        let lap = evs.iter().find_map(|e| {
+            if let RaceEvent::LapCompleted { lap, lap_time_s, best_lap_time_s, .. } = e {
+                Some((*lap, *lap_time_s, *best_lap_time_s))
+            } else {
+                None
+            }
+        });
+
+        let Some((done_lap, lap_time_s, best_lap_time_s)) = lap else {
+            panic!("expected LAP_COMPLETED event");
+        };
+
+        assert_eq!(done_lap, 2);
+        assert_eq!(lap_time_s, Some(153.9));
+        assert_eq!(best_lap_time_s, Some(152.1));
     }
 }

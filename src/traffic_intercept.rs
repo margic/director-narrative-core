@@ -62,6 +62,7 @@ impl TrafficInterceptDetector {
                     time_to_intercept_s: prediction.time_to_intercept_s,
                     intercept_bucket: prediction.intercept_bucket,
                     intercept_lap_dist_pct: prediction.intercept_lap_dist_pct,
+                    predicted_intercept_session_time: session_time + prediction.time_to_intercept_s,
                 });
             }
         }

@@ -21,7 +21,7 @@ const RED:    Color32 = Color32::from_rgb(0xf4, 0x43, 0x36);
 const GREY:   Color32 = Color32::from_rgb(0x80, 0x80, 0x80);
 const CYAN:   Color32 = Color32::from_rgb(0x00, 0xbc, 0xd4);
 const WHITE:  Color32 = Color32::WHITE;
-const DIM:    Color32 = Color32::from_rgb(0x88, 0x88, 0x88);
+const DIM:    Color32 = Color32::from_rgb(0xb0, 0xb0, 0xb0);
 
 // ── App ────────────────────────────────────────────────────────────────────
 
@@ -198,7 +198,7 @@ fn counter_bar(ui: &mut egui::Ui, s: &PublisherStatus) {
         ui.separator();
         ui.label(RichText::new(format!("Calls: {}", s.calls_total)).small());
         ui.separator();
-        let err_colour = if s.calls_failed > 0 { AMBER } else { DIM };
+        let err_colour = if s.calls_failed > 0 { AMBER } else { GREEN };
         ui.label(RichText::new(format!("Errors: {}", s.calls_failed)).color(err_colour).small());
     });
 }
@@ -235,7 +235,7 @@ fn event_colour(event_type: &str) -> (Color32, bool) {
     } else if matches!(event_type, "RACE_GREEN" | "RACE_CHECKERED") {
         (WHITE, true)
     } else if matches!(event_type, "LAP_COMPLETED") {
-        (Color32::LIGHT_GRAY, false)
+        (DIM, false)
     } else {
         (DIM, false)
     }
@@ -263,4 +263,15 @@ pub fn run_ui(
             Ok(Box::new(PublisherApp::new(status, running)))
         }),
     )
+}
+
+#[cfg(target_os = "windows")]
+fn main() {
+    let status = Arc::new(Mutex::new(PublisherStatus::default()));
+    let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+    if let Err(e) = run_ui(status, running) {
+        eprintln!("[publisher-ui] error: {e}");
+        std::process::exit(1);
+    }
 }

@@ -60,6 +60,9 @@ pub struct PublisherTransport {
     queue:             Vec<PublisherEvent>,
     last_flush:        Instant,
     cached_token:      Option<CachedToken>,
+    /// When `true`, batches are pretty-printed to stdout instead of POSTed.
+    /// Enabled by the `--dry-run` flag on the publisher binary.
+    dry_run:           bool,
 }
 
 impl PublisherTransport {
@@ -92,7 +95,13 @@ impl PublisherTransport {
             queue:         Vec::new(),
             last_flush:    Instant::now(),
             cached_token:  None,
+            dry_run:       false,
         }
+    }
+
+    /// Enable dry-run mode: batches are printed to stdout, no HTTP calls are made.
+    pub fn set_dry_run(&mut self, dry_run: bool) {
+        self.dry_run = dry_run;
     }
 
     /// Add one event to the in-memory queue.
@@ -174,6 +183,12 @@ impl PublisherTransport {
         let body_value = serde_json::to_value(&body)
             .expect("IngestRequest is always serialisable");
 
+        if self.dry_run {
+            let pretty = serde_json::to_string_pretty(&body_value)
+                .expect("IngestRequest is always serialisable");
+            println!("[dry-run] POST {} — {} event(s):\n{}", self.ingest_url, batch.len(), pretty);
+        }
+
         // Retry loop: initial attempt + up to 3 retries on 5xx/network error.
         let delays = std::iter::once(0u64).chain(RETRY_DELAYS_MS.iter().copied());
         let mut last_error = String::new();
@@ -192,9 +207,18 @@ impl PublisherTransport {
             // ureq v2 returns non-2xx as Err(ureq::Error::Status(code, resp)).
             // All match arms must be on the Err side for non-2xx status codes.
             match result {
-                Ok(_) => return Ok(()),
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body   = resp.into_string().unwrap_or_default();
+                    if !body.is_empty() {
+                        eprintln!("[transport] HTTP {status} response body: {body}");
+                    }
+                    return Ok(());
+                }
 
-                Err(ureq::Error::Status(401, _)) => {
+                Err(ureq::Error::Status(401, resp)) => {
+                    let body = resp.into_string().unwrap_or_default();
+                    eprintln!("[transport] 401 response body: {body}");
                     // Stale token — attempt one forced refresh on the first 401, then fatal.
                     if attempt == 0 {
                         eprintln!("[transport] 401 — refreshing token and retrying…");
@@ -205,10 +229,20 @@ impl PublisherTransport {
                             .set("Content-Type", "application/json")
                             .send_json(&body_value);
                         return match result2 {
-                            Ok(_) => Ok(()),
-                            Err(ureq::Error::Status(code, _)) => Err(TransportError(format!(
-                                "HTTP {code} after forced token refresh — fatal"
-                            ))),
+                            Ok(r2) => {
+                                let body2 = r2.into_string().unwrap_or_default();
+                                if !body2.is_empty() {
+                                    eprintln!("[transport] HTTP {} response body: {body2}", 200);
+                                }
+                                Ok(())
+                            }
+                            Err(ureq::Error::Status(code, r2)) => {
+                                let body2 = r2.into_string().unwrap_or_default();
+                                eprintln!("[transport] HTTP {code} response body: {body2}");
+                                Err(TransportError(format!(
+                                    "HTTP {code} after forced token refresh — fatal"
+                                )))
+                            }
                             Err(e) => Err(TransportError(format!(
                                 "network error after token refresh: {e}"
                             ))),
@@ -217,13 +251,15 @@ impl PublisherTransport {
                     return Err(TransportError("401 after forced token refresh — fatal".to_owned()));
                 }
 
-                Err(ureq::Error::Status(code, _)) => {
+                Err(ureq::Error::Status(code, resp)) => {
+                    let body = resp.into_string().unwrap_or_default();
                     last_error = format!("HTTP {code}");
                     eprintln!(
-                        "[transport] {} attempt {}/{}, retrying…",
+                        "[transport] {} attempt {}/{} — body: {}",
                         last_error,
                         attempt + 1,
-                        RETRY_DELAYS_MS.len() + 1
+                        RETRY_DELAYS_MS.len() + 1,
+                        body,
                     );
                 }
 
@@ -252,9 +288,12 @@ impl PublisherTransport {
         };
 
         if needs_refresh {
+            eprintln!("[transport] acquiring token from {}", self.token_url);
             let resp = self.fetch_token()?;
+            let expires_in = resp.expires_in;
             let expires_at = SystemTime::now()
-                + Duration::from_secs(resp.expires_in.saturating_sub(TOKEN_REFRESH_BUFFER_S));
+                + Duration::from_secs(expires_in.saturating_sub(TOKEN_REFRESH_BUFFER_S));
+            eprintln!("[transport] token acquired — expires_in={expires_in}s");
             self.cached_token = Some(CachedToken {
                 token: resp.access_token,
                 expires_at,
@@ -265,6 +304,10 @@ impl PublisherTransport {
     }
 
     fn fetch_token(&self) -> Result<TokenResponse, TransportError> {
+        eprintln!("[transport] POST {} client_id={}…{}",
+            self.token_url,
+            &self.client_id[..8.min(self.client_id.len())],
+            &self.client_id[self.client_id.len().saturating_sub(4)..]);
         let result = ureq::post(&self.token_url)
             .set("Content-Type", "application/x-www-form-urlencoded")
             .send_form(&[

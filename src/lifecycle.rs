@@ -1,42 +1,40 @@
-//! Publisher lifecycle events: PUBLISHER_HELLO / PUBLISHER_HEARTBEAT / PUBLISHER_GOODBYE.
+//! Publisher lifecycle events: PUBLISHER_HELLO / PUBLISHER_GOODBYE.
 //!
 //! [`LifecyclePublisher`] is called from the main publisher loop to generate
 //! lifecycle [`RaceEvent`]s that are enqueued into the same [`PublisherTransport`]
 //! as narrative events.
 
-use std::time::{Duration, Instant};
-
 use crate::race_event::RaceEvent;
-
-const HEARTBEAT_INTERVAL_S: u64 = 30;
 
 /// Manages publisher lifecycle events.
 ///
 /// Create one instance at startup, call [`on_activate`] after successful
-/// token acquisition, [`tick`] every engine loop iteration, and
-/// [`on_deactivate`] on clean shutdown.
+/// token acquisition, and [`on_deactivate`] on clean shutdown.
 pub struct LifecyclePublisher {
-    version:        String,
-    last_heartbeat: Instant,
-    interval:       Duration,
+    version: String,
+    /// `true` until `on_activate` is called for the first time.
+    /// Used by the publisher loop to detect when a HELLO is still outstanding.
+    fresh:          bool,
 }
 
 impl LifecyclePublisher {
-    /// Create with the default 30-second heartbeat interval.
+    /// Create a lifecycle publisher.
     pub fn new(version: impl Into<String>) -> Self {
-        Self::with_interval(version, Duration::from_secs(HEARTBEAT_INTERVAL_S))
-    }
-
-    fn with_interval(version: impl Into<String>, interval: Duration) -> Self {
         Self {
-            version:        version.into(),
-            last_heartbeat: Instant::now(),
-            interval,
+            version: version.into(),
+            fresh: true,
         }
     }
 
+    /// `true` if `on_activate` has not yet been called on this instance.
+    /// The publisher loop uses this to know when to emit `PUBLISHER_HELLO`.
+    pub fn is_fresh(&self) -> bool {
+        self.fresh
+    }
+
     /// Emit `PUBLISHER_HELLO` — call once after successful registration.
-    pub fn on_activate(&self, lap: u8, session_time: f32) -> RaceEvent {
+    pub fn on_activate(&mut self, lap: u8, session_time: f32) -> RaceEvent {
+        self.fresh = false;
         RaceEvent::PublisherHello {
             lap,
             session_time,
@@ -49,27 +47,6 @@ impl LifecyclePublisher {
     pub fn on_deactivate(&self, lap: u8, session_time: f32) -> RaceEvent {
         RaceEvent::PublisherGoodbye { lap, session_time }
     }
-
-    /// Check elapsed time and return `Some(PUBLISHER_HEARTBEAT)` if the
-    /// heartbeat interval has elapsed; otherwise `None`.
-    ///
-    /// Call once per engine loop iteration (every ~16ms at 60 Hz).
-    pub fn tick(&mut self, lap: u8, session_time: f32) -> Option<RaceEvent> {
-        if self.last_heartbeat.elapsed() >= self.interval {
-            self.last_heartbeat = Instant::now();
-            Some(RaceEvent::PublisherHeartbeat { lap, session_time })
-        } else {
-            None
-        }
-    }
-
-    /// Back-date the last heartbeat timestamp for test purposes.
-    #[cfg(test)]
-    pub fn set_last_heartbeat_elapsed_for_test(&mut self, elapsed: Duration) {
-        self.last_heartbeat = Instant::now()
-            .checked_sub(elapsed)
-            .expect("elapsed must not overflow Instant");
-    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -80,7 +57,7 @@ mod tests {
 
     #[test]
     fn on_activate_emits_hello() {
-        let lc = LifecyclePublisher::new("0.1.0");
+        let mut lc = LifecyclePublisher::new("0.1.0");
         let event = lc.on_activate(1, 10.0);
         assert!(
             matches!(event, RaceEvent::PublisherHello { version, scope, .. }
@@ -96,30 +73,10 @@ mod tests {
     }
 
     #[test]
-    fn tick_returns_none_before_interval() {
+    fn is_fresh_is_true_before_activate() {
         let mut lc = LifecyclePublisher::new("0.1.0");
-        // No time has passed — heartbeat should not fire
-        assert!(lc.tick(1, 0.0).is_none());
-    }
-
-    #[test]
-    fn tick_emits_heartbeat_after_interval() {
-        let mut lc = LifecyclePublisher::new("0.1.0");
-        // Simulate 31 seconds elapsed
-        lc.set_last_heartbeat_elapsed_for_test(Duration::from_secs(31));
-        let event = lc.tick(3, 310.0);
-        assert!(
-            matches!(event, Some(RaceEvent::PublisherHeartbeat { lap: 3, .. })),
-            "expected PUBLISHER_HEARTBEAT after 31s elapsed"
-        );
-    }
-
-    #[test]
-    fn tick_resets_timer_after_heartbeat() {
-        let mut lc = LifecyclePublisher::new("0.1.0");
-        lc.set_last_heartbeat_elapsed_for_test(Duration::from_secs(31));
-        lc.tick(3, 310.0); // fires heartbeat and resets timer
-        // Immediately after reset, should not fire again
-        assert!(lc.tick(3, 310.1).is_none());
+        assert!(lc.is_fresh());
+        let _ = lc.on_activate(1, 0.0);
+        assert!(!lc.is_fresh());
     }
 }

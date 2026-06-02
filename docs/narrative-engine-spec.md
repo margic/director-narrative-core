@@ -363,8 +363,13 @@ iRacing mmap (60 Hz)
 | `PIT_ENTRY` | Car enters pit road | `lap`, `position` |
 | `PIT_EXIT` | Car leaves pit road | `lap`, `position` |
 | `PUBLISHER_HELLO` | After successful registration | `version`, `scope` |
-| `PUBLISHER_HEARTBEAT` | Every 30 s while session bound | |
 | `PUBLISHER_GOODBYE` | Clean shutdown | |
+
+Liveness is message-driven in publisher v2: every authenticated ingest request
+refreshes the rig check-in TTL, including HELLO, GOODBYE, and normal telemetry
+batches. No periodic keepalive message is scheduled. If a rig is connected but
+idle it remains silent, and check-in stays valid for up to 30 minutes since the
+last received message.
 
 ---
 

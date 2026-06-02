@@ -227,7 +227,8 @@ In the Nürburgring data, yellow flags at `LapDistPct ≈ 0.62` on both Lap 1 an
 │                                                                               │
 │  • Azure AD client_credentials token  (azure_identity crate)                │
 │  • Batch queue → POST /api/publisher/v2/ingest  every 500ms                 │
-│  • lifecycle: HELLO / HEARTBEAT / GOODBYE  on envelope                      │
+│  • lifecycle: HELLO on start, GOODBYE on clean shutdown                     │
+│  • liveness: refreshed by every authenticated ingest message (30 min TTL)   │
 │  • egui status window  (connection health, event log, token TTL)            │
 └────────────────────────────────────┬─────────────────────────────────────────┘
                                      │ HTTPS  Bearer <JWT>

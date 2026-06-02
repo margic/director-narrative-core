@@ -156,16 +156,21 @@ pub enum RaceEvent {
         throttle_release_pct: f32,
     },
     TrafficIntercept {
-        lap:                    u8,
-        session_time:           f32,
-        leader_car_idx:         u8,
-        traffic_car_idx:        u8,
-        cross_class:            bool,
-        distance_m:             f32,
-        relative_speed_mps:     f32,
-        time_to_intercept_s:    f32,
-        intercept_bucket:       u8,
-        intercept_lap_dist_pct: f32,
+        lap:                            u8,
+        session_time:                   f32,
+        leader_car_idx:                 u8,
+        traffic_car_idx:                u8,
+        cross_class:                    bool,
+        distance_m:                     f32,
+        relative_speed_mps:             f32,
+        time_to_intercept_s:            f32,
+        intercept_bucket:               u8,
+        intercept_lap_dist_pct:         f32,
+        /// Absolute iRacing SessionTime (seconds) at which the intercept is
+        /// predicted to occur: `session_time + time_to_intercept_s`.
+        /// Use this instead of `time_to_intercept_s` to compute remaining
+        /// lead time at read time — it is invariant to pipeline latency.
+        predicted_intercept_session_time: f32,
     },
     VulnerabilityAlert {
         lap:                    u8,
@@ -213,10 +218,6 @@ pub enum RaceEvent {
         session_time: f32,
         version:      String,
         scope:        String,
-    },
-    PublisherHeartbeat {
-        lap:          u8,
-        session_time: f32,
     },
     PublisherGoodbye {
         lap:          u8,

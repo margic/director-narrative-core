@@ -214,11 +214,79 @@ impl SessionMetadata {
 pub fn parse_sub_session_id(yaml: &str) -> Option<i64> {
     for line in yaml.lines() {
         let line = line.trim();
-        if let Some(rest) = line.strip_prefix("SubSessionID:") {
-            return rest.trim().parse().ok();
+        // iRacing YAML uses "SubSessionID" in older SDK builds and
+        // "SubSessionId" in newer ones — accept both.
+        let value = if let Some(rest) = line.strip_prefix("SubSessionID:") {
+            Some(rest)
+        } else if let Some(rest) = line.strip_prefix("SubSessionId:") {
+            Some(rest)
+        } else {
+            None
+        };
+        if let Some(rest) = value {
+            let parsed: Option<i64> = rest.trim().parse().ok();
+            // Reject zero — iRacing returns 0 before the session is fully loaded.
+            return parsed.filter(|&v| v > 0);
         }
     }
     None
+}
+
+/// Returns `true` when the YAML indicates this is an iRacing AI session.
+///
+/// AI sessions never receive a real `SubSessionID` from the iRacing server.
+/// The presence of `AIRosterName:` is the most reliable indicator — it is
+/// only set when the session was started with an AI driver roster.
+pub fn is_ai_session(yaml: &str) -> bool {
+    yaml.lines().any(|ln| {
+        let t = ln.trim();
+        if let Some(rest) = t.strip_prefix("AIRosterName:") {
+            let val = rest.trim().trim_matches('"');
+            !val.is_empty()
+        } else {
+            false
+        }
+    })
+}
+
+/// Generate a stable synthetic `SubSessionID` for an AI session.
+///
+/// AI sessions never get a real SubSessionID from iRacing servers. We derive
+/// a reproducible negative ID from the track name and current UTC day so it
+/// changes each calendar day (preventing cross-day event collisions) but
+/// stays constant for the lifetime of a single session.
+///
+/// The ID is always negative to make it distinguishable from real iRacing
+/// SubSessionIDs (which are large positive integers).
+pub fn synthetic_sub_session_id(yaml: &str) -> i64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    // Use track name as the session-stable component.
+    let track = yaml
+        .lines()
+        .find_map(|ln| {
+            ln.trim()
+                .strip_prefix("TrackName:")
+                .map(|s| s.trim().trim_matches('"').to_string())
+        })
+        .unwrap_or_default();
+
+    // Day number since epoch — changes at UTC midnight.
+    let day = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        / 86400;
+
+    let mut h = DefaultHasher::new();
+    track.hash(&mut h);
+    day.hash(&mut h);
+    let hash = h.finish();
+
+    // Map to a positive i64, staying well away from i64::MAX.
+    (hash & 0x7FFF_FFFF_FFFF) as i64 + 1
 }
 
 // ── Private serde types ───────────────────────────────────────────────────────
@@ -288,16 +356,33 @@ struct YamlDriver {
     car_idx: u8,
     #[serde(rename = "UserName")]
     user_name: String,
-    #[serde(rename = "UserID", default)]
+    /// Deserialised as `i64` because iRacing uses `-1` as a sentinel for
+    /// the pace car and inactive slots. Negative values are mapped to `None`.
+    #[serde(rename = "UserID", default, deserialize_with = "deserialize_nonneg_id")]
     user_id: Option<u32>,
     #[serde(rename = "TeamName", default)]
     team_name: Option<String>,
     #[serde(rename = "CarNumber")]
     car_number: String,
-    #[serde(rename = "CarClassID", default)]
+    /// Same sentinel treatment as `UserID`.
+    #[serde(rename = "CarClassID", default, deserialize_with = "deserialize_nonneg_id")]
     car_class_id: Option<u32>,
     #[serde(rename = "CarClassShortName", default)]
     car_class_short_name: Option<String>,
+}
+
+/// Deserialise an integer field that iRacing may set to `-1` (or any negative
+/// value) as a sentinel meaning "not present". Negative values become `None`;
+/// non-negative values become `Some(v as u32)`.
+fn deserialize_nonneg_id<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Accept either a JSON/YAML integer or the absence of the field (handled
+    // by `#[serde(default)]` which calls `Option::default() = None` before
+    // this function is invoked for missing fields).
+    let opt: Option<i64> = serde::Deserialize::deserialize(deserializer)?;
+    Ok(opt.and_then(|v| if v < 0 { None } else { Some(v as u32) }))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
