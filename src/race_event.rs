@@ -209,6 +209,11 @@ pub enum RaceEvent {
         lap_dist_pct_to:   f32,
         car_idxs:          Vec<u8>,
         severity:          f32,
+        /// Most-culpable / dominant car in the incident (lowest car index when
+        /// damage data is unavailable).
+        primary_car_idx:   Option<u8>,
+        /// Coarse classification of the incident (e.g. `"Incident"`).
+        incident_type:     Option<String>,
     },
     IncidentClusterResolved {
         lap:          u8,

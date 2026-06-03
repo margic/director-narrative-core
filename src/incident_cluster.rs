@@ -56,6 +56,7 @@ impl IncidentClusterDetector {
             if cars.len() >= 3 {
                 if !self.active_clusters.contains_key(&bucket) {
                     let severity = cars.len() as f32;
+                    let primary_car_idx = cars.iter().copied().min();
                     self.active_clusters.insert(bucket, (lap, cars.clone()));
                     events.push(RaceEvent::IncidentCluster {
                         lap,
@@ -65,6 +66,8 @@ impl IncidentClusterDetector {
                         lap_dist_pct_to: (bucket as f32 + 1.0) / n_anchors.max(1) as f32,
                         car_idxs: cars,
                         severity,
+                        primary_car_idx,
+                        incident_type: Some("Incident".to_owned()),
                     });
                 }
             } else if self.active_clusters.remove(&bucket).is_some() {
