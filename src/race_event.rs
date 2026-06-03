@@ -2,6 +2,19 @@ use serde::Serialize;
 
 use crate::battle_state::SlopeInfo;
 
+/// Classification of a yellow flag's scope relative to the player.
+#[derive(Debug, Serialize)]
+pub enum FlagScope {
+    /// The player's own actions caused the yellow condition.
+    SelfCaused,
+    /// Another car caused the yellow, but in close proximity to the player.
+    Nearby,
+    /// A caution or yellow condition that affects all cars session-wide.
+    SessionWide,
+    /// Unable to determine the scope from available data.
+    Unknown,
+}
+
 /// All narrative events emitted by the engine.
 #[derive(Debug, Serialize)]
 #[serde(tag = "event_type", rename_all = "SCREAMING_SNAKE_CASE")]
@@ -63,8 +76,19 @@ pub enum RaceEvent {
         session_time: f32,
     },
     FlagYellowLocal {
-        lap:          u8,
-        session_time: f32,
+        lap:                u8,
+        session_time:       f32,
+        /// Car index of the vehicle that caused the yellow, if determinable.
+        trigger_car_idx:    Option<u8>,
+        /// Player's track position as a fraction (0.0–1.0) at the time of the yellow.
+        lap_dist_pct:       Option<f32>,
+        /// Track sector number, if available.
+        sector:             Option<u8>,
+        /// Classification of the yellow relative to the player.
+        scope:              FlagScope,
+        /// Cross-reference to an `IncidentCluster` bucket, if a recent incident
+        /// was the likely cause of this yellow.
+        linked_incident_id: Option<u32>,
     },
     RaceCheckered {
         lap:          u8,
