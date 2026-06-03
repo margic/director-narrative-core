@@ -230,6 +230,35 @@ fn enrich_payload(
                 obj.insert("overtakenCar".to_owned(), serde_json::to_value(&overtaken_car).unwrap_or(Value::Null));
             }
         }
+        RaceEvent::TrafficIntercept { traffic_car_idx, .. } => {
+            let traffic_car = resolve_car(*traffic_car_idx, roster);
+            obj.insert("trafficCar".to_owned(), serde_json::to_value(&traffic_car).unwrap_or(Value::Null));
+        }
+        RaceEvent::HorizonClosing { attacker_car_idx, defender_car_idx, .. } => {
+            let attacker_car = resolve_car(*attacker_car_idx, roster);
+            let defender_car = resolve_car(*defender_car_idx, roster);
+            obj.insert("attackerCar".to_owned(), serde_json::to_value(&attacker_car).unwrap_or(Value::Null));
+            obj.insert("defenderCar".to_owned(), serde_json::to_value(&defender_car).unwrap_or(Value::Null));
+        }
+        RaceEvent::IncidentCluster { car_idxs, primary_car_idx, incident_type, lap_dist_pct_from, lap_dist_pct_to, .. } => {
+            // Resolve all involved cars to a CarRef array
+            let involved_cars: Vec<Value> = car_idxs
+                .iter()
+                .map(|&idx| serde_json::to_value(&resolve_car(idx, roster)).unwrap_or(Value::Null))
+                .collect();
+            obj.insert("involvedCars".to_owned(), Value::Array(involved_cars));
+
+            // Resolve primary car (most-culpable)
+            let primary = primary_car_idx.map(|idx| serde_json::to_value(&resolve_car(idx, roster)).unwrap_or(Value::Null)).unwrap_or(Value::Null);
+            obj.insert("primaryCar".to_owned(), primary);
+
+            // Incident classification
+            let itype = incident_type.as_deref().map(Value::from).unwrap_or(Value::Null);
+            obj.insert("incidentType".to_owned(), itype);
+
+            // Cluster centroid lap distance percentage
+            obj.insert("lapDistPct".to_owned(), json!((lap_dist_pct_from + lap_dist_pct_to) / 2.0));
+        }
         _ => {}
     }
 }

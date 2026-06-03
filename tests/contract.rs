@@ -339,6 +339,110 @@ fn battle_broken_contract_uses_final_gap_sec_and_duration() {
 }
 
 #[test]
+fn traffic_intercept_includes_structured_car_ref() {
+    let event = RaceEvent::TrafficIntercept {
+        lap: 3,
+        session_time: 180.0,
+        leader_car_idx: 0,
+        traffic_car_idx: 5,
+        cross_class: false,
+        distance_m: 200.0,
+        relative_speed_mps: 10.0,
+        time_to_intercept_s: 20.0,
+        intercept_bucket: 12,
+        intercept_lap_dist_pct: 0.6,
+        predicted_intercept_session_time: 200.0,
+    };
+
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001");
+    let json = normalized_event_json(&env);
+
+    assert_envelope_contract(&json, "TRAFFIC_INTERCEPT");
+
+    // Numeric field kept for backward compatibility
+    assert_eq!(json["payload"]["traffic_car_idx"], 5);
+
+    // Structured trafficCar object
+    assert!(json["payload"]["trafficCar"].is_object(), "trafficCar should be a structured object");
+    assert_eq!(json["payload"]["trafficCar"]["carIdx"], 5);
+    assert!(json["payload"]["trafficCar"]["carNumber"].is_string());
+}
+
+#[test]
+fn horizon_closing_includes_both_car_refs() {
+    let event = RaceEvent::HorizonClosing {
+        lap: 8,
+        session_time: 500.0,
+        attacker_car_idx: 3,
+        defender_car_idx: 7,
+        attacker_position: 4,
+        defender_position: 3,
+        current_gap_s: 2.5,
+        closing_rate_sec_per_lap: 0.3,
+        estimated_laps_to_contact: 8,
+    };
+
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001");
+    let json = normalized_event_json(&env);
+
+    assert_envelope_contract(&json, "HORIZON_CLOSING");
+
+    // Numeric fields kept for backward compatibility
+    assert_eq!(json["payload"]["attacker_car_idx"], 3);
+    assert_eq!(json["payload"]["defender_car_idx"], 7);
+
+    // Structured attackerCar and defenderCar objects
+    assert!(json["payload"]["attackerCar"].is_object(), "attackerCar should be a structured object");
+    assert!(json["payload"]["defenderCar"].is_object(), "defenderCar should be a structured object");
+    assert_eq!(json["payload"]["attackerCar"]["carIdx"], 3);
+    assert_eq!(json["payload"]["defenderCar"]["carIdx"], 7);
+    assert!(json["payload"]["attackerCar"]["carNumber"].is_string());
+    assert!(json["payload"]["defenderCar"]["carNumber"].is_string());
+}
+
+#[test]
+fn incident_cluster_includes_all_car_refs() {
+    let event = RaceEvent::IncidentCluster {
+        lap: 6,
+        session_time: 370.0,
+        bucket: 15,
+        lap_dist_pct_from: 0.75,
+        lap_dist_pct_to: 0.80,
+        car_idxs: vec![1, 2, 4],
+        severity: 3.0,
+        primary_car_idx: Some(1),
+        incident_type: Some("Incident".to_owned()),
+    };
+
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001");
+    let json = normalized_event_json(&env);
+
+    assert_envelope_contract(&json, "INCIDENT_CLUSTER");
+
+    // Numeric car_idxs kept for backward compatibility
+    assert!(json["payload"]["car_idxs"].is_array());
+    assert_eq!(json["payload"]["car_idxs"].as_array().unwrap().len(), 3);
+
+    // Structured involvedCars array with all participants
+    assert!(json["payload"]["involvedCars"].is_array(), "involvedCars should be an array");
+    let involved = json["payload"]["involvedCars"].as_array().unwrap();
+    assert_eq!(involved.len(), 3, "involvedCars should contain all 3 participants");
+    assert!(involved[0].is_object());
+    assert!(involved[0]["carIdx"].is_number());
+
+    // primaryCar object for most-culpable car
+    assert!(json["payload"]["primaryCar"].is_object(), "primaryCar should be a structured object");
+    assert_eq!(json["payload"]["primaryCar"]["carIdx"], 1);
+
+    // Incident type
+    assert_eq!(json["payload"]["incidentType"], "Incident");
+
+    // Location: centroid of the cluster bucket
+    let lap_dist_pct = json["payload"]["lapDistPct"].as_f64().unwrap();
+    assert!((lap_dist_pct - 0.775).abs() < 1e-3, "lapDistPct should be centroid ~0.775, got {lap_dist_pct}");
+}
+
+#[test]
 fn battle_broken_with_no_gap_emits_null_final_gap() {
     let event = RaceEvent::BattleBroken {
         lap: 7,
