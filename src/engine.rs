@@ -52,9 +52,11 @@ pub struct NarrativeEngine {
     consecutive_close: u32,
     last_close_t: f32,
     tracking_car: Option<u8>,
+    engagement_start_t: Option<f32>,
     consecutive_close_beh: u32,
     last_close_beh_t: f32,
     tracking_car_beh: Option<u8>,
+    engagement_start_beh_t: Option<f32>,
     prev_session_state: i32,
     prev_session_flags: u32,
     prev_lap: Option<u8>,
@@ -100,9 +102,11 @@ impl NarrativeEngine {
             consecutive_close: 0,
             last_close_t: f32::NEG_INFINITY,
             tracking_car: None,
+            engagement_start_t: None,
             consecutive_close_beh: 0,
             last_close_beh_t: f32::NEG_INFINITY,
             tracking_car_beh: None,
+            engagement_start_beh_t: None,
             prev_session_state: 0,
             prev_session_flags: 0,
             prev_lap: None,
@@ -218,6 +222,7 @@ impl NarrativeEngine {
                 {
                     self.tracking_car = Some(car_idx);
                     self.last_close_t = t;
+                    self.engagement_start_t = Some(t);
                     self.engaged_cars.insert(car_idx);
                     let car_race_position = frame.car_idx_position.get(car_idx as usize).copied().unwrap_or(0);
                     let (prior_skirmishes, prior_attack_time_s) = self.opponent_history(frame.player_car_idx, car_idx);
@@ -230,6 +235,7 @@ impl NarrativeEngine {
                         car_race_position,
                         prior_skirmishes,
                         prior_attack_time_s,
+                        engagement_started_at_session_time_s: t,
                     });
                 }
             }
@@ -239,19 +245,22 @@ impl NarrativeEngine {
                 if current_idx != self.tracking_car {
                     if let Some(prev_car) = self.tracking_car {
                         if self.engaged_cars.remove(&prev_car) {
-                            let gap_s = other.map(|(_, g)| g).unwrap_or(f32::MAX);
+                            let final_gap_sec = other.map(|(_, g)| g).unwrap_or(f32::MAX);
                             let car_race_position = frame.car_idx_position.get(prev_car as usize).copied().unwrap_or(0);
+                            let engagement_started_at_session_time_s = self.engagement_start_t.unwrap_or(t);
                             events.push(RaceEvent::BattleBroken { 
                                 lap, 
                                 session_time: t, 
                                 player_car_idx: frame.player_car_idx,
                                 opponent_car_idx: prev_car, 
-                                gap_s,
+                                final_gap_sec,
                                 car_race_position,
+                                engagement_started_at_session_time_s,
                             });
                         }
                     }
                     self.tracking_car = None;
+                    self.engagement_start_t = None;
                 }
             }
         }
@@ -265,6 +274,7 @@ impl NarrativeEngine {
                 {
                     self.tracking_car_beh = Some(car_idx);
                     self.last_close_beh_t = t;
+                    self.engagement_start_beh_t = Some(t);
                     self.engaged_cars_beh.insert(car_idx);
                     let car_race_position = frame.car_idx_position.get(car_idx as usize).copied().unwrap_or(0);
                     let (prior_skirmishes, prior_attack_time_s) = self.opponent_history(frame.player_car_idx, car_idx);
@@ -277,6 +287,7 @@ impl NarrativeEngine {
                         car_race_position,
                         prior_skirmishes,
                         prior_attack_time_s,
+                        engagement_started_at_session_time_s: t,
                     });
                 }
             }
@@ -286,19 +297,22 @@ impl NarrativeEngine {
                 if current_idx != self.tracking_car_beh {
                     if let Some(prev_car) = self.tracking_car_beh {
                         if self.engaged_cars_beh.remove(&prev_car) {
-                            let gap_s = other.map(|(_, g)| g).unwrap_or(f32::MAX);
+                            let final_gap_sec = other.map(|(_, g)| g).unwrap_or(f32::MAX);
                             let car_race_position = frame.car_idx_position.get(prev_car as usize).copied().unwrap_or(0);
+                            let engagement_started_at_session_time_s = self.engagement_start_beh_t.unwrap_or(t);
                             events.push(RaceEvent::BattleBroken { 
                                 lap, 
                                 session_time: t, 
                                 player_car_idx: frame.player_car_idx,
                                 opponent_car_idx: prev_car, 
-                                gap_s,
+                                final_gap_sec,
                                 car_race_position,
+                                engagement_started_at_session_time_s,
                             });
                         }
                     }
                     self.tracking_car_beh = None;
+                    self.engagement_start_beh_t = None;
                 }
             }
         }

@@ -157,9 +157,44 @@ fn enrich_payload(
             obj.insert("lapTime".to_owned(), option_f32_json(*lap_time_s));
             obj.insert("bestLapTime".to_owned(), option_f32_json(*best_lap_time_s));
         }
-        RaceEvent::BattleEngaged { player_car_idx, opponent_car_idx, .. }
-        | RaceEvent::BattleBroken { player_car_idx, opponent_car_idx, .. }
-        | RaceEvent::BattleClosing { player_car_idx, opponent_car_idx, .. } => {
+        RaceEvent::BattleEngaged { player_car_idx, opponent_car_idx, gap_s, engagement_started_at_session_time_s, .. } => {
+            let (leader_idx, follower_idx) =
+                leader_follower_indices(frame, *player_car_idx, *opponent_car_idx);
+            let leader = resolve_car(leader_idx, roster);
+            let follower = resolve_car(follower_idx, roster);
+
+            // Legacy fields for transition window
+            obj.insert("leaderCarNumber".to_owned(), Value::String(leader.car_number.clone()));
+            obj.insert("followerCarNumber".to_owned(), Value::String(follower.car_number.clone()));
+
+            // New structured car references (primary source of truth)
+            obj.insert("leaderCar".to_owned(), serde_json::to_value(&leader).unwrap_or(Value::Null));
+            obj.insert("followerCar".to_owned(), serde_json::to_value(&follower).unwrap_or(Value::Null));
+
+            // Gap at engagement and engagement start time (camelCase aliases)
+            obj.insert("engagementGapSec".to_owned(), json!(gap_s));
+            obj.insert("engagementStartedAtSessionTime".to_owned(), json!(engagement_started_at_session_time_s));
+        }
+        RaceEvent::BattleBroken { player_car_idx, opponent_car_idx, final_gap_sec, engagement_started_at_session_time_s, session_time, .. } => {
+            let (leader_idx, follower_idx) =
+                leader_follower_indices(frame, *player_car_idx, *opponent_car_idx);
+            let leader = resolve_car(leader_idx, roster);
+            let follower = resolve_car(follower_idx, roster);
+
+            // Legacy fields for transition window
+            obj.insert("leaderCarNumber".to_owned(), Value::String(leader.car_number.clone()));
+            obj.insert("followerCarNumber".to_owned(), Value::String(follower.car_number.clone()));
+
+            // New structured car references (primary source of truth)
+            obj.insert("leaderCar".to_owned(), serde_json::to_value(&leader).unwrap_or(Value::Null));
+            obj.insert("followerCar".to_owned(), serde_json::to_value(&follower).unwrap_or(Value::Null));
+
+            // Final gap and computed engagement duration (camelCase aliases)
+            obj.insert("finalGapSec".to_owned(), json!(final_gap_sec));
+            let duration = (session_time - engagement_started_at_session_time_s).max(0.0);
+            obj.insert("engagementDurationSec".to_owned(), json!(duration));
+        }
+        RaceEvent::BattleClosing { player_car_idx, opponent_car_idx, .. } => {
             let (leader_idx, follower_idx) =
                 leader_follower_indices(frame, *player_car_idx, *opponent_car_idx);
             let leader = resolve_car(leader_idx, roster);
@@ -341,6 +376,7 @@ mod tests {
             car_race_position: 4,
             prior_skirmishes: 0,
             prior_attack_time_s: 0.0,
+            engagement_started_at_session_time_s: 12.0,
         };
 
         let env = build_event(&event, &minimal_frame(), None, "s", "r");

@@ -96,6 +96,7 @@ fn battle_contract_includes_leader_and_follower_numbers() {
         car_race_position: 4,
         prior_skirmishes: 0,
         prior_attack_time_s: 0.0,
+        engagement_started_at_session_time_s: 12.0,
     };
 
     let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001");
@@ -238,6 +239,7 @@ fn battle_events_identify_both_sides_directly() {
         car_race_position: 5,
         prior_skirmishes: 1,
         prior_attack_time_s: 12.5,
+        engagement_started_at_session_time_s: 50.0,
     };
 
     let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001");
@@ -256,4 +258,82 @@ fn battle_events_identify_both_sides_directly() {
     // Leader and follower should be different cars
     assert_ne!(leader_idx, follower_idx);
     assert!((leader_idx == 0 && follower_idx == 3) || (leader_idx == 3 && follower_idx == 0));
+}
+
+#[test]
+fn battle_engaged_includes_engagement_start_time() {
+    let event = RaceEvent::BattleEngaged {
+        lap: 3,
+        session_time: 200.0,
+        player_car_idx: 0,
+        opponent_car_idx: 1,
+        gap_s: 0.45,
+        car_race_position: 4,
+        prior_skirmishes: 0,
+        prior_attack_time_s: 0.0,
+        engagement_started_at_session_time_s: 200.0,
+    };
+
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001");
+    let json = normalized_event_json(&env);
+
+    assert_envelope_contract(&json, "BATTLE_ENGAGED");
+
+    // Snake-case field present in payload
+    let start_snake = json["payload"]["engagement_started_at_session_time_s"].as_f64();
+    assert!(start_snake.is_some(), "engagement_started_at_session_time_s should be in payload");
+    assert!((start_snake.unwrap() - 200.0).abs() < 1e-4);
+
+    // camelCase alias added by enrichment
+    let start_camel = json["payload"]["engagementStartedAtSessionTime"].as_f64();
+    assert!(start_camel.is_some(), "engagementStartedAtSessionTime should be in payload");
+    assert!((start_camel.unwrap() - 200.0).abs() < 1e-4);
+
+    // engagementGapSec camelCase alias
+    let gap = json["payload"]["engagementGapSec"].as_f64();
+    assert!(gap.is_some(), "engagementGapSec should be in payload");
+    assert!((gap.unwrap() - 0.45).abs() < 1e-4);
+}
+
+#[test]
+fn battle_broken_contract_uses_final_gap_sec_and_duration() {
+    let event = RaceEvent::BattleBroken {
+        lap: 5,
+        session_time: 350.0,
+        player_car_idx: 0,
+        opponent_car_idx: 1,
+        final_gap_sec: 1.8,
+        car_race_position: 4,
+        engagement_started_at_session_time_s: 320.0,
+    };
+
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001");
+    let json = normalized_event_json(&env);
+
+    assert_envelope_contract(&json, "BATTLE_BROKEN");
+
+    // Snake-case field final_gap_sec present in payload
+    let final_gap_snake = json["payload"]["final_gap_sec"].as_f64();
+    assert!(final_gap_snake.is_some(), "final_gap_sec should be in payload");
+    assert!((final_gap_snake.unwrap() - 1.8).abs() < 1e-4);
+
+    // camelCase alias added by enrichment
+    let final_gap_camel = json["payload"]["finalGapSec"].as_f64();
+    assert!(final_gap_camel.is_some(), "finalGapSec should be in payload");
+    assert!((final_gap_camel.unwrap() - 1.8).abs() < 1e-4);
+
+    // finalGapSec should never be f32::MAX
+    assert!(
+        final_gap_camel.unwrap() < f32::MAX as f64,
+        "finalGapSec should not be f32::MAX sentinel"
+    );
+
+    // engagementDurationSec computed from start time
+    let duration = json["payload"]["engagementDurationSec"].as_f64();
+    assert!(duration.is_some(), "engagementDurationSec should be in payload");
+    assert!((duration.unwrap() - 30.0).abs() < 1e-4, "duration should be 350.0 - 320.0 = 30.0s");
+
+    // leaderCar and followerCar still present
+    assert!(json["payload"]["leaderCar"].is_object());
+    assert!(json["payload"]["followerCar"].is_object());
 }
