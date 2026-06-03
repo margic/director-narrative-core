@@ -1,6 +1,6 @@
 use director_narrative_core::battle_state::SlopeInfo;
 use director_narrative_core::publisher_event::{build_event, PublisherEvent};
-use director_narrative_core::race_event::RaceEvent;
+use director_narrative_core::race_event::{FlagScope, RaceEvent};
 use director_narrative_core::telemetry_frame::TelemetryFrame;
 use serde_json::Value;
 
@@ -471,4 +471,80 @@ fn battle_broken_with_no_gap_emits_null_final_gap() {
     let duration = json["payload"]["engagementDurationSec"].as_f64();
     assert!(duration.is_some(), "engagementDurationSec should still be computed");
     assert!((duration.unwrap() - 30.0).abs() < 1e-4);
+}
+#[test]
+fn flag_yellow_local_includes_location_and_trigger() {
+    // Yellow with a known nearby trigger car and location.
+    let event = RaceEvent::FlagYellowLocal {
+        lap: 3,
+        session_time: 180.0,
+        trigger_car_idx: Some(5),
+        lap_dist_pct: Some(0.425),
+        sector: None,
+        scope: FlagScope::Nearby,
+        linked_incident_id: Some(8),
+    };
+
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001");
+    let json = normalized_event_json(&env);
+
+    assert_envelope_contract(&json, "FLAG_YELLOW_LOCAL");
+
+    // Structured trigger car reference
+    assert!(json["payload"]["triggerCar"].is_object(),
+        "triggerCar should be a structured CarRef object");
+    assert_eq!(json["payload"]["triggerCar"]["carIdx"], 5);
+    assert!(json["payload"]["triggerCar"]["carNumber"].is_string());
+
+    // Track location formatted as percentage string
+    let track_pct = json["payload"]["trackLocationPct"].as_str();
+    assert!(track_pct.is_some(), "trackLocationPct should be present");
+    assert_eq!(track_pct.unwrap(), "42.5%");
+
+    // Flag scope is one of the four valid enum variants
+    let flag_scope = json["payload"]["flagScope"].as_str();
+    assert!(flag_scope.is_some(), "flagScope should be present");
+    assert!(
+        ["SelfCaused", "Nearby", "SessionWide", "Unknown"].contains(&flag_scope.unwrap()),
+        "flagScope must be one of the four valid values, got: {}",
+        flag_scope.unwrap()
+    );
+    assert_eq!(flag_scope.unwrap(), "Nearby");
+
+    // Human-readable reason
+    assert!(json["payload"]["reason"].is_string(), "reason should be a string");
+
+    // Raw fields still present for backward compatibility
+    let raw_pct = json["payload"]["lap_dist_pct"].as_f64().expect("lap_dist_pct should be a number");
+    assert!((raw_pct - 0.425).abs() < 1e-4, "lap_dist_pct should be ~0.425, got {raw_pct}");
+    assert_eq!(json["payload"]["linked_incident_id"], 8);
+}
+
+#[test]
+fn flag_yellow_local_unknown_scope_omits_trigger_car() {
+    // Yellow with no determinable cause.
+    let event = RaceEvent::FlagYellowLocal {
+        lap: 5,
+        session_time: 310.0,
+        trigger_car_idx: None,
+        lap_dist_pct: Some(0.72),
+        sector: None,
+        scope: FlagScope::Unknown,
+        linked_incident_id: None,
+    };
+
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001");
+    let json = normalized_event_json(&env);
+
+    assert_envelope_contract(&json, "FLAG_YELLOW_LOCAL");
+
+    // No trigger car when cause is unknown
+    assert!(json["payload"].get("triggerCar").is_none() || json["payload"]["triggerCar"].is_null(),
+        "triggerCar should be absent or null when scope is Unknown");
+
+    // flagScope still present and valid
+    assert_eq!(json["payload"]["flagScope"].as_str(), Some("Unknown"));
+
+    // reason still present
+    assert!(json["payload"]["reason"].is_string());
 }

@@ -11,7 +11,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::race_event::RaceEvent;
+use crate::race_event::{FlagScope, RaceEvent};
 use crate::session_info::{CarRef, SessionRoster};
 use crate::telemetry_frame::TelemetryFrame;
 
@@ -258,6 +258,38 @@ fn enrich_payload(
 
             // Cluster centroid lap distance percentage
             obj.insert("lapDistPct".to_owned(), json!((lap_dist_pct_from + lap_dist_pct_to) / 2.0));
+        }
+        RaceEvent::FlagYellowLocal { trigger_car_idx, lap_dist_pct, scope, .. } => {
+            // Resolve trigger car to a structured CarRef when known.
+            if let Some(idx) = trigger_car_idx {
+                let trigger_car = resolve_car(*idx, roster);
+                obj.insert("triggerCar".to_owned(), serde_json::to_value(&trigger_car).unwrap_or(Value::Null));
+            }
+            // Format track location as a human-readable percentage string.
+            if let Some(pct) = lap_dist_pct {
+                obj.insert("trackLocationPct".to_owned(), Value::String(format!("{:.1}%", pct * 100.0)));
+            }
+            // Flag scope as a string matching the FlagScope enum variant name.
+            let scope_str = match scope {
+                FlagScope::SelfCaused  => "SelfCaused",
+                FlagScope::Nearby      => "Nearby",
+                FlagScope::SessionWide => "SessionWide",
+                FlagScope::Unknown     => "Unknown",
+            };
+            obj.insert("flagScope".to_owned(), Value::String(scope_str.to_owned()));
+            // Human-readable summary for narration.
+            let reason = match scope {
+                FlagScope::SelfCaused  => "Incident caused by player".to_owned(),
+                FlagScope::Nearby      => {
+                    let loc = lap_dist_pct
+                        .map(|p| format!("{:.1}%", p * 100.0))
+                        .unwrap_or_else(|| "unknown location".to_owned());
+                    format!("Incident nearby at {loc}")
+                }
+                FlagScope::SessionWide => "Session-wide caution".to_owned(),
+                FlagScope::Unknown     => "Yellow flag condition".to_owned(),
+            };
+            obj.insert("reason".to_owned(), Value::String(reason));
         }
         _ => {}
     }

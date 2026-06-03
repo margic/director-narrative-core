@@ -14,7 +14,7 @@ use crate::incident_cluster::IncidentClusterDetector;
 use crate::lap_timer::LapTimer;
 use crate::lift_coast::LiftCoastDetector;
 use crate::micro_sector::MicroSectorTracker;
-use crate::race_event::RaceEvent;
+use crate::race_event::{FlagScope, RaceEvent};
 use crate::regression_store::RegressionStore;
 use crate::session_info::SessionRoster;
 use crate::telemetry_frame::TelemetryFrame;
@@ -166,7 +166,40 @@ impl NarrativeEngine {
         if session_flags & CAUTION != 0 && self.prev_session_flags & CAUTION == 0 {
             events.push(RaceEvent::FlagYellowFullCourse { lap, session_time: t });
         } else if session_flags & YELLOW_WAVE != 0 && self.prev_session_flags & YELLOW_WAVE == 0 {
-            events.push(RaceEvent::FlagYellowLocal { lap, session_time: t });
+            // Infer scope and context from active incident clusters at the time of the yellow.
+            // A cluster whose centre is within 15% of the player's current track position is
+            // considered "nearby"; beyond that we default to Unknown.
+            const NEARBY_DIST_THRESHOLD: f32 = 0.15;
+            let player_ldp = ldp;
+            let mut best_primary: Option<u8> = None;
+            let mut best_bucket: Option<u8> = None;
+            let mut best_dist = f32::MAX;
+            for (&bucket, (_cluster_lap, cars)) in &self.incident_cluster.active_clusters {
+                let cluster_center = (bucket as f32 + 0.5) / self.anchor_count.max(1) as f32;
+                let raw_dist = (player_ldp - cluster_center).abs();
+                // Account for track wrap-around (e.g. position 0.98 vs 0.02).
+                let dist = raw_dist.min(1.0 - raw_dist);
+                if dist < best_dist {
+                    best_dist = dist;
+                    best_primary = cars.iter().copied().min();
+                    best_bucket = Some(bucket);
+                }
+            }
+            let (trigger_car_idx, linked_incident_id, scope) =
+                if best_dist <= NEARBY_DIST_THRESHOLD {
+                    (best_primary, best_bucket.map(|b| b as u32), FlagScope::Nearby)
+                } else {
+                    (None, None, FlagScope::Unknown)
+                };
+            events.push(RaceEvent::FlagYellowLocal {
+                lap,
+                session_time: t,
+                trigger_car_idx,
+                lap_dist_pct: Some(ldp),
+                sector: None,
+                scope,
+                linked_incident_id,
+            });
         }
         self.prev_session_state = session_state;
         self.prev_session_flags = session_flags;
