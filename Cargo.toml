@@ -13,8 +13,16 @@ name = "publisher"
 path = "src/bin/publisher.rs"
 
 [[bin]]
+name = "publisher_ui"
+path = "src/bin/publisher_ui.rs"
+required-features = ["publisher-ui"]
+
+[[bin]]
 name = "replay"
 path = "src/bin/replay.rs"
+
+[features]
+publisher-ui = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
