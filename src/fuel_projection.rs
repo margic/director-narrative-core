@@ -108,6 +108,20 @@ mod tests {
     }
 
     #[test]
+    fn newly_created_projector_returns_no_valid_data() {
+        let tracker = FuelProjection::new();
+        assert!(!tracker.has_valid_data());
+    }
+
+    #[test]
+    fn projector_with_fuel_data_returns_valid_data() {
+        let mut tracker = FuelProjection::new();
+        tracker.on_lap_crossing(1, 60.0, 50.0, false, false);
+        tracker.on_lap_crossing(2, 120.0, 47.5, false, false);
+        assert!(tracker.has_valid_data());
+    }
+
+    #[test]
     fn yellow_lap_exclusion() {
         let mut tracker = FuelProjection::new();
         tracker.on_lap_crossing(1, 60.0, 50.0, false, false);

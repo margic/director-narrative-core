@@ -79,6 +79,8 @@ pub struct NarrativeEngine {
     incident_cluster: IncidentClusterDetector,
     compression_zone: CompressionZoneDetector,
     track_length_m: f32,
+    logged_tire_suppressed: bool,
+    logged_fuel_suppressed: bool,
 }
 
 impl NarrativeEngine {
@@ -129,6 +131,8 @@ impl NarrativeEngine {
             incident_cluster: IncidentClusterDetector::new(),
             compression_zone: CompressionZoneDetector::new(),
             track_length_m: 5000.0,
+            logged_tire_suppressed: false,
+            logged_fuel_suppressed: false,
         }
     }
 
@@ -500,7 +504,11 @@ impl NarrativeEngine {
                 events.extend(self.micro_sector.on_lap_end(done_lap, t, clean_lap));
                 if let Some(event) = self.tire_degradation.on_lap_crossing(done_lap, t, self.pit_laps.contains(&done_lap)) {
                     if self.tire_degradation.has_valid_data() {
+                        self.logged_tire_suppressed = false;
                         events.push(event);
+                    } else if !self.logged_tire_suppressed {
+                        eprintln!("[engine] suppressing TIRE_DEGRADATION at lap {done_lap}: telemetry unavailable");
+                        self.logged_tire_suppressed = true;
                     }
                 }
                 if let Some(event) = self.fuel_projection.on_lap_crossing(
@@ -511,7 +519,11 @@ impl NarrativeEngine {
                     self.dirty_laps.contains(&done_lap),
                 ) {
                     if self.fuel_projection.has_valid_data() {
+                        self.logged_fuel_suppressed = false;
                         events.push(event);
+                    } else if !self.logged_fuel_suppressed {
+                        eprintln!("[engine] suppressing FUEL_PROJECTION at lap {done_lap}: telemetry unavailable");
+                        self.logged_fuel_suppressed = true;
                     }
                 }
                 events.extend(self.horizon.detect(
@@ -778,6 +790,78 @@ mod tests {
         assert_eq!(done_lap, 2);
         assert_eq!(lap_time_s, Some(153.9));
         assert_eq!(best_lap_time_s, Some(152.1));
+    }
+
+    #[test]
+    fn tire_degradation_suppressed_until_valid() {
+        let mut engine = NarrativeEngine::new(10);
+
+        let mut f1 = frame_no_opponent(1, 60.0);
+        f1.session_state = 4;
+        let _ = engine.process_frame(&f1);
+
+        let mut f2 = frame_no_opponent(2, 120.0);
+        f2.session_state = 4;
+        let _ = engine.process_frame(&f2);
+
+        let mut f3 = frame_no_opponent(3, 180.0);
+        f3.session_state = 4;
+        let evs3 = engine.process_frame(&f3);
+        assert!(!evs3.iter().any(|e| matches!(e, RaceEvent::TireDegradation { .. })));
+
+        let mut f4 = frame_no_opponent(4, 240.0);
+        f4.session_state = 4;
+        f4.lf_temp_m = 80.0;
+        f4.rf_temp_m = 80.0;
+        f4.lr_temp_m = 80.0;
+        f4.rr_temp_m = 80.0;
+        let _ = engine.process_frame(&f4);
+
+        let mut f5 = frame_no_opponent(5, 300.0);
+        f5.session_state = 4;
+        f5.lf_temp_m = 81.0;
+        f5.rf_temp_m = 81.0;
+        f5.lr_temp_m = 81.0;
+        f5.rr_temp_m = 81.0;
+        let _ = engine.process_frame(&f5);
+
+        let mut f6 = frame_no_opponent(6, 360.0);
+        f6.session_state = 4;
+        f6.lf_temp_m = 82.0;
+        f6.rf_temp_m = 82.0;
+        f6.lr_temp_m = 82.0;
+        f6.rr_temp_m = 82.0;
+        let evs6 = engine.process_frame(&f6);
+        assert!(evs6.iter().any(|e| matches!(e, RaceEvent::TireDegradation { .. })));
+    }
+
+    #[test]
+    fn fuel_projection_suppressed_until_valid() {
+        let mut engine = NarrativeEngine::new(10);
+
+        let mut f1 = frame_no_opponent(1, 60.0);
+        f1.session_state = 4;
+        let _ = engine.process_frame(&f1);
+
+        let mut f2 = frame_no_opponent(2, 120.0);
+        f2.session_state = 4;
+        let _ = engine.process_frame(&f2);
+
+        let mut f3 = frame_no_opponent(3, 180.0);
+        f3.session_state = 4;
+        let evs3 = engine.process_frame(&f3);
+        assert!(!evs3.iter().any(|e| matches!(e, RaceEvent::FuelProjection { .. })));
+
+        let mut f4 = frame_no_opponent(4, 240.0);
+        f4.session_state = 4;
+        f4.fuel_level = 50.0;
+        let _ = engine.process_frame(&f4);
+
+        let mut f5 = frame_no_opponent(5, 300.0);
+        f5.session_state = 4;
+        f5.fuel_level = 47.5;
+        let evs5 = engine.process_frame(&f5);
+        assert!(evs5.iter().any(|e| matches!(e, RaceEvent::FuelProjection { .. })));
     }
 
     #[test]

@@ -168,6 +168,19 @@ mod tests {
     }
 
     #[test]
+    fn newly_created_detector_returns_no_valid_data() {
+        let tracker = TireDegradation::new(1.0);
+        assert!(!tracker.has_valid_data());
+    }
+
+    #[test]
+    fn detector_with_samples_returns_valid_data() {
+        let mut tracker = TireDegradation::new(1.0);
+        tracker.update_ema(&frame(0.0, 80.0));
+        assert!(tracker.has_valid_data());
+    }
+
+    #[test]
     fn pit_cycle_reset() {
         let mut tracker = TireDegradation::new(1.0);
         tracker.update_ema(&frame(0.0, 80.0));

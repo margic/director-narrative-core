@@ -176,7 +176,6 @@ fn pipeline_main(
     }
     let mut lifecycle       = LifecyclePublisher::new(env!("CARGO_PKG_VERSION"));
     let mut roster_cache    = RosterCache::new();
-    let mut session_meta    = SessionMetadata::default();
     let mut race_session_id = String::from("0");
     let mut sub_session_id: i64 = 0;
     let mut last_frame: Option<TelemetryFrame> = None;
@@ -233,7 +232,6 @@ fn pipeline_main(
             engine         = NarrativeEngine::new(10);
             lifecycle      = LifecyclePublisher::new(env!("CARGO_PKG_VERSION"));
             roster_cache   = RosterCache::new();
-            session_meta   = SessionMetadata::default();
             pending_events.clear();
             sub_session_id  = 0;
             race_session_id = String::new();
@@ -299,7 +297,6 @@ fn pipeline_main(
                                 engine        = NarrativeEngine::new(10);
                                 lifecycle     = LifecyclePublisher::new(env!("CARGO_PKG_VERSION"));
                                 roster_cache  = RosterCache::new();
-                                session_meta  = SessionMetadata::default();
                                 pending_events.clear();
                             }
                             sub_session_id  = sid;
@@ -330,7 +327,7 @@ fn pipeline_main(
                             }
                         }
 
-                        session_meta = SessionMetadata::parse(&yaml, frame.session_num as usize);
+                        let session_meta = SessionMetadata::parse(&yaml, frame.session_num as usize);
                         {
                             let mut s = status.lock().unwrap();
                             s.sub_session_id = Some(sub_session_id);
@@ -513,7 +510,7 @@ fn make_log_entry(
 fn log_event(
     event:  &director_narrative_core::race_event::RaceEvent,
     roster: Option<&director_narrative_core::session_info::SessionRoster>,
-    frame:  &director_narrative_core::telemetry_frame::TelemetryFrame,
+    _frame: &director_narrative_core::telemetry_frame::TelemetryFrame,
 ) {
     use director_narrative_core::race_event::RaceEvent;
     use director_narrative_core::session_info::SessionRoster;

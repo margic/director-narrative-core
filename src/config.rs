@@ -224,7 +224,7 @@ mod tests {
     use super::*;
 
     fn parse(toml: &str) -> PublisherConfig {
-        let mut raw: RawConfig = toml::from_str(toml).expect("valid toml");
+        let raw: RawConfig = toml::from_str(toml).expect("valid toml");
         // No env vars in unit tests — isolate file parsing only
         build_and_validate(raw).expect("valid config")
     }

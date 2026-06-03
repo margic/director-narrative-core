@@ -266,6 +266,7 @@ pub fn run_ui(
 }
 
 #[cfg(target_os = "windows")]
+#[allow(dead_code)]
 fn main() {
     let status = Arc::new(Mutex::new(PublisherStatus::default()));
     let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
