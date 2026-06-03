@@ -6,6 +6,7 @@ resolver = "2"
 name = "director-narrative-core"
 version = "0.1.0"
 edition = "2021"
+autobins = false
 
 [[bin]]
 name = "publisher"
