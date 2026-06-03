@@ -234,6 +234,10 @@ fn enrich_payload(
     }
 }
 
+/// Threshold above which a raw f32 telemetry value is treated as a
+/// missing-data sentinel (e.g. iRacing's `f32::MAX` / `3.4e+38`).
+const F32_SENTINEL_THRESHOLD: f32 = 1e30;
+
 fn option_f32_json(v: Option<f32>) -> Value {
     match v {
         Some(n) => json!(n),
@@ -242,9 +246,10 @@ fn option_f32_json(v: Option<f32>) -> Value {
 }
 
 /// Convert a raw f32 telemetry value to JSON, mapping sentinel values
-/// (NaN, Infinite, or unreasonably large values such as f32::MAX) to `null`.
+/// (NaN, Infinite, or values >= `F32_SENTINEL_THRESHOLD` such as `f32::MAX`)
+/// to `null` to prevent invalid data from reaching Cosmos.
 fn sanitize_sentinel_json(v: f32) -> Value {
-    if v.is_nan() || v.is_infinite() || v >= 1e30 {
+    if v.is_nan() || v.is_infinite() || v >= F32_SENTINEL_THRESHOLD {
         if cfg!(debug_assertions) {
             eprintln!("[publisher] sentinel value detected in telemetry: {v}");
         }

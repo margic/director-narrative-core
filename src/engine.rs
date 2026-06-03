@@ -27,6 +27,9 @@ const PIT_LAP_FRAME_THRESH: u32 = 20;
 const YELLOW_WAVE: u32 = 0x0100;
 const CAUTION: u32 = 0x4000;
 const YELLOW_ZONES: &[(u8, f32, f32)] = &[(1, 0.625, 0.646), (2, 0.616, 0.623)];
+/// Upper bound for a credible race gap. Real battle gaps are bounded by
+/// `MAX_BATTLE_GAP_S` (~5 s); anything at or above this value is a sentinel.
+const MAX_VALID_GAP_S: f32 = 100.0;
 
 pub struct NarrativeEngine {
     anchor_count: usize,
@@ -598,10 +601,11 @@ fn valid_lap_time(v: f32) -> Option<f32> {
     (v.is_finite() && v > 0.1).then_some(v)
 }
 
-/// Sanitize a gap value: return `None` if it is a sentinel (f32::MAX, NaN, or infinite)
-/// or unreasonably large (>= 100 s). Real race gaps are bounded by MAX_BATTLE_GAP_S.
+/// Sanitize a gap value: return `None` if it is a sentinel (NaN, Infinite,
+/// or >= `MAX_VALID_GAP_S`). Real battle gaps are bounded by `MAX_BATTLE_GAP_S`
+/// (~5 s), so anything >= 100 s is definitively a missing-data sentinel.
 fn sanitize_gap(v: f32) -> Option<f32> {
-    if v.is_nan() || v.is_infinite() || v >= 100.0 {
+    if v.is_nan() || v.is_infinite() || v >= MAX_VALID_GAP_S {
         None
     } else {
         Some(v)
