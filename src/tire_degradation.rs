@@ -82,6 +82,13 @@ impl TireDegradation {
     pub fn latest_max_slope(&self) -> f32 {
         self.last_max_slope
     }
+
+    /// Returns true if real temperature telemetry has been received (EMA non-zero).
+    /// When telemetry is unavailable, all EMA values stay at 0.0 and events
+    /// should be suppressed to avoid emitting all-zero slope data.
+    pub fn has_valid_data(&self) -> bool {
+        self.ema_lf > 0.0 || self.ema_rf > 0.0 || self.ema_lr > 0.0 || self.ema_rr > 0.0
+    }
 }
 
 fn ema(prev: f32, sample: f32, alpha: f32) -> f32 {

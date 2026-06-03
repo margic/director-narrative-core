@@ -302,7 +302,7 @@ fn battle_broken_contract_uses_final_gap_sec_and_duration() {
         session_time: 350.0,
         player_car_idx: 0,
         opponent_car_idx: 1,
-        final_gap_sec: 1.8,
+        final_gap_sec: Some(1.8),
         car_race_position: 4,
         engagement_started_at_session_time_s: 320.0,
     };
@@ -336,4 +336,35 @@ fn battle_broken_contract_uses_final_gap_sec_and_duration() {
     // leaderCar and followerCar still present
     assert!(json["payload"]["leaderCar"].is_object());
     assert!(json["payload"]["followerCar"].is_object());
+}
+
+#[test]
+fn battle_broken_with_no_gap_emits_null_final_gap() {
+    let event = RaceEvent::BattleBroken {
+        lap: 7,
+        session_time: 420.0,
+        player_car_idx: 0,
+        opponent_car_idx: 2,
+        final_gap_sec: None, // gap unknown — opponent left scan range
+        car_race_position: 3,
+        engagement_started_at_session_time_s: 390.0,
+    };
+
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001");
+    let json = normalized_event_json(&env);
+
+    assert_envelope_contract(&json, "BATTLE_BROKEN");
+
+    // Snake-case field present in payload and is null
+    assert_eq!(json["payload"]["final_gap_sec"], Value::Null,
+        "final_gap_sec should be null when gap is unknown");
+
+    // camelCase alias also null (no sentinel written)
+    assert_eq!(json["payload"]["finalGapSec"], Value::Null,
+        "finalGapSec should be null when gap is unknown — no f32::MAX sentinel");
+
+    // Duration still computable
+    let duration = json["payload"]["engagementDurationSec"].as_f64();
+    assert!(duration.is_some(), "engagementDurationSec should still be computed");
+    assert!((duration.unwrap() - 30.0).abs() < 1e-4);
 }

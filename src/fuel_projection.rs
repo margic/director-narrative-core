@@ -75,6 +75,13 @@ impl FuelProjection {
     pub fn laps_remaining(&self) -> Option<f32> {
         self.last_laps_remaining
     }
+
+    /// Returns true if meaningful fuel consumption data has been observed.
+    /// Suppresses events when all recorded fuel deltas are zero (no telemetry)
+    /// or when the delta window is not yet populated.
+    pub fn has_valid_data(&self) -> bool {
+        !self.clean_deltas.is_empty() && self.clean_deltas.iter().any(|&d| d > 0.0)
+    }
 }
 
 impl Default for FuelProjection {
