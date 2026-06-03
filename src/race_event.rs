@@ -2,6 +2,15 @@ use serde::Serialize;
 
 use crate::battle_state::SlopeInfo;
 
+/// High-level scope of an emitted event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum EventScope {
+    CarScoped,
+    RigScoped,
+    SessionScoped,
+}
+
 /// Classification of a yellow flag's scope relative to the player.
 #[derive(Debug, Serialize)]
 pub enum FlagScope {
@@ -267,4 +276,16 @@ pub enum RaceEvent {
         lap:          u8,
         session_time: f32,
     },
+}
+
+impl RaceEvent {
+    pub fn event_scope(&self) -> EventScope {
+        match self {
+            Self::RaceGreen { .. }
+            | Self::RaceCheckered { .. }
+            | Self::FlagYellowFullCourse { .. } => EventScope::SessionScoped,
+            Self::PublisherHello { .. } | Self::PublisherGoodbye { .. } => EventScope::RigScoped,
+            _ => EventScope::CarScoped,
+        }
+    }
 }

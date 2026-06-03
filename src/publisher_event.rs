@@ -11,7 +11,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::race_event::{FlagScope, RaceEvent};
+use crate::race_event::{EventScope, FlagScope, RaceEvent};
 use crate::session_info::{CarRef, SessionRoster};
 use crate::telemetry_frame::TelemetryFrame;
 
@@ -34,8 +34,11 @@ pub struct PublisherEvent {
     pub session_time: f64,
     /// iRacing `SessionTick` counter.
     pub session_tick: i64,
-    /// Car identity resolved from the session roster.
-    pub car: CarRef,
+    /// High-level ownership of the event.
+    pub scope: EventScope,
+    /// Car identity resolved from the session roster for car-scoped events.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub car: Option<CarRef>,
     /// Event-specific fields (all fields of the `RaceEvent` variant except
     /// the `event_type` discriminator tag, which is hoisted to the envelope).
     pub payload: Value,
@@ -57,9 +60,10 @@ pub struct PublisherEventContext {
 
 /// Wrap a [`RaceEvent`] in a [`PublisherEvent`] envelope ready for serialisation.
 ///
-/// * `roster` — optional current session roster. When `None` or when the
-///   car slot is absent, `car` falls back to a stub containing only
-///   `carIdx` and the stringified index as `carNumber`.
+/// * `roster` — optional current session roster. Car-scoped events resolve a
+///   `car` envelope field from the roster, falling back to a stub containing
+///   only `carIdx` and the stringified index as `carNumber` when the slot is
+///   absent. Session- and rig-scoped events omit `car` entirely.
 pub fn build_event(
     race_event: &RaceEvent,
     frame: &TelemetryFrame,
@@ -81,11 +85,11 @@ pub fn build_event(
         .and_then(|m| m.remove("event_type"))
         .and_then(|v| v.as_str().map(str::to_owned))
         .unwrap_or_default();
+    let scope = race_event.event_scope();
     let mut payload = event_value;
     enrich_payload(&mut payload, race_event, frame, roster);
 
-    let car_idx = primary_car_idx(race_event, frame.player_car_idx);
-    let car = resolve_car(car_idx, roster);
+    let car = event_car(race_event, frame.player_car_idx, roster);
 
     let leader_lap = frame.car_idx_lap_completed.iter().copied().max();
     let context = Some(PublisherEventContext {
@@ -102,6 +106,7 @@ pub fn build_event(
         timestamp,
         session_time: frame.session_time as f64,
         session_tick: frame.session_tick,
+        scope,
         car,
         payload,
         context,
@@ -120,6 +125,25 @@ fn primary_car_idx(event: &RaceEvent, player_car_idx: u8) -> u8 {
         | RaceEvent::BattleBroken  { opponent_car_idx, .. }
         | RaceEvent::BattleClosing { opponent_car_idx, .. } => *opponent_car_idx,
         _ => player_car_idx,
+    }
+}
+
+fn event_car(
+    event: &RaceEvent,
+    player_car_idx: u8,
+    roster: Option<&SessionRoster>,
+) -> Option<CarRef> {
+    match event.event_scope() {
+        EventScope::SessionScoped | EventScope::RigScoped => None,
+        EventScope::CarScoped => Some(resolve_car(primary_car_idx(event, player_car_idx), roster)),
+    }
+}
+
+fn event_scope_label(scope: EventScope) -> &'static str {
+    match scope {
+        EventScope::CarScoped => "CAR_SCOPED",
+        EventScope::RigScoped => "RIG_SCOPED",
+        EventScope::SessionScoped => "SESSION_SCOPED",
     }
 }
 
@@ -151,6 +175,11 @@ fn enrich_payload(
     let Some(obj) = payload.as_object_mut() else {
         return;
     };
+
+    obj.insert(
+        "eventScope".to_owned(),
+        Value::String(event_scope_label(race_event.event_scope()).to_owned()),
+    );
 
     match race_event {
         RaceEvent::LapCompleted { lap_time_s, best_lap_time_s, .. } => {
@@ -436,11 +465,32 @@ mod tests {
     }
 
     #[test]
-    fn session_events_use_player_car_idx() {
+    fn session_events_omit_car_and_use_session_scope() {
         let event = RaceEvent::RaceGreen { lap: 1, session_time: 0.0 };
         let frame = minimal_frame(); // player_car_idx = 0
         let env = build_event(&event, &frame, None, "s", "r");
-        assert_eq!(env.car.car_idx, 0);
+        let json: Value = serde_json::to_value(&env).unwrap();
+        assert_eq!(env.scope, EventScope::SessionScoped);
+        assert!(env.car.is_none());
+        assert!(json.get("car").is_none());
+        assert_eq!(json["scope"], "SESSION_SCOPED");
+        assert_eq!(json["payload"]["eventScope"], "SESSION_SCOPED");
+    }
+
+    #[test]
+    fn publisher_lifecycle_events_use_rig_scope() {
+        let event = RaceEvent::PublisherHello {
+            lap: 1,
+            session_time: 0.0,
+            version: "0.1.0".to_owned(),
+            scope: "driver".to_owned(),
+        };
+        let env = build_event(&event, &minimal_frame(), None, "s", "r");
+        let json: Value = serde_json::to_value(&env).unwrap();
+        assert_eq!(env.scope, EventScope::RigScoped);
+        assert!(env.car.is_none());
+        assert_eq!(json["scope"], "RIG_SCOPED");
+        assert_eq!(json["payload"]["eventScope"], "RIG_SCOPED");
     }
 
     #[test]

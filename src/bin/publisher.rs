@@ -142,6 +142,7 @@ fn pipeline_main(
         engine::NarrativeEngine,
         lifecycle::LifecyclePublisher,
         publisher_event::{build_event, PublisherEvent},
+        race_event::EventScope,
         session_info::{is_ai_session, parse_sub_session_id, synthetic_sub_session_id, RosterCache, SessionMetadata},
         telemetry_frame::TelemetryFrame,
         transport::PublisherTransport,
@@ -312,18 +313,26 @@ fn pipeline_main(
                         if sub_session_id > 0 && !pending_events.is_empty() {
                             let held = std::mem::take(&mut pending_events);
                             for mut pe in held {
-                                if let Some(car) = roster_cache
-                                    .roster()
-                                    .and_then(|r| r.lookup(pe.car.car_idx))
-                                {
-                                    if !car.driver_name.is_empty() {
-                                        pe.car.driver_name = car.driver_name.clone();
-                                        transport.enqueue(pe);
-                                        status.lock().unwrap().events_enqueued_total += 1;
-                                        continue;
+                                if pe.scope == EventScope::CarScoped {
+                                    if let Some(car_ref) = pe.car.as_mut() {
+                                        if let Some(car) = roster_cache
+                                            .roster()
+                                            .and_then(|r| r.lookup(car_ref.car_idx))
+                                        {
+                                            if !car.driver_name.is_empty() {
+                                                car_ref.driver_name = car.driver_name.clone();
+                                                transport.enqueue(pe);
+                                                status.lock().unwrap().events_enqueued_total += 1;
+                                                continue;
+                                            }
+                                        }
                                     }
+                                    pending_events.push(pe); // still unresolved
+                                    continue;
                                 }
-                                pending_events.push(pe); // still unresolved
+
+                                transport.enqueue(pe);
+                                status.lock().unwrap().events_enqueued_total += 1;
                             }
                         }
 
@@ -351,7 +360,9 @@ fn pipeline_main(
                                 &race_session_id,
                                 &rig_id,
                             );
-                            if pe.car.driver_name.is_empty() {
+                            if pe.scope == EventScope::CarScoped
+                                && pe.car.as_ref().is_some_and(|car| car.driver_name.is_empty())
+                            {
                                 pending_events.push(pe);
                             } else {
                                 transport.enqueue(pe);
@@ -370,7 +381,9 @@ fn pipeline_main(
                     let pe        = build_event(event, &frame, roster, &race_session_id, &rig_id);
                     // Gate on roster: hold back events whose driverName is not yet resolved
                     // (server rejects car-scoped events with an empty driverName).
-                    if pe.car.driver_name.is_empty() {
+                    if pe.scope == EventScope::CarScoped
+                        && pe.car.as_ref().is_some_and(|car| car.driver_name.is_empty())
+                    {
                         status.lock().unwrap().push_event_log(log_entry);
                         if pending_events.len() < 64 {
                             pending_events.push(pe);
@@ -523,9 +536,9 @@ fn log_event(
     }
 
     match event {
-        RaceEvent::RaceGreen { .. }            => println!("[publisher] RACE_GREEN — lap 1 underway"),
-        RaceEvent::RaceCheckered { .. }        => println!("[publisher] RACE_CHECKERED"),
-        RaceEvent::FlagYellowFullCourse { .. } => println!("[publisher] FLAG_YELLOW_FULL_COURSE"),
+        RaceEvent::RaceGreen { .. }            => println!("[publisher] RACE_GREEN — session event, lap 1 underway"),
+        RaceEvent::RaceCheckered { .. }        => println!("[publisher] RACE_CHECKERED — session event"),
+        RaceEvent::FlagYellowFullCourse { .. } => println!("[publisher] FLAG_YELLOW_FULL_COURSE — session event"),
         RaceEvent::FlagYellowLocal { .. }      => println!("[publisher] FLAG_YELLOW_LOCAL"),
         RaceEvent::BattleEngaged { player_car_idx, opponent_car_idx, gap_s, .. } => {
             let player = car_num(roster, *player_car_idx);

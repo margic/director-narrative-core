@@ -52,7 +52,7 @@ fn assert_envelope_contract(json: &Value, expected_type: &str) {
     assert!(json["timestamp"].is_number());
     assert!(json["sessionTime"].is_number());
     assert!(json["sessionTick"].is_i64());
-    assert!(json["car"].is_object());
+    assert!(json["scope"].is_string());
     assert!(json["payload"].is_object());
     assert!(json["payload"].get("event_type").is_none());
     assert!(json["context"].is_object());
@@ -103,6 +103,8 @@ fn battle_contract_includes_leader_and_follower_numbers() {
     let json = normalized_event_json(&env);
 
     assert_envelope_contract(&json, "BATTLE_ENGAGED");
+    assert_eq!(json["scope"], "CAR_SCOPED");
+    assert!(json["car"].is_object());
     assert_eq!(json["car"]["carIdx"], 1);
     
     // Legacy fields still present for transition
@@ -139,6 +141,8 @@ fn battle_closing_contract_uses_opponent_car_as_primary_identity() {
     let json = normalized_event_json(&env);
 
     assert_envelope_contract(&json, "BATTLE_CLOSING");
+    assert_eq!(json["scope"], "CAR_SCOPED");
+    assert!(json["car"].is_object());
     assert_eq!(json["car"]["carIdx"], 1);
     assert_eq!(json["payload"]["opponent_car_idx"], 1);
     assert_eq!(json["payload"]["player_car_idx"], 0);
@@ -161,6 +165,8 @@ fn overtake_includes_overtaking_and_overtaken_cars() {
     let json = normalized_event_json(&env);
 
     assert_envelope_contract(&json, "OVERTAKE");
+    assert_eq!(json["scope"], "CAR_SCOPED");
+    assert!(json["car"].is_object());
     
     // Envelope should show player as primary car
     assert_eq!(json["car"]["carIdx"], 0);
@@ -192,6 +198,8 @@ fn overtake_can_emit_without_overtaken_car_when_uncertain() {
     let json = normalized_event_json(&env);
 
     assert_envelope_contract(&json, "OVERTAKE");
+    assert_eq!(json["scope"], "CAR_SCOPED");
+    assert!(json["car"].is_object());
     
     // Legacy position fields are still present for narration
     assert_eq!(json["payload"]["position_from"], 4);
@@ -220,6 +228,7 @@ fn overtake_for_lead_includes_both_cars() {
     let json = normalized_event_json(&env);
 
     assert_envelope_contract(&json, "OVERTAKE_FOR_LEAD");
+    assert_eq!(json["scope"], "CAR_SCOPED");
     
     // Should identify both cars
     assert!(json["payload"]["overtakingCar"].is_object());
@@ -246,6 +255,7 @@ fn battle_events_identify_both_sides_directly() {
     let json = normalized_event_json(&env);
 
     assert_envelope_contract(&json, "BATTLE_ENGAGED");
+    assert_eq!(json["scope"], "CAR_SCOPED");
     
     // Payload should include structured car references for both battle participants
     assert!(json["payload"]["leaderCar"].is_object());
@@ -547,4 +557,36 @@ fn flag_yellow_local_unknown_scope_omits_trigger_car() {
 
     // reason still present
     assert!(json["payload"]["reason"].is_string());
+}
+
+#[test]
+fn session_wide_events_not_car_scoped() {
+    let event = RaceEvent::RaceGreen {
+        lap: 1,
+        session_time: 10.0,
+    };
+
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001");
+    let json = normalized_event_json(&env);
+
+    assert_envelope_contract(&json, "RACE_GREEN");
+    assert_eq!(json["scope"], "SESSION_SCOPED");
+    assert_eq!(json["payload"]["eventScope"], "SESSION_SCOPED");
+    assert!(json.get("car").is_none());
+}
+
+#[test]
+fn session_event_envelope_does_not_include_player_car_ref() {
+    let event = RaceEvent::FlagYellowFullCourse {
+        lap: 4,
+        session_time: 200.0,
+    };
+
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001");
+    let json = normalized_event_json(&env);
+
+    assert_envelope_contract(&json, "FLAG_YELLOW_FULL_COURSE");
+    assert_eq!(json["scope"], "SESSION_SCOPED");
+    assert_eq!(json["payload"]["eventScope"], "SESSION_SCOPED");
+    assert!(json.get("car").is_none());
 }
