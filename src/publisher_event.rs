@@ -171,8 +171,8 @@ fn enrich_payload(
             obj.insert("leaderCar".to_owned(), serde_json::to_value(&leader).unwrap_or(Value::Null));
             obj.insert("followerCar".to_owned(), serde_json::to_value(&follower).unwrap_or(Value::Null));
 
-            // Gap at engagement and engagement start time (camelCase aliases)
-            obj.insert("engagementGapSec".to_owned(), json!(gap_s));
+            // Gap at engagement (sanitized) and engagement start time (camelCase aliases)
+            obj.insert("engagementGapSec".to_owned(), sanitize_sentinel_json(*gap_s));
             obj.insert("engagementStartedAtSessionTime".to_owned(), json!(engagement_started_at_session_time_s));
         }
         RaceEvent::BattleBroken { player_car_idx, opponent_car_idx, final_gap_sec, engagement_started_at_session_time_s, session_time, .. } => {
@@ -189,8 +189,8 @@ fn enrich_payload(
             obj.insert("leaderCar".to_owned(), serde_json::to_value(&leader).unwrap_or(Value::Null));
             obj.insert("followerCar".to_owned(), serde_json::to_value(&follower).unwrap_or(Value::Null));
 
-            // Final gap and computed engagement duration (camelCase aliases)
-            obj.insert("finalGapSec".to_owned(), json!(final_gap_sec));
+            // Final gap (None when the gap was a sentinel / car no longer visible)
+            obj.insert("finalGapSec".to_owned(), option_f32_json(*final_gap_sec));
             let duration = (session_time - engagement_started_at_session_time_s).max(0.0);
             obj.insert("engagementDurationSec".to_owned(), json!(duration));
         }
@@ -238,6 +238,19 @@ fn option_f32_json(v: Option<f32>) -> Value {
     match v {
         Some(n) => json!(n),
         None => Value::Null,
+    }
+}
+
+/// Convert a raw f32 telemetry value to JSON, mapping sentinel values
+/// (NaN, Infinite, or unreasonably large values such as f32::MAX) to `null`.
+fn sanitize_sentinel_json(v: f32) -> Value {
+    if v.is_nan() || v.is_infinite() || v >= 1e30 {
+        if cfg!(debug_assertions) {
+            eprintln!("[publisher] sentinel value detected in telemetry: {v}");
+        }
+        Value::Null
+    } else {
+        json!(v)
     }
 }
 

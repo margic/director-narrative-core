@@ -245,7 +245,7 @@ impl NarrativeEngine {
                 if current_idx != self.tracking_car {
                     if let Some(prev_car) = self.tracking_car {
                         if self.engaged_cars.remove(&prev_car) {
-                            let final_gap_sec = other.map(|(_, g)| g).unwrap_or(f32::MAX);
+                            let final_gap_sec = other.and_then(|(_, g)| sanitize_gap(g));
                             let car_race_position = frame.car_idx_position.get(prev_car as usize).copied().unwrap_or(0);
                             let engagement_started_at_session_time_s = self.engagement_start_t.unwrap_or(t);
                             events.push(RaceEvent::BattleBroken { 
@@ -297,7 +297,7 @@ impl NarrativeEngine {
                 if current_idx != self.tracking_car_beh {
                     if let Some(prev_car) = self.tracking_car_beh {
                         if self.engaged_cars_beh.remove(&prev_car) {
-                            let final_gap_sec = other.map(|(_, g)| g).unwrap_or(f32::MAX);
+                            let final_gap_sec = other.and_then(|(_, g)| sanitize_gap(g));
                             let car_race_position = frame.car_idx_position.get(prev_car as usize).copied().unwrap_or(0);
                             let engagement_started_at_session_time_s = self.engagement_start_beh_t.unwrap_or(t);
                             events.push(RaceEvent::BattleBroken { 
@@ -461,7 +461,9 @@ impl NarrativeEngine {
                 let clean_lap = !self.pit_laps.contains(&done_lap) && !self.dirty_laps.contains(&done_lap);
                 events.extend(self.micro_sector.on_lap_end(done_lap, t, clean_lap));
                 if let Some(event) = self.tire_degradation.on_lap_crossing(done_lap, t, self.pit_laps.contains(&done_lap)) {
-                    events.push(event);
+                    if self.tire_degradation.has_valid_data() {
+                        events.push(event);
+                    }
                 }
                 if let Some(event) = self.fuel_projection.on_lap_crossing(
                     done_lap,
@@ -470,7 +472,9 @@ impl NarrativeEngine {
                     self.pit_laps.contains(&done_lap),
                     self.dirty_laps.contains(&done_lap),
                 ) {
-                    events.push(event);
+                    if self.fuel_projection.has_valid_data() {
+                        events.push(event);
+                    }
                 }
                 events.extend(self.horizon.detect(
                     &self.car_registry,
@@ -592,6 +596,16 @@ fn synthesize_flags(lap: u8, ldp: f32) -> u32 {
 fn valid_lap_time(v: f32) -> Option<f32> {
     // Guard against zero/negative/NaN artifacts observed in replay and reset edges.
     (v.is_finite() && v > 0.1).then_some(v)
+}
+
+/// Sanitize a gap value: return `None` if it is a sentinel (f32::MAX, NaN, or infinite)
+/// or unreasonably large (>= 100 s). Real race gaps are bounded by MAX_BATTLE_GAP_S.
+fn sanitize_gap(v: f32) -> Option<f32> {
+    if v.is_nan() || v.is_infinite() || v >= 100.0 {
+        None
+    } else {
+        Some(v)
+    }
 }
 
 #[cfg(test)]

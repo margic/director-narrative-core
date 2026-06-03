@@ -22,7 +22,7 @@ pub enum RaceEvent {
         session_time:                      f32,
         player_car_idx:                    u8,
         opponent_car_idx:                  u8,
-        final_gap_sec:                     f32,
+        final_gap_sec:                     Option<f32>,
         car_race_position:                 u8,
         engagement_started_at_session_time_s: f32,
     },
