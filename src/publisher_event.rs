@@ -265,9 +265,10 @@ fn enrich_payload(
                 let trigger_car = resolve_car(*idx, roster);
                 obj.insert("triggerCar".to_owned(), serde_json::to_value(&trigger_car).unwrap_or(Value::Null));
             }
-            // Format track location as a human-readable percentage string.
-            if let Some(pct) = lap_dist_pct {
-                obj.insert("trackLocationPct".to_owned(), Value::String(format!("{:.1}%", pct * 100.0)));
+            // Format track location as a human-readable percentage string, reused in the reason below.
+            let location_pct_str = lap_dist_pct.map(|p| format!("{:.1}%", p * 100.0));
+            if let Some(ref s) = location_pct_str {
+                obj.insert("trackLocationPct".to_owned(), Value::String(s.clone()));
             }
             // Flag scope as a string matching the FlagScope enum variant name.
             let scope_str = match scope {
@@ -281,9 +282,7 @@ fn enrich_payload(
             let reason = match scope {
                 FlagScope::SelfCaused  => "Incident caused by player".to_owned(),
                 FlagScope::Nearby      => {
-                    let loc = lap_dist_pct
-                        .map(|p| format!("{:.1}%", p * 100.0))
-                        .unwrap_or_else(|| "unknown location".to_owned());
+                    let loc = location_pct_str.as_deref().unwrap_or("unknown location");
                     format!("Incident nearby at {loc}")
                 }
                 FlagScope::SessionWide => "Session-wide caution".to_owned(),

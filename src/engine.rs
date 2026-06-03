@@ -181,6 +181,8 @@ impl NarrativeEngine {
                 let dist = raw_dist.min(1.0 - raw_dist);
                 if dist < best_dist {
                     best_dist = dist;
+                    // Use the lowest car index as the primary trigger when incident
+                    // damage data is unavailable — consistent with IncidentClusterDetector.
                     best_primary = cars.iter().copied().min();
                     best_bucket = Some(bucket);
                 }

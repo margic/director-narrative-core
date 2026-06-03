@@ -4,7 +4,6 @@ use crate::battle_state::SlopeInfo;
 
 /// Classification of a yellow flag's scope relative to the player.
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum FlagScope {
     /// The player's own actions caused the yellow condition.
     SelfCaused,
