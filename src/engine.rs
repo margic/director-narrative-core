@@ -42,6 +42,9 @@ pub struct NarrativeEngine {
     pit_laps: HashSet<u8>,
     dirty_laps: HashSet<u8>,
     lap_end_positions: HashMap<u8, u8>,
+    /// Track position-to-car mappings at lap boundaries for overtake detection.
+    /// Key is lap number, value is Vec<car_idx> indexed by position (position - 1).
+    lap_car_positions: HashMap<u8, Vec<u8>>,
     lap_pit_frames: HashMap<u8, u32>,
     best_lap_time_s: Option<f32>,
     engaged_cars: HashSet<u8>,
@@ -89,6 +92,7 @@ impl NarrativeEngine {
             pit_laps: HashSet::new(),
             dirty_laps: HashSet::new(),
             lap_end_positions: HashMap::new(),
+            lap_car_positions: HashMap::new(),
             lap_pit_frames: HashMap::new(),
             best_lap_time_s: None,
             engaged_cars: HashSet::new(),
@@ -160,6 +164,12 @@ impl NarrativeEngine {
         self.prev_session_state = session_state;
         self.prev_session_flags = session_flags;
 
+        // Record car positions every frame so we have accurate position history
+        // (even for lap 0/formation lap, as we need this for overtake detection)
+        if pos > 0 {
+            self.record_lap_car_positions(lap, frame);
+        }
+
         if pos == 0 || lap < 1 {
             self.prev_lap = Some(lap);
             self.prev_on_pit = on_pit;
@@ -194,9 +204,9 @@ impl NarrativeEngine {
         let nearest_behind = cars_behind.first().copied();
 
         if on_pit && !self.prev_on_pit {
-            events.push(RaceEvent::PitEntry { lap, session_time: t, position: pos });
+            events.push(RaceEvent::PitEntry { lap, session_time: t, player_car_idx: frame.player_car_idx, position: pos });
         } else if !on_pit && self.prev_on_pit {
-            events.push(RaceEvent::PitExit { lap, session_time: t, position: pos });
+            events.push(RaceEvent::PitExit { lap, session_time: t, player_car_idx: frame.player_car_idx, position: pos });
         }
 
         match nearest_ahead {
@@ -214,7 +224,8 @@ impl NarrativeEngine {
                     events.push(RaceEvent::BattleEngaged {
                         lap,
                         session_time: t,
-                        car_idx,
+                        player_car_idx: frame.player_car_idx,
+                        opponent_car_idx: car_idx,
                         gap_s: gap,
                         car_race_position,
                         prior_skirmishes,
@@ -229,7 +240,15 @@ impl NarrativeEngine {
                     if let Some(prev_car) = self.tracking_car {
                         if self.engaged_cars.remove(&prev_car) {
                             let gap_s = other.map(|(_, g)| g).unwrap_or(f32::MAX);
-                            events.push(RaceEvent::BattleBroken { lap, session_time: t, car_idx: prev_car, gap_s });
+                            let car_race_position = frame.car_idx_position.get(prev_car as usize).copied().unwrap_or(0);
+                            events.push(RaceEvent::BattleBroken { 
+                                lap, 
+                                session_time: t, 
+                                player_car_idx: frame.player_car_idx,
+                                opponent_car_idx: prev_car, 
+                                gap_s,
+                                car_race_position,
+                            });
                         }
                     }
                     self.tracking_car = None;
@@ -252,7 +271,8 @@ impl NarrativeEngine {
                     events.push(RaceEvent::BattleEngaged {
                         lap,
                         session_time: t,
-                        car_idx,
+                        player_car_idx: frame.player_car_idx,
+                        opponent_car_idx: car_idx,
                         gap_s: gap,
                         car_race_position,
                         prior_skirmishes,
@@ -267,7 +287,15 @@ impl NarrativeEngine {
                     if let Some(prev_car) = self.tracking_car_beh {
                         if self.engaged_cars_beh.remove(&prev_car) {
                             let gap_s = other.map(|(_, g)| g).unwrap_or(f32::MAX);
-                            events.push(RaceEvent::BattleBroken { lap, session_time: t, car_idx: prev_car, gap_s });
+                            let car_race_position = frame.car_idx_position.get(prev_car as usize).copied().unwrap_or(0);
+                            events.push(RaceEvent::BattleBroken { 
+                                lap, 
+                                session_time: t, 
+                                player_car_idx: frame.player_car_idx,
+                                opponent_car_idx: prev_car, 
+                                gap_s,
+                                car_race_position,
+                            });
                         }
                     }
                     self.tracking_car_beh = None;
@@ -295,6 +323,7 @@ impl NarrativeEngine {
                 events.push(RaceEvent::LapCompleted {
                     lap: done_lap,
                     session_time: t,
+                    player_car_idx: frame.player_car_idx,
                     lap_time_s,
                     best_lap_time_s: self.best_lap_time_s,
                     position: end_pos,
@@ -304,11 +333,13 @@ impl NarrativeEngine {
                 if let Some(&prev_pos) = self.lap_end_positions.get(&done_lap.wrapping_sub(1)) {
                     let delta = prev_pos as i16 - end_pos as i16;
                     if delta > 0 && !self.pit_laps.contains(&done_lap) {
+                        let overtaken_car_idx = self.find_overtaken_car(done_lap.wrapping_sub(1), prev_pos, end_pos);
                         if end_pos == 1 {
                             events.push(RaceEvent::OvertakeForLead {
                                 lap: done_lap,
                                 session_time: t,
                                 car_idx: frame.player_car_idx,
+                                overtaken_car_idx,
                                 position_from: prev_pos,
                                 positions_gained: delta as u8,
                             });
@@ -317,6 +348,7 @@ impl NarrativeEngine {
                                 lap: done_lap,
                                 session_time: t,
                                 car_idx: frame.player_car_idx,
+                                overtaken_car_idx,
                                 position_from: prev_pos,
                                 position_to: end_pos,
                                 positions_gained: delta as u8,
@@ -342,7 +374,9 @@ impl NarrativeEngine {
                             events.push(RaceEvent::BattleClosing {
                                 lap: done_lap,
                                 session_time: t,
-                                car_idx,
+                                player_car_idx: frame.player_car_idx,
+                                opponent_car_idx: car_idx,
+                                car_race_position: frame.car_idx_position.get(car_idx as usize).copied().unwrap_or(0),
                                 closing_rate_sec_per_lap: si.median_slope.abs(),
                                 slope_info: si,
                                 prior_skirmishes,
@@ -382,7 +416,9 @@ impl NarrativeEngine {
                             events.push(RaceEvent::BattleClosing {
                                 lap: done_lap,
                                 session_time: t,
-                                car_idx,
+                                player_car_idx: frame.player_car_idx,
+                                opponent_car_idx: car_idx,
+                                car_race_position: frame.car_idx_position.get(car_idx as usize).copied().unwrap_or(0),
                                 closing_rate_sec_per_lap: si.median_slope.abs(),
                                 slope_info: si,
                                 prior_skirmishes,
@@ -457,6 +493,7 @@ impl NarrativeEngine {
                         def.slope_info.as_ref().map(|s| s.median_slope).unwrap_or(0.0),
                         nearest_behind.map(|(_, gap)| gap).unwrap_or(99.0),
                         self.fuel_projection.laps_remaining().unwrap_or(99.0),
+                        frame.player_car_idx,
                         attacker_idx,
                         done_lap,
                         t,
@@ -468,6 +505,7 @@ impl NarrativeEngine {
                         0.0,
                         99.0,
                         self.fuel_projection.laps_remaining().unwrap_or(99.0),
+                        frame.player_car_idx,
                         0,
                         done_lap,
                         t,
@@ -492,6 +530,39 @@ impl NarrativeEngine {
             .and_then(|car| car.opponent_history.iter().find(|history| history.car_idx == opponent_idx))
             .map(|history| (history.skirmish_count, history.time_in_attack_s))
             .unwrap_or((0, 0.0))
+    }
+
+    /// Record the current car positions from the frame at a lap boundary.
+    fn record_lap_car_positions(&mut self, lap: u8, frame: &TelemetryFrame) {
+        let mut positions = vec![u8::MAX; 64]; // Initialize with sentinel values
+        for (car_idx, &pos) in frame.car_idx_position.iter().enumerate() {
+            if pos > 0 && (car_idx as u8) < 64 {
+                let position_idx = (pos as usize).saturating_sub(1);
+                if position_idx < positions.len() {
+                    positions[position_idx] = car_idx as u8;
+                }
+            }
+        }
+        self.lap_car_positions.insert(lap, positions);
+    }
+
+    /// Find which car was likely overtaken based on position history.
+    /// Returns Some(car_idx) if we can confidently identify the overtaken car,
+    /// or None if we cannot determine it reliably.
+    fn find_overtaken_car(&self, prev_lap: u8, _position_from: u8, position_to: u8) -> Option<u8> {
+        // Look up the previous lap's position mapping
+        let prev_positions = self.lap_car_positions.get(&prev_lap)?;
+        
+        // Check if there's a car recorded at the position_to (where we moved to)
+        let pos_idx = (position_to as usize).saturating_sub(1);
+        if pos_idx < prev_positions.len() {
+            let car_at_prev_pos = prev_positions[pos_idx];
+            // Only return valid car indices (not our sentinel)
+            if car_at_prev_pos != u8::MAX {
+                return Some(car_at_prev_pos);
+            }
+        }
+        None
     }
 }
 
@@ -580,7 +651,7 @@ mod tests {
         for i in 0..6u8 {
             all_events.extend(engine.process_frame(&frame_with_gap(1, i as f32, 4, 0.501)));
         }
-        assert!(all_events.iter().any(|e| matches!(e, RaceEvent::BattleEngaged { lap: 1, car_idx: 1, .. })));
+        assert!(all_events.iter().any(|e| matches!(e, RaceEvent::BattleEngaged { lap: 1, opponent_car_idx: 1, .. })));
     }
 
     #[test]
@@ -590,9 +661,9 @@ mod tests {
         for i in 0..6u8 {
             all_events.extend(engine.process_frame(&frame_with_gap(1, i as f32, 4, 0.501)));
         }
-        assert!(all_events.iter().any(|e| matches!(e, RaceEvent::BattleEngaged { car_idx: 1, .. })));
+        assert!(all_events.iter().any(|e| matches!(e, RaceEvent::BattleEngaged { opponent_car_idx: 1, .. })));
         let evs = engine.process_frame(&frame_no_opponent(1, 6.0));
-        assert!(evs.iter().any(|e| matches!(e, RaceEvent::BattleBroken { car_idx: 1, .. })));
+        assert!(evs.iter().any(|e| matches!(e, RaceEvent::BattleBroken { opponent_car_idx: 1, .. })));
     }
 
     #[test]
@@ -640,5 +711,44 @@ mod tests {
         assert_eq!(done_lap, 2);
         assert_eq!(lap_time_s, Some(153.9));
         assert_eq!(best_lap_time_s, Some(152.1));
+    }
+
+    #[test]
+    fn battle_engaged_includes_both_player_and_opponent() {
+        let mut engine = NarrativeEngine::new(10);
+        let mut all_events = Vec::new();
+        for i in 0..6u8 {
+            all_events.extend(engine.process_frame(&frame_with_gap(1, i as f32, 4, 0.501)));
+        }
+        
+        let battle = all_events.iter().find_map(|e| {
+            if let RaceEvent::BattleEngaged { player_car_idx, opponent_car_idx, .. } = e {
+                Some((*player_car_idx, *opponent_car_idx))
+            } else {
+                None
+            }
+        });
+
+        assert_eq!(battle, Some((0, 1)), "should include both player and opponent car indices");
+    }
+
+    #[test]
+    fn battle_broken_includes_both_cars() {
+        let mut engine = NarrativeEngine::new(10);
+        let mut all_events = Vec::new();
+        for i in 0..6u8 {
+            all_events.extend(engine.process_frame(&frame_with_gap(1, i as f32, 4, 0.501)));
+        }
+        let evs = engine.process_frame(&frame_no_opponent(1, 6.0));
+
+        let battle_broken = evs.iter().find_map(|e| {
+            if let RaceEvent::BattleBroken { player_car_idx, opponent_car_idx, .. } = e {
+                Some((*player_car_idx, *opponent_car_idx))
+            } else {
+                None
+            }
+        });
+
+        assert_eq!(battle_broken, Some((0, 1)), "should include both player and opponent car indices");
     }
 }

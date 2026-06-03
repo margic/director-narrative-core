@@ -24,6 +24,9 @@ target
 .venv/
 .vscode/
 
+**/__pycache__/
+*.pyc
+
 # napi compiled native addon
 *.node
 

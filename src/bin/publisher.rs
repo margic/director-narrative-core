@@ -530,26 +530,28 @@ fn log_event(
         RaceEvent::RaceCheckered { .. }        => println!("[publisher] RACE_CHECKERED"),
         RaceEvent::FlagYellowFullCourse { .. } => println!("[publisher] FLAG_YELLOW_FULL_COURSE"),
         RaceEvent::FlagYellowLocal { .. }      => println!("[publisher] FLAG_YELLOW_LOCAL"),
-        RaceEvent::BattleEngaged { car_idx, gap_s, .. } => {
-            let player = car_num(roster, frame.player_car_idx);
-            let opp    = car_num(roster, *car_idx);
+        RaceEvent::BattleEngaged { player_car_idx, opponent_car_idx, gap_s, .. } => {
+            let player = car_num(roster, *player_car_idx);
+            let opp    = car_num(roster, *opponent_car_idx);
             println!("[publisher] BATTLE_ENGAGED — #{player} vs #{opp}, gap {gap_s:.1}s");
         }
-        RaceEvent::BattleClosing { car_idx, closing_rate_sec_per_lap, .. } => {
-            let player = car_num(roster, frame.player_car_idx);
-            let opp    = car_num(roster, *car_idx);
+        RaceEvent::BattleClosing { player_car_idx, opponent_car_idx, closing_rate_sec_per_lap, .. } => {
+            let player = car_num(roster, *player_car_idx);
+            let opp    = car_num(roster, *opponent_car_idx);
             println!(
                 "[publisher] BATTLE_CLOSING — #{player} vs #{opp}, \
                  closing {closing_rate_sec_per_lap:.1}s/lap"
             );
         }
-        RaceEvent::Overtake { position_to, .. } => {
-            let player = car_num(roster, frame.player_car_idx);
-            println!("[publisher] OVERTAKE — #{player} P{position_to}");
+        RaceEvent::Overtake { car_idx, overtaken_car_idx, position_to, .. } => {
+            let player = car_num(roster, *car_idx);
+            let overtaken = overtaken_car_idx.map(|idx| car_num(roster, idx)).unwrap_or_else(|| "?".to_string());
+            println!("[publisher] OVERTAKE — #{player} passed #{overtaken} to P{position_to}");
         }
-        RaceEvent::OvertakeForLead { .. } => {
-            let player = car_num(roster, frame.player_car_idx);
-            println!("[publisher] OVERTAKE_FOR_LEAD — #{player} leads");
+        RaceEvent::OvertakeForLead { car_idx, overtaken_car_idx, .. } => {
+            let player = car_num(roster, *car_idx);
+            let overtaken = overtaken_car_idx.map(|idx| car_num(roster, idx)).unwrap_or_else(|| "?".to_string());
+            println!("[publisher] OVERTAKE_FOR_LEAD — #{player} passed #{overtaken}");
         }
         _ => {}
     }

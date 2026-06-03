@@ -116,9 +116,9 @@ pub fn build_event(
 /// (session, flag, lap, position) are keyed on the player's own car.
 fn primary_car_idx(event: &RaceEvent, player_car_idx: u8) -> u8 {
     match event {
-        RaceEvent::BattleEngaged  { car_idx, .. }
-        | RaceEvent::BattleBroken  { car_idx, .. }
-        | RaceEvent::BattleClosing { car_idx, .. } => *car_idx,
+        RaceEvent::BattleEngaged  { opponent_car_idx, .. }
+        | RaceEvent::BattleBroken  { opponent_car_idx, .. }
+        | RaceEvent::BattleClosing { opponent_car_idx, .. } => *opponent_car_idx,
         _ => player_car_idx,
     }
 }
@@ -157,15 +157,43 @@ fn enrich_payload(
             obj.insert("lapTime".to_owned(), option_f32_json(*lap_time_s));
             obj.insert("bestLapTime".to_owned(), option_f32_json(*best_lap_time_s));
         }
-        RaceEvent::BattleEngaged { car_idx, .. }
-        | RaceEvent::BattleBroken { car_idx, .. }
-        | RaceEvent::BattleClosing { car_idx, .. } => {
+        RaceEvent::BattleEngaged { player_car_idx, opponent_car_idx, .. }
+        | RaceEvent::BattleBroken { player_car_idx, opponent_car_idx, .. }
+        | RaceEvent::BattleClosing { player_car_idx, opponent_car_idx, .. } => {
             let (leader_idx, follower_idx) =
-                leader_follower_indices(frame, frame.player_car_idx, *car_idx);
+                leader_follower_indices(frame, *player_car_idx, *opponent_car_idx);
             let leader = resolve_car(leader_idx, roster);
             let follower = resolve_car(follower_idx, roster);
-            obj.insert("leaderCarNumber".to_owned(), Value::String(leader.car_number));
-            obj.insert("followerCarNumber".to_owned(), Value::String(follower.car_number));
+            
+            // Legacy fields for transition window
+            obj.insert("leaderCarNumber".to_owned(), Value::String(leader.car_number.clone()));
+            obj.insert("followerCarNumber".to_owned(), Value::String(follower.car_number.clone()));
+            
+            // New structured car references (primary source of truth)
+            obj.insert("leaderCar".to_owned(), serde_json::to_value(&leader).unwrap_or(Value::Null));
+            obj.insert("followerCar".to_owned(), serde_json::to_value(&follower).unwrap_or(Value::Null));
+        }
+        RaceEvent::Overtake { car_idx, overtaken_car_idx, .. } => {
+            let overtaking_car = resolve_car(*car_idx, roster);
+            
+            // New structured car references (primary source of truth)
+            obj.insert("overtakingCar".to_owned(), serde_json::to_value(&overtaking_car).unwrap_or(Value::Null));
+            
+            if let Some(overtaken_idx) = overtaken_car_idx {
+                let overtaken_car = resolve_car(*overtaken_idx, roster);
+                obj.insert("overtakenCar".to_owned(), serde_json::to_value(&overtaken_car).unwrap_or(Value::Null));
+            }
+        }
+        RaceEvent::OvertakeForLead { car_idx, overtaken_car_idx, .. } => {
+            let overtaking_car = resolve_car(*car_idx, roster);
+            
+            // New structured car references (primary source of truth)
+            obj.insert("overtakingCar".to_owned(), serde_json::to_value(&overtaking_car).unwrap_or(Value::Null));
+            
+            if let Some(overtaken_idx) = overtaken_car_idx {
+                let overtaken_car = resolve_car(*overtaken_idx, roster);
+                obj.insert("overtakenCar".to_owned(), serde_json::to_value(&overtaken_car).unwrap_or(Value::Null));
+            }
         }
         _ => {}
     }
@@ -241,7 +269,9 @@ mod tests {
         let event = RaceEvent::BattleClosing {
             lap: 4,
             session_time: 1234.5,
-            car_idx: 1,
+            player_car_idx: 0,
+            opponent_car_idx: 1,
+            car_race_position: 3,
             closing_rate_sec_per_lap: 0.43,
             slope_info: SlopeInfo {
                 median_slope: -0.43,
@@ -271,7 +301,8 @@ mod tests {
         // Payload contains event-specific fields (field names are snake_case)
         let rate = json["payload"]["closing_rate_sec_per_lap"].as_f64().unwrap_or(0.0);
         assert!((rate - 0.43).abs() < 1e-4, "expected ~0.43, got {rate}");
-        assert_eq!(json["payload"]["car_idx"], 1);
+        assert_eq!(json["payload"]["opponent_car_idx"], 1);
+        assert_eq!(json["payload"]["player_car_idx"], 0);
         assert_eq!(json["payload"]["lap"], 4);
         assert!(json["payload"].get("event_type").is_none(),
             "event_type should be hoisted out of payload");
@@ -304,7 +335,8 @@ mod tests {
         let event = RaceEvent::BattleEngaged {
             lap: 2,
             session_time: 12.0,
-            car_idx: 1,
+            player_car_idx: 0,
+            opponent_car_idx: 1,
             gap_s: 0.4,
             car_race_position: 4,
             prior_skirmishes: 0,
@@ -321,8 +353,7 @@ mod tests {
     fn lap_completed_payload_includes_camel_case_aliases() {
         let event = RaceEvent::LapCompleted {
             lap: 2,
-            session_time: 99.0,
-            lap_time_s: Some(88.2),
+            session_time: 99.0,            player_car_idx: 0,            lap_time_s: Some(88.2),
             best_lap_time_s: Some(87.9),
             position: 5,
             pit_frames: 0,

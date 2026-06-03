@@ -63,6 +63,7 @@ fn lap_completed_contract_includes_aliases_and_snake_case_fields() {
     let event = RaceEvent::LapCompleted {
         lap: 2,
         session_time: 99.0,
+        player_car_idx: 0,
         lap_time_s: Some(88.2),
         best_lap_time_s: Some(87.9),
         position: 5,
@@ -89,7 +90,8 @@ fn battle_contract_includes_leader_and_follower_numbers() {
     let event = RaceEvent::BattleEngaged {
         lap: 2,
         session_time: 12.0,
-        car_idx: 1,
+        player_car_idx: 0,
+        opponent_car_idx: 1,
         gap_s: 0.4,
         car_race_position: 4,
         prior_skirmishes: 0,
@@ -101,8 +103,16 @@ fn battle_contract_includes_leader_and_follower_numbers() {
 
     assert_envelope_contract(&json, "BATTLE_ENGAGED");
     assert_eq!(json["car"]["carIdx"], 1);
+    
+    // Legacy fields still present for transition
     assert_eq!(json["payload"]["leaderCarNumber"], "1");
     assert_eq!(json["payload"]["followerCarNumber"], "0");
+    
+    // New structured car references (primary source of truth)
+    assert!(json["payload"]["leaderCar"].is_object());
+    assert!(json["payload"]["followerCar"].is_object());
+    assert_eq!(json["payload"]["leaderCar"]["carIdx"], 1);
+    assert_eq!(json["payload"]["followerCar"]["carIdx"], 0);
 }
 
 #[test]
@@ -110,7 +120,9 @@ fn battle_closing_contract_uses_opponent_car_as_primary_identity() {
     let event = RaceEvent::BattleClosing {
         lap: 4,
         session_time: 1234.5,
-        car_idx: 1,
+        player_car_idx: 0,
+        opponent_car_idx: 1,
+        car_race_position: 3,
         closing_rate_sec_per_lap: 0.43,
         slope_info: SlopeInfo {
             median_slope: -0.43,
@@ -127,6 +139,121 @@ fn battle_closing_contract_uses_opponent_car_as_primary_identity() {
 
     assert_envelope_contract(&json, "BATTLE_CLOSING");
     assert_eq!(json["car"]["carIdx"], 1);
-    assert_eq!(json["payload"]["car_idx"], 1);
+    assert_eq!(json["payload"]["opponent_car_idx"], 1);
+    assert_eq!(json["payload"]["player_car_idx"], 0);
     assert_eq!(json["context"]["leaderLap"], 3);
+}
+
+#[test]
+fn overtake_includes_overtaking_and_overtaken_cars() {
+    let event = RaceEvent::Overtake {
+        lap: 3,
+        session_time: 125.0,
+        car_idx: 0,
+        overtaken_car_idx: Some(2),
+        position_from: 4,
+        position_to: 3,
+        positions_gained: 1,
+    };
+
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001");
+    let json = normalized_event_json(&env);
+
+    assert_envelope_contract(&json, "OVERTAKE");
+    
+    // Envelope should show player as primary car
+    assert_eq!(json["car"]["carIdx"], 0);
+    
+    // Payload should include structured car references (primary source of truth)
+    assert!(json["payload"]["overtakingCar"].is_object());
+    assert!(json["payload"]["overtakenCar"].is_object());
+    assert_eq!(json["payload"]["overtakingCar"]["carIdx"], 0);
+    assert_eq!(json["payload"]["overtakenCar"]["carIdx"], 2);
+    
+    // Legacy position fields still present
+    assert_eq!(json["payload"]["position_from"], 4);
+    assert_eq!(json["payload"]["position_to"], 3);
+}
+
+#[test]
+fn overtake_can_emit_without_overtaken_car_when_uncertain() {
+    let event = RaceEvent::Overtake {
+        lap: 3,
+        session_time: 125.0,
+        car_idx: 0,
+        overtaken_car_idx: None,
+        position_from: 4,
+        position_to: 3,
+        positions_gained: 1,
+    };
+
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001");
+    let json = normalized_event_json(&env);
+
+    assert_envelope_contract(&json, "OVERTAKE");
+    
+    // Legacy position fields are still present for narration
+    assert_eq!(json["payload"]["position_from"], 4);
+    assert_eq!(json["payload"]["position_to"], 3);
+    
+    // Overtaking car should still be identified
+    assert!(json["payload"]["overtakingCar"].is_object());
+    assert_eq!(json["payload"]["overtakingCar"]["carIdx"], 0);
+    
+    // Overtaken car should be null when not determined
+    assert_eq!(json["payload"]["overtakenCar"], Value::Null);
+}
+
+#[test]
+fn overtake_for_lead_includes_both_cars() {
+    let event = RaceEvent::OvertakeForLead {
+        lap: 5,
+        session_time: 234.0,
+        car_idx: 0,
+        overtaken_car_idx: Some(1),
+        position_from: 2,
+        positions_gained: 1,
+    };
+
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001");
+    let json = normalized_event_json(&env);
+
+    assert_envelope_contract(&json, "OVERTAKE_FOR_LEAD");
+    
+    // Should identify both cars
+    assert!(json["payload"]["overtakingCar"].is_object());
+    assert!(json["payload"]["overtakenCar"].is_object());
+    assert_eq!(json["payload"]["overtakingCar"]["carIdx"], 0);
+    assert_eq!(json["payload"]["overtakenCar"]["carIdx"], 1);
+}
+
+#[test]
+fn battle_events_identify_both_sides_directly() {
+    let event = RaceEvent::BattleEngaged {
+        lap: 2,
+        session_time: 50.0,
+        player_car_idx: 0,
+        opponent_car_idx: 3,
+        gap_s: 0.35,
+        car_race_position: 5,
+        prior_skirmishes: 1,
+        prior_attack_time_s: 12.5,
+    };
+
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001");
+    let json = normalized_event_json(&env);
+
+    assert_envelope_contract(&json, "BATTLE_ENGAGED");
+    
+    // Payload should include structured car references for both battle participants
+    assert!(json["payload"]["leaderCar"].is_object());
+    assert!(json["payload"]["followerCar"].is_object());
+    
+    // Can determine who was where without heuristics
+    let leader_idx = json["payload"]["leaderCar"]["carIdx"].as_i64().unwrap_or(0) as u8;
+    let follower_idx = json["payload"]["followerCar"]["carIdx"].as_i64().unwrap_or(0) as u8;
+    
+    // Leader and follower should be different cars
+    assert_ne!(leader_idx, follower_idx);
+    assert!((leader_idx == 0 && follower_idx == 3) || (leader_idx == 3 && follower_idx == 0));
 }

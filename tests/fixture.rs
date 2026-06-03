@@ -25,8 +25,8 @@ fn load_fixture() -> Vec<TelemetryFrame> {
 fn lap3_push_car7() {
     let frames = load_fixture();
     let events = replay_frames(&frames);
-    let battle_closing = events.iter().find(|e| matches!(e, RaceEvent::BattleClosing { car_idx: 7, .. }));
-    assert!(battle_closing.is_some(), "expected a BATTLE_CLOSING event for car_idx=7");
+    let battle_closing = events.iter().find(|e| matches!(e, RaceEvent::BattleClosing { opponent_car_idx: 7, .. }));
+    assert!(battle_closing.is_some(), "expected a BATTLE_CLOSING event for opponent_car_idx=7");
     if let Some(RaceEvent::BattleClosing { lap, slope_info, .. }) = battle_closing {
         assert_eq!(*lap, 3, "BATTLE_CLOSING should first be emitted at lap 3, got lap {lap}");
         assert!((slope_info.median_slope - (-0.4998)).abs() < 0.01);
@@ -39,9 +39,9 @@ fn lap4_attack_setup_car7() {
     let events = replay_frames(&frames);
     let attack = events
         .iter()
-        .filter(|e| matches!(e, RaceEvent::BattleClosing { car_idx: 7, .. }))
+        .filter(|e| matches!(e, RaceEvent::BattleClosing { opponent_car_idx: 7, .. }))
         .nth(1);
-    assert!(attack.is_some(), "expected a second BATTLE_CLOSING event for car_idx=7");
+    assert!(attack.is_some(), "expected a second BATTLE_CLOSING event for opponent_car_idx=7");
     if let Some(RaceEvent::BattleClosing { lap, slope_info, .. }) = attack {
         assert_eq!(*lap, 4);
         assert!((slope_info.median_slope - (-0.5999)).abs() < 0.01);
@@ -52,7 +52,7 @@ fn lap4_attack_setup_car7() {
 fn close_approach_car7() {
     let frames = load_fixture();
     let events = replay_frames(&frames);
-    let close = events.iter().find(|e| matches!(e, RaceEvent::BattleEngaged { car_idx: 7, .. }));
+    let close = events.iter().find(|e| matches!(e, RaceEvent::BattleEngaged { opponent_car_idx: 7, .. }));
     assert!(close.is_some());
     if let Some(RaceEvent::BattleEngaged { lap, gap_s, .. }) = close {
         assert!(*lap >= 5 && *lap <= 7);
