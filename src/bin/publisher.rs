@@ -152,18 +152,9 @@ fn pipeline_main(
         .map(|n| format!("rig-{}", n.to_lowercase()))
         .unwrap_or_else(|_| "rig-unknown".to_string());
 
-    // ── Wait for iRacing ──────────────────────────────────────────────────
+    // ── Initialise transport + auth warmup ───────────────────────────────
 
-    println!("[publisher] waiting for iRacing...");
-    let mut reader = match connect_loop(&running) {
-        Some(r) => r,
-        None => return,
-    };
-
-    // ── Initialise components ─────────────────────────────────────────────
-
-    let mut engine      = NarrativeEngine::new(10);
-    let mut transport   = PublisherTransport::new(
+    let mut transport = PublisherTransport::new(
         &cfg.auth.tenant_id,
         &cfg.auth.client_id,
         &cfg.auth.client_secret,
@@ -175,10 +166,41 @@ fn pipeline_main(
     if dry_run {
         println!("[publisher] dry-run mode — payloads will be printed to stdout and still sent");
     }
+    // Warm up auth early so misconfiguration is visible before the first
+    // event-triggered ingest attempt. Non-fatal: posting still retries and
+    // refreshes tokens if this startup token expires before first publish.
+    match transport.warmup_auth() {
+        Ok(()) => {
+            println!("[publisher] auth warmup succeeded");
+            let mut s = status.lock().unwrap();
+            s.rc_connected   = true;
+            s.token_expires_at = transport.token_expires_at();
+        }
+        Err(e) => {
+            eprintln!("[publisher] auth warmup failed: {e}");
+            let mut s = status.lock().unwrap();
+            s.rc_connected   = false;
+            s.token_expires_at = None;
+        }
+    }
+
+    // ── Wait for iRacing ──────────────────────────────────────────────────
+
+    println!("[publisher] waiting for iRacing...");
+    let mut reader = match connect_loop(&running) {
+        Some(r) => r,
+        None => return,
+    };
+
+    // ── Initialise components ─────────────────────────────────────────────
+
+    let mut engine      = NarrativeEngine::new(10);
     let mut lifecycle       = LifecyclePublisher::new(env!("CARGO_PKG_VERSION"));
     let mut roster_cache    = RosterCache::new();
     let mut race_session_id = String::from("0");
     let mut sub_session_id: i64 = 0;
+    let mut last_session_num: Option<i32> = None;
+    let mut current_session_meta: Option<SessionMetadata> = None;
     let mut last_frame: Option<TelemetryFrame> = None;
     // Car-scoped events held back while the roster hasn't yet resolved driverName.
     // Flushed after each roster update. Capped at 64 entries.
@@ -235,6 +257,8 @@ fn pipeline_main(
             roster_cache   = RosterCache::new();
             pending_events.clear();
             sub_session_id  = 0;
+            last_session_num = None;
+            current_session_meta = None;
             race_session_id = String::new();
             println!("[publisher] reconnected");
             status.lock().unwrap().iracing_connected = true;
@@ -244,9 +268,12 @@ fn pipeline_main(
         match reader.wait_for_frame() {
             Ok(true) => {
                 let Some(frame) = reader.read_frame() else { continue };
+                let session_num_changed = last_session_num != Some(frame.session_num);
 
                 // Refresh roster + session metadata when SessionInfo changes.
-                if roster_cache.needs_update(frame.session_info_update) {
+                // Also force a refresh when SessionNum changes so practice/qualify/race
+                // transitions are not missed if the SessionInfoUpdate var is absent.
+                if session_num_changed || roster_cache.needs_update(frame.session_info_update) {
                     if let Some(yaml) = reader.read_session_info() {
                         // For AI/offline sessions iRacing never assigns a real
                         // SubSessionID (always 0). Detect this and synthesise a
@@ -285,6 +312,8 @@ fn pipeline_main(
                                             roster_cache.roster(),
                                             &race_session_id,
                                             &rig_id,
+                                            current_session_meta.as_ref(),
+                                            (sub_session_id > 0).then_some(sub_session_id),
                                         );
                                         transport.enqueue(pe);
                                     }
@@ -320,7 +349,7 @@ fn pipeline_main(
                                             .and_then(|r| r.lookup(car_ref.car_idx))
                                         {
                                             if !car.driver_name.is_empty() {
-                                                car_ref.driver_name = car.driver_name.clone();
+                                                *car_ref = car.clone();
                                                 transport.enqueue(pe);
                                                 status.lock().unwrap().events_enqueued_total += 1;
                                                 continue;
@@ -336,7 +365,8 @@ fn pipeline_main(
                             }
                         }
 
-                        let session_meta = SessionMetadata::parse(&yaml, frame.session_num as usize);
+                        let session_meta = SessionMetadata::parse(&yaml, frame.session_num);
+                        current_session_meta = Some(session_meta.clone());
                         {
                             let mut s = status.lock().unwrap();
                             s.sub_session_id = Some(sub_session_id);
@@ -359,6 +389,8 @@ fn pipeline_main(
                                 roster_cache.roster(),
                                 &race_session_id,
                                 &rig_id,
+                                current_session_meta.as_ref(),
+                                (sub_session_id > 0).then_some(sub_session_id),
                             );
                             if pe.scope == EventScope::CarScoped
                                 && pe.car.as_ref().is_some_and(|car| car.driver_name.is_empty())
@@ -369,6 +401,8 @@ fn pipeline_main(
                                 status.lock().unwrap().events_enqueued_total += 1;
                             }
                         }
+
+                        last_session_num = Some(frame.session_num);
                     }
                 }
 
@@ -378,7 +412,15 @@ fn pipeline_main(
                 for event in &events {
                     log_event(event, roster, &frame);
                     let log_entry = make_log_entry(event, &frame, roster);
-                    let pe        = build_event(event, &frame, roster, &race_session_id, &rig_id);
+                    let pe        = build_event(
+                        event,
+                        &frame,
+                        roster,
+                        &race_session_id,
+                        &rig_id,
+                        current_session_meta.as_ref(),
+                        (sub_session_id > 0).then_some(sub_session_id),
+                    );
                     // Gate on roster: hold back events whose driverName is not yet resolved
                     // (server rejects car-scoped events with an empty driverName).
                     if pe.scope == EventScope::CarScoped
@@ -454,6 +496,8 @@ fn pipeline_main(
             roster_cache.roster(),
             &race_session_id,
             &rig_id,
+            current_session_meta.as_ref(),
+            (sub_session_id > 0).then_some(sub_session_id),
         );
         transport.enqueue(pe);
     }
@@ -474,19 +518,19 @@ fn parse_config_path() -> Option<std::path::PathBuf> {
         .map(|w| std::path::PathBuf::from(&w[1]))
 }
 
-/// Retry loop: block until `IrsdkReader::try_connect()` succeeds.
+/// Retry loop: block until `SharedMemReader::try_connect()` succeeds.
 /// Returns `None` if the shutdown flag is set before a connection is made.
 #[cfg(target_os = "windows")]
 fn connect_loop(
     running: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> Option<director_narrative_core::irsdk::IrsdkReader> {
+) -> Option<director_narrative_core::sim_bridge::SharedMemReader> {
     use std::sync::atomic::Ordering;
-    use director_narrative_core::irsdk::IrsdkReader;
+    use director_narrative_core::sim_bridge::SharedMemReader;
     loop {
         if !running.load(Ordering::SeqCst) {
             return None;
         }
-        match IrsdkReader::try_connect() {
+        match SharedMemReader::try_connect() {
             Ok(r)  => return Some(r),
             Err(_) => std::thread::sleep(std::time::Duration::from_secs(1)),
         }

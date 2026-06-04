@@ -234,6 +234,9 @@ mod tests {
                 car_class_short_name: Some("LMP2".into()),
                 car_class_id: Some(1),
                 user_id: None,
+                irating: None,
+                lic_string: None,
+                flair_name: None,
             },
             CarRef {
                 car_idx: 1,
@@ -243,6 +246,9 @@ mod tests {
                 car_class_short_name: Some("GT3".into()),
                 car_class_id: Some(2),
                 user_id: None,
+                irating: None,
+                lic_string: None,
+                flair_name: None,
             },
         ])
     }

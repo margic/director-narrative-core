@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::race_event::{EventScope, FlagScope, RaceEvent};
-use crate::session_info::{CarRef, SessionRoster};
+use crate::session_info::{CarRef, SessionMetadata, SessionRoster};
 use crate::telemetry_frame::TelemetryFrame;
 
 // ── Envelope types ────────────────────────────────────────────────────────────
@@ -54,6 +54,10 @@ pub struct PublisherEventContext {
     pub leader_lap: Option<i32>,
     pub session_state: Option<i32>,
     pub session_flags: Option<u32>,
+    pub session_num: Option<i32>,
+    pub sub_session_id: Option<i64>,
+    pub session_type: Option<String>,
+    pub track_name: Option<String>,
 }
 
 // ── Builder ───────────────────────────────────────────────────────────────────
@@ -70,6 +74,8 @@ pub fn build_event(
     roster: Option<&SessionRoster>,
     race_session_id: &str,
     rig_id: &str,
+    session_meta: Option<&SessionMetadata>,
+    sub_session_id: Option<i64>,
 ) -> PublisherEvent {
     let id = Uuid::new_v4().to_string();
     let timestamp = SystemTime::now()
@@ -96,6 +102,10 @@ pub fn build_event(
         leader_lap,
         session_state: Some(frame.session_state),
         session_flags: Some(frame.session_flags),
+        session_num: Some(frame.session_num),
+        sub_session_id,
+        session_type: session_meta.and_then(|m| m.session_type.clone()),
+        track_name: session_meta.and_then(|m| m.track_name.clone()),
     });
 
     PublisherEvent {
@@ -163,6 +173,9 @@ fn resolve_car(car_idx: u8, roster: Option<&SessionRoster>) -> CarRef {
             car_class_short_name: None,
             car_class_id: None,
             user_id: None,
+            irating: None,
+            lic_string: None,
+            flair_name: None,
         })
 }
 
@@ -374,6 +387,7 @@ mod tests {
     use super::*;
     use crate::battle_state::SlopeInfo;
     use crate::race_event::RaceEvent;
+    use crate::session_info::{CarRef, SessionMetadata, SessionRoster};
     use crate::telemetry_frame::TelemetryFrame;
 
     fn minimal_frame() -> TelemetryFrame {
@@ -406,6 +420,35 @@ mod tests {
         }
     }
 
+    fn enriched_roster() -> SessionRoster {
+        SessionRoster::from_cars(vec![
+            CarRef {
+                car_idx: 0,
+                car_number: "42".to_owned(),
+                driver_name: "Player".to_owned(),
+                team_name: Some("Team A".to_owned()),
+                car_class_short_name: Some("BMW M2".to_owned()),
+                car_class_id: Some(4073),
+                user_id: Some(123456),
+                irating: Some(2680),
+                lic_string: Some("D 2.79".to_owned()),
+                flair_name: Some("United States".to_owned()),
+            },
+            CarRef {
+                car_idx: 1,
+                car_number: "7".to_owned(),
+                driver_name: "Opponent".to_owned(),
+                team_name: Some("Team B".to_owned()),
+                car_class_short_name: Some("BMW M2".to_owned()),
+                car_class_id: Some(4073),
+                user_id: Some(999111),
+                irating: Some(1400),
+                lic_string: Some("R 2.50".to_owned()),
+                flair_name: Some("Spain".to_owned()),
+            },
+        ])
+    }
+
     #[test]
     fn battle_closing_json_shape() {
         let event = RaceEvent::BattleClosing {
@@ -425,7 +468,7 @@ mod tests {
             prior_attack_time_s: 0.0,
         };
 
-        let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001");
+        let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001", None, None);
         let json: Value = serde_json::to_value(&env).unwrap();
 
         // Envelope-level fields
@@ -453,14 +496,15 @@ mod tests {
         assert_eq!(json["context"]["leaderLap"], 3);
         assert_eq!(json["context"]["sessionState"], 4);
         assert_eq!(json["context"]["sessionFlags"], 0);
+        assert_eq!(json["context"]["sessionNum"], 0);
     }
 
     #[test]
     fn uuid_is_unique_across_calls() {
         let event = RaceEvent::RaceGreen { lap: 1, session_time: 0.0 };
         let frame = minimal_frame();
-        let e1 = build_event(&event, &frame, None, "s", "r");
-        let e2 = build_event(&event, &frame, None, "s", "r");
+        let e1 = build_event(&event, &frame, None, "s", "r", None, None);
+        let e2 = build_event(&event, &frame, None, "s", "r", None, None);
         assert_ne!(e1.id, e2.id);
     }
 
@@ -468,7 +512,7 @@ mod tests {
     fn session_events_omit_car_and_use_session_scope() {
         let event = RaceEvent::RaceGreen { lap: 1, session_time: 0.0 };
         let frame = minimal_frame(); // player_car_idx = 0
-        let env = build_event(&event, &frame, None, "s", "r");
+        let env = build_event(&event, &frame, None, "s", "r", None, None);
         let json: Value = serde_json::to_value(&env).unwrap();
         assert_eq!(env.scope, EventScope::SessionScoped);
         assert!(env.car.is_none());
@@ -485,7 +529,7 @@ mod tests {
             version: "0.1.0".to_owned(),
             scope: "driver".to_owned(),
         };
-        let env = build_event(&event, &minimal_frame(), None, "s", "r");
+        let env = build_event(&event, &minimal_frame(), None, "s", "r", None, None);
         let json: Value = serde_json::to_value(&env).unwrap();
         assert_eq!(env.scope, EventScope::RigScoped);
         assert!(env.car.is_none());
@@ -507,7 +551,7 @@ mod tests {
             engagement_started_at_session_time_s: 12.0,
         };
 
-        let env = build_event(&event, &minimal_frame(), None, "s", "r");
+        let env = build_event(&event, &minimal_frame(), None, "s", "r", None, None);
         let json: Value = serde_json::to_value(&env).unwrap();
         assert_eq!(json["payload"]["leaderCarNumber"], "1");
         assert_eq!(json["payload"]["followerCarNumber"], "0");
@@ -523,7 +567,7 @@ mod tests {
             pit_frames: 0,
         };
 
-        let env = build_event(&event, &minimal_frame(), None, "s", "r");
+        let env = build_event(&event, &minimal_frame(), None, "s", "r", None, None);
         let json: Value = serde_json::to_value(&env).unwrap();
         let lap_time = json["payload"]["lapTime"].as_f64().unwrap_or_default();
         let best_lap = json["payload"]["bestLapTime"].as_f64().unwrap_or_default();
@@ -533,5 +577,43 @@ mod tests {
         assert!((best_lap - 87.9).abs() < 1e-3);
         assert!((lap_time_snake - 88.2).abs() < 1e-3);
         assert!((best_lap_snake - 87.9).abs() < 1e-3);
+    }
+
+    #[test]
+    fn car_refs_include_enrichment_fields_when_roster_present() {
+        let event = RaceEvent::Overtake {
+            lap: 3,
+            session_time: 42.0,
+            car_idx: 0,
+            overtaken_car_idx: Some(1),
+            position_from: 6,
+            position_to: 5,
+            positions_gained: 1,
+        };
+        let frame = minimal_frame();
+        let roster = enriched_roster();
+
+        let env = build_event(&event, &frame, Some(&roster), "s", "r", None, None);
+        let json: Value = serde_json::to_value(&env).unwrap();
+        assert_eq!(json["payload"]["overtakingCar"]["irating"], 2680);
+        assert_eq!(json["payload"]["overtakingCar"]["licString"], "D 2.79");
+        assert_eq!(json["payload"]["overtakingCar"]["flairName"], "United States");
+    }
+
+    #[test]
+    fn context_includes_session_metadata_when_provided() {
+        let event = RaceEvent::RaceGreen { lap: 1, session_time: 1.0 };
+        let frame = minimal_frame();
+        let meta = SessionMetadata {
+            track_name: Some("Winton National".to_owned()),
+            session_type: Some("Practice".to_owned()),
+            session_laps: Some("unlimited".to_owned()),
+        };
+
+        let env = build_event(&event, &frame, None, "s", "r", Some(&meta), Some(86268796));
+        let json: Value = serde_json::to_value(&env).unwrap();
+        assert_eq!(json["context"]["subSessionId"], 86268796);
+        assert_eq!(json["context"]["sessionType"], "Practice");
+        assert_eq!(json["context"]["trackName"], "Winton National");
     }
 }

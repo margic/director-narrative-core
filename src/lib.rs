@@ -9,7 +9,10 @@ pub mod fuel_projection;
 pub mod gap_finder;
 pub mod horizon;
 pub mod incident_cluster;
-pub mod irsdk;
+mod irsdk;
+pub mod sim_bridge {
+	pub use crate::irsdk::*;
+}
 pub mod lap_timer;
 pub mod lifecycle;
 pub mod lift_coast;

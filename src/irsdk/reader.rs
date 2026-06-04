@@ -75,8 +75,6 @@ pub const REQUIRED_VARS: &[&str] = &[
     "CarIdxOnPitRoad",
     // Optional — absent in some session types; defaults to 0.0.
     "LapLastLapTime",
-    // Optional — absent in very old iRacing builds; defaults to 0.
-    "SessionInfoUpdate",
     // Optional — session metadata; default to 0 if absent.
     "SessionTick",
     "SessionState",
@@ -91,7 +89,7 @@ pub const REQUIRED_VARS: &[&str] = &[
 ///
 /// Returns `None` if any required variable is absent from `vars` or the
 /// buffer is too short for a required offset.
-pub fn build_frame(buf: &[u8], vars: &VarIndex) -> Option<CoreFrame> {
+pub fn build_frame(buf: &[u8], vars: &VarIndex, header_session_info_update: u32) -> Option<CoreFrame> {
     macro_rules! var {
         ($name:expr) => {
             vars.get($name)?
@@ -156,10 +154,8 @@ pub fn build_frame(buf: &[u8], vars: &VarIndex) -> Option<CoreFrame> {
         .map(|v| read_f32(buf, v.offset))
         .unwrap_or(0.0);
 
-    let session_info_update = vars
-        .get("SessionInfoUpdate")
-        .map(|v| read_i32(buf, v.offset) as u32)
-        .unwrap_or(0);
+    // SessionInfoUpdate is sourced from the irsdk header counter.
+    let session_info_update = header_session_info_update;
 
     let session_tick = vars
         .get("SessionTick")
@@ -295,7 +291,7 @@ mod tests {
     #[test]
     fn build_frame_round_trips_all_fields() {
         let (buf, index) = make_test_buf();
-        let frame = build_frame(&buf, &index).expect("build_frame should succeed");
+        let frame = build_frame(&buf, &index, 42).expect("build_frame should succeed");
 
         assert!((frame.session_time - 123.456).abs() < 0.001, "session_time");
         assert_eq!(frame.session_flags, 0x0100, "session_flags");
@@ -304,6 +300,7 @@ mod tests {
         assert!((frame.lap_dist_pct - 0.75).abs() < 1e-5, "lap_dist_pct");
         assert_eq!(frame.player_car_position, 7, "player_car_position");
         assert!(!frame.on_pit_road, "on_pit_road");
+        assert_eq!(frame.session_info_update, 42, "session_info_update");
         assert_eq!(frame.car_idx_lap_dist_pct.len(), 3);
         assert_eq!(frame.car_idx_position, vec![1, 2, 3]);
         assert_eq!(frame.car_idx_on_pit_road, vec![false, true, false]);

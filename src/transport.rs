@@ -109,6 +109,16 @@ impl PublisherTransport {
         self.queue.push(event);
     }
 
+    /// Warm up authentication by ensuring a valid bearer token is available.
+    ///
+    /// This is safe to call at startup: the normal ingest path still refreshes
+    /// tokens as needed, so a token that expires before first event publish is
+    /// automatically replaced during `post_batch`.
+    pub fn warmup_auth(&mut self) -> Result<(), TransportError> {
+        let _ = self.get_or_refresh_token(false)?;
+        Ok(())
+    }
+
     /// Call once per frame. Flushes automatically when the interval elapses
     /// or the queue reaches [`BATCH_LIMIT`].
     pub fn tick(
@@ -452,6 +462,8 @@ mod tests {
             None,
             "session-xyz",
             "rig-001",
+            None,
+            None,
         );
 
         let mut transport = make_transport(&server.url());
@@ -469,6 +481,8 @@ mod tests {
             None,
             "session-xyz",
             "rig-001",
+            None,
+            None,
         );
 
         let req = IngestRequest {
@@ -507,6 +521,8 @@ mod tests {
                 None,
                 "s",
                 "r",
+                None,
+                None,
             );
             transport.enqueue(event);
             transport.flush(10.0, 100, 1).unwrap();
@@ -515,5 +531,12 @@ mod tests {
         // No token fetch calls (token was injected) — if token refresh were
         // triggered unexpectedly, the fetch_token() call to the non-mocked
         // Azure endpoint would fail and the test would error.
+    }
+
+    #[test]
+    fn warmup_auth_succeeds_with_cached_token() {
+        let mut transport = make_transport("http://localhost");
+        transport.warmup_auth().expect("warmup should use cached token");
+        assert!(transport.token_expires_at().is_some());
     }
 }

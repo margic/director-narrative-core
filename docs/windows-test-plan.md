@@ -11,7 +11,7 @@
 This branch adds a Rust-native Windows shared-memory reader that connects directly
 to iRacing's memory-mapped file (`Local\IRSDKMemMapFileName`) at 60 Hz, replacing
 the Python `irsdk` bridge that previously handled this. The implementation lives
-entirely in `src/irsdk/` and is `#[cfg(target_os = "windows")]`-gated so Linux
+under `sim_bridge` (backed by `src/irsdk/`) and is `#[cfg(target_os = "windows")]`-gated so Linux
 CI is unaffected.
 
 ### What was built
@@ -20,7 +20,7 @@ CI is unaffected.
 |---|---|
 | `src/irsdk/header.rs` | Parses `irsdk_header` C struct; builds `VarIndex` (name → byte offset map) |
 | `src/irsdk/reader.rs` | Typed read helpers + `build_frame()` from raw buffer bytes |
-| `src/irsdk/mod.rs` | `IrsdkReader` — `MapViewOfFile`, `WaitForSingleObject`, `Drop` |
+| `src/irsdk/mod.rs` | `SharedMemReader` — `MapViewOfFile`, `WaitForSingleObject`, `Drop` |
 | `src/bin/publisher.rs` | Main loop: mmap reader + engine + HTTP transport |
 
 ### How it works
@@ -31,7 +31,7 @@ iRacing (Windows)
   └─ signals Local\IRSDKDataValidEvent on each write
 
 publisher.exe (Rust main loop)
-  └─ IrsdkReader::wait_for_frame()  ← 0% CPU when idle
+  └─ SharedMemReader::wait_for_frame()  ← 0% CPU when idle
   └─ reads mmap → builds TelemetryFrame
   └─ engine.process_frame() → Vec<RaceEvent>
   └─ build_event() → PublisherEvent → transport.enqueue()
@@ -86,7 +86,7 @@ in-memory buffers with no Windows API calls.
 cargo test
 ```
 
-**Expected:** all 26 tests pass (20 existing + 6 new irsdk unit tests).
+**Expected:** all 26 tests pass (20 existing + 6 new shared-memory reader unit tests).
 
 ```
 test result: ok. 26 passed; 0 failed
@@ -238,7 +238,7 @@ src/                    ← pure Rust logic (platform-agnostic, never changes fo
 napi/src/
   lib.rs                ← NAPI boundary: TelemetryFrame (JS), RaceEvent (JS), NarrativeEngine class
   irsdk/
-    mod.rs              ← IrsdkReader (Windows mmap handle, Drop)
+    mod.rs              ← SharedMemReader (Windows mmap handle, Drop)
     header.rs           ← irsdk_header parsing, VarIndex
     reader.rs           ← build_frame() from raw bytes
     thread.rs           ← LiveSession background thread

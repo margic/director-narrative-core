@@ -5,7 +5,7 @@
 //! `wait_for_frame()` / `read_frame()` / `read_session_info()` for the
 //! publisher main loop.
 //!
-//! The single `unsafe` boundary is in `IrsdkReader::try_connect()` where the
+//! The single `unsafe` boundary is in `SharedMemReader::try_connect()` where the
 //! `MapViewOfFile` result is validated and wrapped into a `&[u8]` slice.
 //! All downstream reads (`header.rs`, `reader.rs`) are safe slice operations.
 
@@ -14,6 +14,7 @@ pub mod reader;
 
 #[cfg(target_os = "windows")]
 mod platform {
+    use std::env;
     use std::ffi::OsStr;
     use std::iter;
     use std::os::windows::ffi::OsStrExt;
@@ -35,13 +36,27 @@ mod platform {
     use super::header::{build_var_index, is_connected, latest_buf, parse_header, VarIndex};
     use super::reader::{build_frame, REQUIRED_VARS};
 
-    const MMAP_NAME:      &str = "Local\\IRSDKMemMapFileName";
-    const EVENT_NAME:     &str = "Local\\IRSDKDataValidEvent";
+    const MMAP_NAME_DEFAULT:  &str = "Local\\IRSDKMemMapFileName";
+    const EVENT_NAME_DEFAULT: &str = "Local\\IRSDKDataValidEvent";
     const WAIT_TIMEOUT_MS: u32 = 1_000;
     const MAX_MMAP_SIZE:  usize = 4 * 1024 * 1024;
 
+    fn mmap_name() -> String {
+        env::var("SIM_MMAP_NAME")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| MMAP_NAME_DEFAULT.to_owned())
+    }
+
+    fn event_name() -> String {
+        env::var("SIM_EVENT_NAME")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| EVENT_NAME_DEFAULT.to_owned())
+    }
+
     #[derive(Debug)]
-    pub enum IrsdkError {
+    pub enum SharedMemError {
         /// iRacing is not running or the mmap is not present.
         NotRunning,
         /// The mmap data is malformed (header parse failed).
@@ -52,7 +67,7 @@ mod platform {
         Os(u32),
     }
 
-    impl std::fmt::Display for IrsdkError {
+    impl std::fmt::Display for SharedMemError {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
                 Self::NotRunning  => write!(f, "iRacing is not running"),
@@ -67,7 +82,7 @@ mod platform {
     ///
     /// Holds the Windows handles for the memory-mapped file and the
     /// data-valid event. `Drop` releases both handles automatically.
-    pub struct IrsdkReader {
+    pub struct SharedMemReader {
         map_view:     *const u8,
         mmap_handle:  HANDLE,
         event_handle: HANDLE,
@@ -75,21 +90,22 @@ mod platform {
         buf_len:      usize,
     }
 
-    // SAFETY: IrsdkReader owns its handles and the map_view pointer.
+    // SAFETY: SharedMemReader owns its handles and the map_view pointer.
     // It is only ever moved into and used from the publisher main thread.
-    unsafe impl Send for IrsdkReader {}
+    unsafe impl Send for SharedMemReader {}
 
-    impl IrsdkReader {
+    impl SharedMemReader {
         /// Attempt to open the iRacing mmap and event handles.
         ///
-        /// Returns `Err(IrsdkError::NotRunning)` if iRacing is not yet open;
+        /// Returns `Err(SharedMemError::NotRunning)` if iRacing is not yet open;
         /// callers should retry after a delay.
-        pub fn try_connect() -> Result<Self, IrsdkError> {
+        pub fn try_connect() -> Result<Self, SharedMemError> {
+            let mmap_name = mmap_name();
             let mmap_handle = unsafe {
-                OpenFileMappingW(FILE_MAP_READ, 0, wide(MMAP_NAME).as_ptr())
+                OpenFileMappingW(FILE_MAP_READ, 0, wide(&mmap_name).as_ptr())
             };
             if mmap_handle == std::ptr::null_mut() || mmap_handle == INVALID_HANDLE_VALUE {
-                return Err(IrsdkError::NotRunning);
+                return Err(SharedMemError::NotRunning);
             }
 
             let map_view = unsafe {
@@ -97,26 +113,26 @@ mod platform {
             };
             if map_view.is_null() {
                 unsafe { CloseHandle(mmap_handle) };
-                return Err(IrsdkError::NotRunning);
+                return Err(SharedMemError::NotRunning);
             }
 
             let mmap_slice = unsafe { std::slice::from_raw_parts(map_view, MAX_MMAP_SIZE) };
 
-            let hdr = parse_header(mmap_slice).ok_or(IrsdkError::BadHeader)?;
+            let hdr = parse_header(mmap_slice).ok_or(SharedMemError::BadHeader)?;
 
             if !is_connected(hdr.status) {
                 unsafe {
                     UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: map_view as *mut _ });
                     CloseHandle(mmap_handle);
                 }
-                return Err(IrsdkError::NotRunning);
+                return Err(SharedMemError::NotRunning);
             }
 
             let var_index = build_var_index(mmap_slice, &hdr, REQUIRED_VARS)
-                .ok_or(IrsdkError::BadHeader)?;
+                .ok_or(SharedMemError::BadHeader)?;
 
             // Verify that non-optional required vars are present.
-            let optional = ["LapLastLapTime", "SessionInfoUpdate", "SessionTick",
+            let optional = ["LapLastLapTime", "SessionTick",
                             "SessionState", "SessionNum", "CarIdxLapCompleted"];
             let missing = REQUIRED_VARS.iter()
                 .filter(|&&n| !optional.contains(&n))
@@ -126,18 +142,19 @@ mod platform {
                     UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: map_view as *mut _ });
                     CloseHandle(mmap_handle);
                 }
-                return Err(IrsdkError::MissingVars);
+                return Err(SharedMemError::MissingVars);
             }
 
+            let event_name = event_name();
             let event_handle = unsafe {
-                OpenEventW(SYNCHRONIZE, 0, wide(EVENT_NAME).as_ptr())
+                OpenEventW(SYNCHRONIZE, 0, wide(&event_name).as_ptr())
             };
             if event_handle == std::ptr::null_mut() || event_handle == INVALID_HANDLE_VALUE {
                 unsafe {
                     UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: map_view as *mut _ });
                     CloseHandle(mmap_handle);
                 }
-                return Err(IrsdkError::NotRunning);
+                return Err(SharedMemError::NotRunning);
             }
 
             Ok(Self {
@@ -155,12 +172,12 @@ mod platform {
         /// - `Ok(true)`  — new frame is ready
         /// - `Ok(false)` — timeout; iRacing may still be running
         /// - `Err`       — OS error
-        pub fn wait_for_frame(&self) -> Result<bool, IrsdkError> {
+        pub fn wait_for_frame(&self) -> Result<bool, SharedMemError> {
             let result = unsafe { WaitForSingleObject(self.event_handle, WAIT_TIMEOUT_MS) };
             match result {
                 WAIT_OBJECT_0 => Ok(true),
                 WAIT_TIMEOUT  => Ok(false),
-                other         => Err(IrsdkError::Os(other)),
+                other         => Err(SharedMemError::Os(other)),
             }
         }
 
@@ -176,7 +193,11 @@ mod platform {
                 return None;
             }
 
-            build_frame(&mmap[start..end], &self.var_index)
+            build_frame(
+                &mmap[start..end],
+                &self.var_index,
+                hdr.session_info_update as u32,
+            )
         }
 
         /// Read the SessionInfo YAML blob from the mmap.
@@ -206,7 +227,7 @@ mod platform {
         }
     }
 
-    impl Drop for IrsdkReader {
+    impl Drop for SharedMemReader {
         fn drop(&mut self) {
             unsafe {
                 UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: self.map_view as *mut _ });
@@ -226,4 +247,4 @@ mod platform {
 }
 
 #[cfg(target_os = "windows")]
-pub use platform::{IrsdkError, IrsdkReader};
+pub use platform::{SharedMemError, SharedMemReader};

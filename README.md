@@ -113,6 +113,7 @@ python3 scripts/prototype_narrative.py
 | [docs/narrative-engine-spec.md](docs/narrative-engine-spec.md) | Full 15-section architecture specification: anchoring, regression, state machines, napi contract |
 | [docs/data-models.md](docs/data-models.md) | Complete Rust struct definitions with field-level documentation |
 | [docs/test-harness.md](docs/test-harness.md) | JSONL fixtures, Rust unit and scenario tests, CI integration |
+| [docs/iracing-mmap-reference.md](docs/iracing-mmap-reference.md) | Shared-memory layout, mock mmap workflow, snapshot export, and detector validation checklist |
 
 ## Key Design Decisions
 

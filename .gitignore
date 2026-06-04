@@ -32,3 +32,4 @@ target
 
 # Publisher rig config — contains client secret, must never be committed
 publisher.toml
+exports/

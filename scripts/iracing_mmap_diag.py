@@ -15,11 +15,13 @@ Usage:
 
 import argparse
 import ctypes
+import json
+import os
 import struct
 import sys
 import time
 
-MMAP_NAME      = "IRSDKMemMapFileName"
+MMAP_NAMES     = ["Local\\IRSDKMemMapFileName", "IRSDKMemMapFileName"]
 MMAP_SIZE      = 2 * 1024 * 1024  # 2 MiB — large enough for any SDK version
 HDR_STATUS_OFF = 0x04
 HDR_SI_UPDATE  = 0x0C
@@ -48,6 +50,16 @@ INTERESTING_VARS = {
     "SessionInfoUpdate", "PlayerCarIdx", "Lap", "SessionFlags",
 }
 
+SESSION_STATE_NAMES = {
+    0: "Invalid",
+    1: "GetInCar",
+    2: "Warmup",
+    3: "ParadeLaps",
+    4: "Racing",
+    5: "Checkered",
+    6: "CoolDown",
+}
+
 
 def ri32(buf, off):
     return struct.unpack_from("<i", buf, off)[0]
@@ -61,15 +73,21 @@ def open_mmap():
     k32.CloseHandle.argtypes      = [ctypes.c_void_p]
     FILE_MAP_READ = 0x0004
 
-    h = k32.OpenFileMappingA(FILE_MAP_READ, False, MMAP_NAME.encode())
+    h = None
+    chosen_name = None
+    for candidate in MMAP_NAMES:
+        h = k32.OpenFileMappingA(FILE_MAP_READ, False, candidate.encode())
+        if h:
+            chosen_name = candidate
+            break
     if not h:
-        return None, None
+        return None, None, None
 
     # Map the full file (size=0) to read the header first.
     ptr = k32.MapViewOfFile(h, FILE_MAP_READ, 0, 0, 0)
     if not ptr:
         k32.CloseHandle(h)
-        return None, None
+        return None, None, None
 
     # Read enough to parse the header + VarBuf array (256 bytes is plenty).
     hdr_bytes = ctypes.string_at(ptr, 256)
@@ -89,7 +107,7 @@ def open_mmap():
     data = ctypes.string_at(ptr, actual_size)
     k32.UnmapViewOfFile(ptr)
     k32.CloseHandle(h)
-    return data, True
+    return data, True, chosen_name
 
 
 def parse_header(data):
@@ -175,9 +193,68 @@ def yaml_grep(yaml, *keywords):
     return out
 
 
-def run(dump_yaml=False, watch=False):
+def parse_active_session_type(yaml, session_num):
+    """Best-effort parser to map SessionNum -> SessionType from SessionInfo YAML."""
+    current_num = None
+    for raw in yaml.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+
+        if line.startswith("- "):
+            line = line[2:].strip()
+
+        if line.startswith("SessionNum:"):
+            value = line.split(":", 1)[1].strip()
+            try:
+                current_num = int(value)
+            except ValueError:
+                current_num = None
+            continue
+
+        if line.startswith("SessionType:") and current_num == session_num:
+            return line.split(":", 1)[1].strip()
+
+    return None
+
+
+def export_snapshot(data, hdr, vars, yaml, chosen_name, export_path=None, manifest_path=None):
+    if export_path:
+        os.makedirs(os.path.dirname(os.path.abspath(export_path)), exist_ok=True)
+        with open(export_path, "wb") as fh:
+            fh.write(data)
+        print(f"  exported raw mmap snapshot to: {export_path}")
+
+    if manifest_path:
+        manifest = {
+            "capturedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "mappingName": chosen_name,
+            "header": hdr,
+            "interestingVars": {
+                name: read_var(data, info, hdr["best_buf_off"])
+                for name, info in vars.items()
+                if name in INTERESTING_VARS
+            },
+            "yamlPreview": yaml.splitlines()[:80],
+            "variableCatalog": {
+                name: {
+                    "type": info["type"],
+                    "offset": info["offset"],
+                    "count": info["count"],
+                }
+                for name, info in sorted(vars.items())
+            },
+        }
+        os.makedirs(os.path.dirname(os.path.abspath(manifest_path)), exist_ok=True)
+        with open(manifest_path, "w", encoding="utf-8") as fh:
+            json.dump(manifest, fh, indent=2)
+        print(f"  exported snapshot manifest to: {manifest_path}")
+
+
+def run(dump_yaml=False, watch=False, export_path=None, manifest_path=None, transitions=False):
+    last_transition_sig = None
     while True:
-        data, ok = open_mmap()
+        data, ok, chosen_name = open_mmap()
         if not ok or data is None:
             print("ERROR: Could not open iRacing mmap — is iRacing running?")
             if watch:
@@ -189,56 +266,111 @@ def run(dump_yaml=False, watch=False):
         vars = build_var_index(data, hdr)
         yaml = extract_session_yaml(data, hdr)
 
-        print("=" * 60)
-        print(f"  iRacing mmap diagnostic  {time.strftime('%H:%M:%S')}")
-        print("=" * 60)
-        print(f"  connected       : {hdr['connected']}  (status={hdr['status']:#010x})")
-        print(f"  si_update_tick  : {hdr['si_update']}")
-        print(f"  session_info_len: {hdr['si_len']}")
-        print(f"  num_vars        : {hdr['num_vars']}")
-        print(f"  buf_len         : {hdr['buf_len']}")
-        print(f"  best_frame_tick : {hdr['best_tick']}")
-        print()
-
-        # Live telemetry vars
         buf_start = hdr["best_buf_off"]
-        print("  ── Live telemetry ──")
+        live = {}
         for name in sorted(INTERESTING_VARS):
             info = vars.get(name)
-            if info is None:
-                print(f"  {name:<24} NOT FOUND")
-            else:
-                val = read_var(data, info, buf_start)
-                print(f"  {name:<24} {val}")
-        print()
+            live[name] = None if info is None else read_var(data, info, buf_start)
+
+        active_session_num = live.get("SessionNum")
+        active_session_type = None
+        if isinstance(active_session_num, int):
+            active_session_type = parse_active_session_type(yaml, active_session_num)
+
+        if transitions:
+            session_state = live.get("SessionState")
+            state_name = SESSION_STATE_NAMES.get(session_state, "Unknown")
+            transition_sig = (
+                hdr["si_update"],
+                active_session_num,
+                session_state,
+                active_session_type,
+            )
+            if transition_sig != last_transition_sig:
+                print(
+                    f"[{time.strftime('%H:%M:%S')}] si_update={hdr['si_update']} "
+                    f"SessionNum={active_session_num} "
+                    f"SessionState={session_state}({state_name}) "
+                    f"SessionType={active_session_type or 'UNKNOWN'}"
+                )
+                last_transition_sig = transition_sig
+        else:
+            print("=" * 60)
+            print(f"  iRacing mmap diagnostic  {time.strftime('%H:%M:%S')}")
+            print("=" * 60)
+            print(f"  mapping         : {chosen_name}")
+            print(f"  connected       : {hdr['connected']}  (status={hdr['status']:#010x})")
+            print(f"  si_update_tick  : {hdr['si_update']}")
+            print(f"  session_info_len: {hdr['si_len']}")
+            print(f"  num_vars        : {hdr['num_vars']}")
+            print(f"  buf_len         : {hdr['buf_len']}")
+            print(f"  best_frame_tick : {hdr['best_tick']}")
+            print()
+
+            print("  ── Live telemetry ──")
+            for name in sorted(INTERESTING_VARS):
+                val = live[name]
+                if val is None:
+                    print(f"  {name:<24} NOT FOUND")
+                else:
+                    print(f"  {name:<24} {val}")
+            print()
+
+            state_raw = live.get("SessionState")
+            state_name = SESSION_STATE_NAMES.get(state_raw, "Unknown")
+            print("  ── Session detection summary ──")
+            print(f"  Header SessionInfoUpdate     : {hdr['si_update']}")
+            print(f"  Var SessionInfoUpdate        : {live.get('SessionInfoUpdate')}")
+            print(f"  Active SessionNum            : {active_session_num}")
+            print(f"  Active SessionState          : {state_raw} ({state_name})")
+            print(f"  Active SessionType (from YAML): {active_session_type or 'UNKNOWN'}")
+            print()
 
         # YAML snippets most relevant to the SubSessionID bug
-        print("  ── SessionInfo YAML (relevant keys) ──")
-        for ln in yaml_grep(yaml,
-                "SubSessionID", "SubSessionId",
-                "WeekendInfo", "TrackName",
-                "SessionType", "SessionID",
-                "DriverInfo"):
-            print(f"  {ln}")
-        print()
+        if not transitions:
+            print("  ── SessionInfo YAML (relevant keys) ──")
+            for ln in yaml_grep(yaml,
+                    "SubSessionID", "SubSessionId",
+                    "WeekendInfo", "TrackName",
+                    "SessionType", "SessionID",
+                    "DriverInfo"):
+                print(f"  {ln}")
+            print()
 
-        if dump_yaml:
+        if dump_yaml and not transitions:
             print("  ── Full SessionInfo YAML ──")
             print(yaml)
             print()
 
+        if export_path or manifest_path:
+            export_snapshot(data, hdr, vars, yaml, chosen_name, export_path, manifest_path)
+
         if not watch:
             break
         time.sleep(1)
-        print()
+        if not transitions:
+            print()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="iRacing mmap diagnostic")
     parser.add_argument("--yaml",  action="store_true", help="Dump full SessionInfo YAML")
     parser.add_argument("--watch", action="store_true", help="Refresh every second (Ctrl+C to stop)")
+    parser.add_argument(
+        "--transitions",
+        action="store_true",
+        help="In watch mode, print only when session transition signals change",
+    )
+    parser.add_argument("--export", help="Write the raw mmap bytes to a binary snapshot file")
+    parser.add_argument("--manifest", help="Write parsed header/variable metadata to JSON")
     args = parser.parse_args()
     try:
-        run(dump_yaml=args.yaml, watch=args.watch)
+        run(
+            dump_yaml=args.yaml,
+            watch=args.watch,
+            transitions=args.transitions,
+            export_path=args.export,
+            manifest_path=args.manifest,
+        )
     except KeyboardInterrupt:
         print("\nStopped.")

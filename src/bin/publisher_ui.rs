@@ -20,8 +20,8 @@ const AMBER:  Color32 = Color32::from_rgb(0xff, 0x98, 0x00);
 const RED:    Color32 = Color32::from_rgb(0xf4, 0x43, 0x36);
 const GREY:   Color32 = Color32::from_rgb(0x80, 0x80, 0x80);
 const CYAN:   Color32 = Color32::from_rgb(0x00, 0xbc, 0xd4);
-const WHITE:  Color32 = Color32::WHITE;
 const DIM:    Color32 = Color32::from_rgb(0xb0, 0xb0, 0xb0);
+const RACE_TEXT: Color32 = Color32::from_rgb(0x2e, 0x7d, 0x32);
 
 // ── App ────────────────────────────────────────────────────────────────────
 
@@ -178,7 +178,11 @@ fn rc_block(ui: &mut egui::Ui, s: &PublisherStatus) {
 
 fn rc_status(s: &PublisherStatus) -> (Color32, &'static str) {
     if s.calls_total == 0 {
-        return (GREY, "WAITING");
+        return if s.rc_connected {
+            (GREEN, "AUTH READY")
+        } else {
+            (GREY, "WAITING")
+        };
     }
     if s.rc_connected {
         (GREEN, "CONNECTED")
@@ -233,7 +237,7 @@ fn event_colour(event_type: &str) -> (Color32, bool) {
     } else if event_type.starts_with("PIT_") {
         (CYAN, false)
     } else if matches!(event_type, "RACE_GREEN" | "RACE_CHECKERED") {
-        (WHITE, true)
+        (RACE_TEXT, true)
     } else if matches!(event_type, "LAP_COMPLETED") {
         (DIM, false)
     } else {

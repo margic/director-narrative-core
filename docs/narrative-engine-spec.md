@@ -301,11 +301,11 @@ pub fn replay_frames(frames: &[TelemetryFrame]) -> Vec<RaceEvent>;
 
 The `napi/` crate (Node.js bridge) was removed in issue #27. The live entry point
 is the pure Rust publisher binary (`src/bin/publisher.rs`). It reads iRacing
-directly via `src/irsdk/` and has no Node.js dependency.
+directly via the `sim_bridge` module (`src/irsdk/`) and has no Node.js dependency.
 
 ```
 iRacing mmap (60 Hz)
-  └─ src/irsdk/IrsdkReader::wait_for_frame()
+  └─ sim_bridge::SharedMemReader::wait_for_frame()
        └─ reader::build_frame()  →  TelemetryFrame
             └─ engine.process_frame(&frame)  →  Vec<RaceEvent>
                  └─ publisher_event::build_event()  →  PublisherEvent
@@ -393,7 +393,7 @@ Issue #5  — Rust ownership/lifetime strategy for engine state (completed)
 Issue #6  — AnchorSampler + RegressionStore (completed)
 Issue #7  — BattleState FSM (completed)
 Issue #9  — JSONL replay harness (completed)
-Issue #17 — Windows iRacing mmap reader (src/irsdk/) (completed)
+Issue #17 — Windows iRacing mmap reader (sim_bridge backed by src/irsdk/) (completed)
 Issue #20 — Align event names to PublisherEventType schema (completed)
 Issue #21 — PublisherEvent envelope + build_event() (completed)
 Issue #22 — HTTP transport + Azure AD token (completed)

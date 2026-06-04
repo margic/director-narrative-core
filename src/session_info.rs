@@ -2,8 +2,8 @@
 //!
 //! iRacing exposes a `SessionInfo` string variable containing a YAML blob with
 //! the full entry list: car number, driver name, team name, car class, etc.
-//! A monotonically-increasing `SessionInfoUpdate` counter in the telemetry stream
-//! signals when the blob has changed (e.g. a driver disconnects or reconnects).
+//! A monotonically-increasing `SessionInfoUpdate` header counter signals when
+//! the blob has changed (e.g. a driver disconnects or reconnects).
 //!
 //! # Usage
 //!
@@ -14,7 +14,7 @@
 //!
 //! // Called each frame with the current update tick and a closure that
 //! // provides the raw YAML string only when the cache is stale.
-//! let session_info_update: u32 = 3; // from TelemetryFrame or mmap header
+//! let session_info_update: u32 = 3; // from TelemetryFrame (header counter)
 //! if cache.needs_update(session_info_update) {
 //!     let yaml = "<yaml from mmap>";
 //!     cache.update(session_info_update, yaml).ok();
@@ -45,6 +45,12 @@ pub struct CarRef {
     pub car_class_id: Option<u32>,
     /// iRacing CustID — used by Race Control for identity resolution.
     pub user_id: Option<u32>,
+    /// iRacing iRating from SessionInfo.DriverInfo.Drivers[].
+    pub irating: Option<u32>,
+    /// Driver license string (e.g. "D 2.79").
+    pub lic_string: Option<String>,
+    /// Country/region flair label from iRacing (e.g. "United States").
+    pub flair_name: Option<String>,
 }
 
 /// Immutable roster built from one parse of the `SessionInfo` YAML.
@@ -113,6 +119,9 @@ impl SessionInfoParser {
                     car_class_short_name: non_empty(d.car_class_short_name),
                     car_class_id: d.car_class_id,
                     user_id: d.user_id,
+                    irating: d.irating,
+                    lic_string: non_empty(d.lic_string),
+                    flair_name: non_empty(d.flair_name),
                 };
                 (d.car_idx, car_ref)
             })
@@ -191,18 +200,106 @@ pub struct SessionMetadata {
 
 impl SessionMetadata {
     /// Parse track name and the active session's type/laps from the raw YAML.
-    /// `session_num` is `TelemetryFrame::session_num` (0-based index into Sessions[]).
-    pub fn parse(yaml: &str, session_num: usize) -> Self {
+    /// `session_num` is `TelemetryFrame::session_num` (practice=0, qualify=1, race=2).
+    pub fn parse(yaml: &str, session_num: i32) -> Self {
         let root: YamlRootFull = match serde_yaml::from_str(yaml) {
             Ok(r) => r,
-            Err(_) => return Self::default(),
+            Err(_) => return parse_metadata_fallback(yaml),
         };
-        let session = root.session_info.sessions.get(session_num);
-        Self {
-            track_name:   root.weekend_info.track_display_name.filter(|s| !s.is_empty()),
-            session_type: session.and_then(|s| s.session_type.clone()).filter(|s| !s.is_empty()),
-            session_laps: session.and_then(|s| s.session_laps()).filter(|s| !s.is_empty()),
+
+        let track_name = root
+            .weekend_info
+            .track_display_name
+            .or(root.weekend_info.track_name)
+            .filter(|s| !s.is_empty());
+
+        let sessions = &root.session_info.sessions;
+        let session = if sessions.is_empty() {
+            None
+        } else {
+            let idx = usize::try_from(session_num)
+                .ok()
+                .filter(|&i| i < sessions.len())
+                .unwrap_or(0);
+            sessions.get(idx)
+        };
+
+        let session_type = session.and_then(|s| s.session_type.clone()).filter(|s| !s.is_empty());
+        let session_laps = session.and_then(|s| s.session_laps()).filter(|s| !s.is_empty());
+
+        let mut meta = Self {
+            track_name,
+            session_type,
+            session_laps,
+        };
+
+        if meta.track_name.is_none() || meta.session_type.is_none() || meta.session_laps.is_none() {
+            let fallback = parse_metadata_fallback(yaml);
+            if meta.track_name.is_none() {
+                meta.track_name = fallback.track_name;
+            }
+            if meta.session_type.is_none() {
+                meta.session_type = fallback.session_type;
+            }
+            if meta.session_laps.is_none() {
+                meta.session_laps = fallback.session_laps;
+            }
         }
+
+        meta
+    }
+}
+
+fn parse_metadata_fallback(yaml: &str) -> SessionMetadata {
+    let mut track_name: Option<String> = None;
+    let mut session_type: Option<String> = None;
+    let mut session_laps: Option<String> = None;
+
+    for line in yaml.lines() {
+        let line = line.trim();
+        let line_no_dash = line.trim_start_matches('-').trim_start();
+
+        if track_name.is_none() {
+            if let Some(rest) = line.strip_prefix("TrackDisplayName:") {
+                let v = rest.trim().trim_matches('"');
+                if !v.is_empty() {
+                    track_name = Some(v.to_string());
+                }
+            } else if let Some(rest) = line.strip_prefix("TrackName:") {
+                let v = rest.trim().trim_matches('"');
+                if !v.is_empty() {
+                    track_name = Some(v.to_string());
+                }
+            }
+        }
+
+        if session_type.is_none() {
+            if let Some(rest) = line_no_dash.strip_prefix("SessionType:") {
+                let v = rest.trim().trim_matches('"');
+                if !v.is_empty() {
+                    session_type = Some(v.to_string());
+                }
+            }
+        }
+
+        if session_laps.is_none() {
+            if let Some(rest) = line.strip_prefix("SessionLaps:") {
+                let v = rest.trim().trim_matches('"');
+                if !v.is_empty() {
+                    session_laps = Some(v.to_string());
+                }
+            }
+        }
+
+        if track_name.is_some() && session_type.is_some() && session_laps.is_some() {
+            break;
+        }
+    }
+
+    SessionMetadata {
+        track_name,
+        session_type,
+        session_laps,
     }
 }
 
@@ -224,9 +321,13 @@ pub fn parse_sub_session_id(yaml: &str) -> Option<i64> {
             None
         };
         if let Some(rest) = value {
-            let parsed: Option<i64> = rest.trim().parse().ok();
-            // Reject zero — iRacing returns 0 before the session is fully loaded.
-            return parsed.filter(|&v| v > 0);
+            // Ignore placeholder zeros and keep scanning. Some SessionInfo blobs
+            // can contain multiple SubSessionID keys, with an early value of 0.
+            let raw = rest.trim().trim_matches('"');
+            let parsed: Option<i64> = raw.parse().ok();
+            if let Some(v) = parsed.filter(|&v| v > 0) {
+                return Some(v);
+            }
         }
     }
     None
@@ -318,6 +419,8 @@ struct YamlRootFull {
 struct YamlWeekendInfo {
     #[serde(rename = "TrackDisplayName", default)]
     track_display_name: Option<String>,
+    #[serde(rename = "TrackName", default)]
+    track_name: Option<String>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -360,6 +463,12 @@ struct YamlDriver {
     /// the pace car and inactive slots. Negative values are mapped to `None`.
     #[serde(rename = "UserID", default, deserialize_with = "deserialize_nonneg_id")]
     user_id: Option<u32>,
+    #[serde(rename = "IRating", default, deserialize_with = "deserialize_nonneg_id")]
+    irating: Option<u32>,
+    #[serde(rename = "LicString", default)]
+    lic_string: Option<String>,
+    #[serde(rename = "FlairName", default)]
+    flair_name: Option<String>,
     #[serde(rename = "TeamName", default)]
     team_name: Option<String>,
     #[serde(rename = "CarNumber")]
@@ -392,36 +501,36 @@ mod tests {
     use super::*;
 
     /// Minimal SessionInfo YAML covering 4 drivers with varying optional fields.
-    const FIXTURE_YAML: &str = r#"
-DriverInfo:
- DriverCarIdx: 0
- Drivers:
- - CarIdx: 0
-   UserName: Paul Crofts
-   UserID: 123456
-   TeamName: Team Margic
-   CarNumber: "42"
-   CarClassID: 4011
-   CarClassShortName: GTP
- - CarIdx: 1
-   UserName: Alice Racer
-   UserID: 234567
-   TeamName: ""
-   CarNumber: "7"
-   CarClassID: 4011
-   CarClassShortName: GTP
- - CarIdx: 2
-   UserName: Bob Speedman
-   CarNumber: "18"
-   CarClassID: 2523
-   CarClassShortName: LMP2
- - CarIdx: 63
-   UserName: Pace Car
-   UserID: 0
-   CarNumber: "0"
-   CarClassID: 11
-   CarClassShortName: Pace
-"#;
+        const FIXTURE_YAML: &str = concat!(
+            "DriverInfo:\n",
+            " DriverCarIdx: 0\n",
+            " Drivers:\n",
+            " - CarIdx: 0\n",
+            "   UserName: Paul Crofts\n",
+            "   UserID: 123456\n",
+            "   TeamName: Team Margic\n",
+            "   CarNumber: \"42\"\n",
+            "   CarClassID: 4011\n",
+            "   CarClassShortName: GTP\n",
+            " - CarIdx: 1\n",
+            "   UserName: Alice Racer\n",
+            "   UserID: 234567\n",
+            "   TeamName: \"\"\n",
+            "   CarNumber: \"7\"\n",
+            "   CarClassID: 4011\n",
+            "   CarClassShortName: GTP\n",
+            " - CarIdx: 2\n",
+            "   UserName: Bob Speedman\n",
+            "   CarNumber: \"18\"\n",
+            "   CarClassID: 2523\n",
+            "   CarClassShortName: LMP2\n",
+            " - CarIdx: 63\n",
+            "   UserName: Pace Car\n",
+            "   UserID: 0\n",
+            "   CarNumber: \"0\"\n",
+            "   CarClassID: 11\n",
+            "   CarClassShortName: Pace\n",
+        );
 
     #[test]
     fn parse_returns_all_drivers() {
@@ -439,6 +548,9 @@ DriverInfo:
         assert_eq!(car.car_class_short_name, Some("GTP".to_string()));
         assert_eq!(car.car_class_id, Some(4011));
         assert_eq!(car.user_id, Some(123456));
+        assert_eq!(car.irating, None);
+        assert_eq!(car.lic_string, None);
+        assert_eq!(car.flair_name, None);
     }
 
     #[test]
@@ -462,6 +574,9 @@ DriverInfo:
         // carIdx 2 has no TeamName or UserID keys at all
         assert_eq!(car.team_name, None);
         assert_eq!(car.user_id, None);
+        assert_eq!(car.irating, None);
+        assert_eq!(car.lic_string, None);
+        assert_eq!(car.flair_name, None);
     }
 
     #[test]
@@ -509,4 +624,74 @@ DriverInfo:
             .expect("should find carIdx 0");
         assert_eq!(car.driver_name, "Paul Crofts");
     }
+
+    #[test]
+    fn parse_sub_session_id_skips_zero_and_finds_later_positive() {
+        let yaml = r#"
+WeekendInfo:
+    TrackName: okayama full
+    SubSessionID: 0
+SessionInfo:
+    Sessions:
+        - SessionType: Practice
+WeekendInfo2:
+    SubSessionID: 123456789
+"#;
+        assert_eq!(parse_sub_session_id(yaml), Some(123456789));
+    }
+
+    #[test]
+    fn parse_sub_session_id_accepts_quoted_values() {
+        let yaml = r#"
+WeekendInfo:
+    SubSessionId: "987654321"
+"#;
+        assert_eq!(parse_sub_session_id(yaml), Some(987654321));
+    }
+
+    #[test]
+    fn enrichment_fields_parse_when_present() {
+        let yaml = r#"
+DriverInfo:
+ DriverCarIdx: 0
+ Drivers:
+ - { CarIdx: 0, UserName: Paul Crofts, UserID: 123456, IRating: 2680, LicString: "D 2.79", FlairName: "United States", CarNumber: "42", CarClassID: 4011, CarClassShortName: GTP }
+"#;
+        let roster = SessionInfoParser::build(yaml).expect("parse");
+        let car = roster.lookup(0).expect("carIdx 0 should exist");
+        assert_eq!(car.irating, Some(2680));
+        assert_eq!(car.lic_string, Some("D 2.79".to_string()));
+        assert_eq!(car.flair_name, Some("United States".to_string()));
+    }
+
+        #[test]
+        fn session_metadata_uses_trackname_and_default_session_when_index_invalid() {
+                let yaml = r#"
+WeekendInfo:
+    TrackName: test_track
+SessionInfo:
+    Sessions:
+        - SessionType: Practice
+            SessionLaps: "unlimited"
+        - SessionType: Race
+            SessionLaps: 30
+"#;
+                let meta = SessionMetadata::parse(yaml, -1);
+                assert_eq!(meta.track_name.as_deref(), Some("test_track"));
+                assert_eq!(meta.session_type.as_deref(), Some("Practice"));
+                assert_eq!(meta.session_laps.as_deref(), Some("unlimited"));
+        }
+
+        #[test]
+        fn session_metadata_fallback_line_scan_handles_minimal_yaml() {
+                let yaml = r#"
+TrackDisplayName: Sample Circuit
+SessionType: Race
+SessionLaps: 45
+"#;
+                let meta = SessionMetadata::parse(yaml, 2);
+                assert_eq!(meta.track_name.as_deref(), Some("Sample Circuit"));
+                assert_eq!(meta.session_type.as_deref(), Some("Race"));
+                assert_eq!(meta.session_laps.as_deref(), Some("45"));
+        }
 }
