@@ -217,7 +217,10 @@ mod platform {
             let bytes = &mmap[start..start + len];
             // The YAML string is null-terminated; trim to first null.
             let end = bytes.iter().position(|&b| b == 0).unwrap_or(len);
-            String::from_utf8(bytes[..end].to_vec()).ok()
+            // iRacing payloads are expected to be UTF-8, but some sessions can
+            // contain non-UTF8 bytes in free-text fields (driver/team names).
+            // Use a lossy decode so YAML key scanning still succeeds.
+            Some(String::from_utf8_lossy(&bytes[..end]).into_owned())
         }
 
         /// `true` if the iRacing status field still shows a live session.

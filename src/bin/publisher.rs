@@ -202,6 +202,8 @@ fn pipeline_main(
     let mut last_session_num: Option<i32> = None;
     let mut current_session_meta: Option<SessionMetadata> = None;
     let mut last_frame: Option<TelemetryFrame> = None;
+    let mut session_info_read_failures: u32 = 0;
+    let mut sub_session_blocked_frames: u32 = 0;
     // Car-scoped events held back while the roster hasn't yet resolved driverName.
     // Flushed after each roster update. Capped at 64 entries.
     let mut pending_events: Vec<PublisherEvent> = Vec::new();
@@ -275,6 +277,7 @@ fn pipeline_main(
                 // transitions are not missed if the SessionInfoUpdate var is absent.
                 if session_num_changed || roster_cache.needs_update(frame.session_info_update) {
                     if let Some(yaml) = reader.read_session_info() {
+                        session_info_read_failures = 0;
                         // For AI/offline sessions iRacing never assigns a real
                         // SubSessionID (always 0). Detect this and synthesise a
                         // stable negative ID so events are still published.
@@ -403,6 +406,16 @@ fn pipeline_main(
                         }
 
                         last_session_num = Some(frame.session_num);
+                    } else {
+                        session_info_read_failures = session_info_read_failures.saturating_add(1);
+                        if session_info_read_failures == 1 || session_info_read_failures % 300 == 0 {
+                            eprintln!(
+                                "[publisher] SessionInfo read failed (update={}, session_num={}, attempts={})",
+                                frame.session_info_update,
+                                frame.session_num,
+                                session_info_read_failures,
+                            );
+                        }
                     }
                 }
 
@@ -450,8 +463,16 @@ fn pipeline_main(
                 // Flush — skip until subSessionId is resolved to avoid persisting
                 // events against a ghost session keyed on subSessionId=0.
                 if sub_session_id == 0 {
+                    sub_session_blocked_frames = sub_session_blocked_frames.saturating_add(1);
+                    if sub_session_blocked_frames == 1 || sub_session_blocked_frames % 300 == 0 {
+                        eprintln!(
+                            "[publisher] publishing paused: unresolved subSessionId (SessionInfoUpdate={})",
+                            frame.session_info_update,
+                        );
+                    }
                     continue;
                 }
+                sub_session_blocked_frames = 0;
                 match transport.tick_result(
                     frame.session_time as f64,
                     frame.session_tick,
@@ -584,6 +605,10 @@ fn log_event(
         RaceEvent::RaceCheckered { .. }        => println!("[publisher] RACE_CHECKERED — session event"),
         RaceEvent::FlagYellowFullCourse { .. } => println!("[publisher] FLAG_YELLOW_FULL_COURSE — session event"),
         RaceEvent::FlagYellowLocal { .. }      => println!("[publisher] FLAG_YELLOW_LOCAL"),
+        RaceEvent::IncidentAlert { car_idx, reason, speed_drop_mps, .. } => {
+            let player = car_num(roster, *car_idx);
+            println!("[publisher] INCIDENT_ALERT — #{player}, {reason}, speed drop {speed_drop_mps:.1} m/s");
+        }
         RaceEvent::BattleEngaged { player_car_idx, opponent_car_idx, gap_s, .. } => {
             let player = car_num(roster, *player_car_idx);
             let opp    = car_num(roster, *opponent_car_idx);

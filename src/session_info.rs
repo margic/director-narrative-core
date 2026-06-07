@@ -310,20 +310,18 @@ fn parse_metadata_fallback(yaml: &str) -> SessionMetadata {
 /// Returns `None` if the key is absent or not parseable as `i64`.
 pub fn parse_sub_session_id(yaml: &str) -> Option<i64> {
     for line in yaml.lines() {
-        let line = line.trim();
-        // iRacing YAML uses "SubSessionID" in older SDK builds and
-        // "SubSessionId" in newer ones — accept both.
-        let value = if let Some(rest) = line.strip_prefix("SubSessionID:") {
-            Some(rest)
-        } else if let Some(rest) = line.strip_prefix("SubSessionId:") {
-            Some(rest)
-        } else {
-            None
-        };
-        if let Some(rest) = value {
+        let line = line.trim().trim_start_matches('-').trim_start();
+        if let Some((key, rest)) = line.split_once(':') {
+            // Accept common casing variants seen across SDK versions.
+            let is_sub_session_key = key.eq_ignore_ascii_case("SubSessionID")
+                || key.eq_ignore_ascii_case("SubSessionId");
+            if !is_sub_session_key {
+                continue;
+            }
+
             // Ignore placeholder zeros and keep scanning. Some SessionInfo blobs
             // can contain multiple SubSessionID keys, with an early value of 0.
-            let raw = rest.trim().trim_matches('"');
+            let raw = rest.trim().trim_matches('"').replace(',', "");
             let parsed: Option<i64> = raw.parse().ok();
             if let Some(v) = parsed.filter(|&v| v > 0) {
                 return Some(v);
