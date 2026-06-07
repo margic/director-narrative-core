@@ -134,6 +134,7 @@ fn primary_car_idx(event: &RaceEvent, player_car_idx: u8) -> u8 {
         RaceEvent::BattleEngaged  { opponent_car_idx, .. }
         | RaceEvent::BattleBroken  { opponent_car_idx, .. }
         | RaceEvent::BattleClosing { opponent_car_idx, .. } => *opponent_car_idx,
+        RaceEvent::IncidentAlert { car_idx, .. } => *car_idx,
         _ => player_car_idx,
     }
 }
@@ -301,6 +302,19 @@ fn enrich_payload(
             // Cluster centroid lap distance percentage
             obj.insert("lapDistPct".to_owned(), json!((lap_dist_pct_from + lap_dist_pct_to) / 2.0));
         }
+        RaceEvent::IncidentAlert { driver_incident_count, previous_track_surface, current_track_surface, previous_speed_mps, current_speed_mps, speed_drop_mps, severity, reason, .. } => {
+            obj.insert(
+                "driverIncidentCount".to_owned(),
+                driver_incident_count.map(Value::from).unwrap_or(Value::Null),
+            );
+            obj.insert("previousTrackSurface".to_owned(), json!(previous_track_surface));
+            obj.insert("currentTrackSurface".to_owned(), json!(current_track_surface));
+            obj.insert("previousSpeedMps".to_owned(), json!(previous_speed_mps));
+            obj.insert("currentSpeedMps".to_owned(), json!(current_speed_mps));
+            obj.insert("speedDropMps".to_owned(), json!(speed_drop_mps));
+            obj.insert("severityScore".to_owned(), json!(severity));
+            obj.insert("reason".to_owned(), Value::String(reason.clone()));
+        }
         RaceEvent::FlagYellowLocal { trigger_car_idx, lap_dist_pct, scope, .. } => {
             // Resolve trigger car to a structured CarRef when known.
             if let Some(idx) = trigger_car_idx {
@@ -408,6 +422,7 @@ mod tests {
             session_tick: 9876,
             session_state: 4,
             session_num: 0,
+            player_incident_count: 0,
             car_idx_lap_completed: vec![3, 3],
             lf_temp_m: 0.0,
             rf_temp_m: 0.0,

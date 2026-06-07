@@ -271,6 +271,7 @@ mod tests {
             session_tick: tick,
             session_state: 4,
             session_num: 0,
+            player_incident_count: 0,
             car_idx_lap_completed: vec![3, 3],
             lf_temp_m: 0.0,
             rf_temp_m: 0.0,

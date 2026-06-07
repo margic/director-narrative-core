@@ -79,6 +79,9 @@ pub const REQUIRED_VARS: &[&str] = &[
     "SessionTick",
     "SessionState",
     "SessionNum",
+    "PlayerCarMyIncidentCount",
+    // Optional — absent in some sessions; defaults to empty vec.
+    "CarIdxTrackSurface",
     // Optional — int array, same pattern as CarIdxPosition.
     "CarIdxLapCompleted",
 ];
@@ -172,6 +175,11 @@ pub fn build_frame(buf: &[u8], vars: &VarIndex, header_session_info_update: u32)
         .map(|v| read_i32(buf, v.offset))
         .unwrap_or(0);
 
+    let player_incident_count = vars
+        .get("PlayerCarMyIncidentCount")
+        .map(|v| read_i32(buf, v.offset))
+        .unwrap_or(0);
+
     let car_idx_lap_completed = vars
         .get("CarIdxLapCompleted")
         .filter(|v| v.type_code == IR_INT)
@@ -213,6 +221,7 @@ pub fn build_frame(buf: &[u8], vars: &VarIndex, header_session_info_update: u32)
         session_tick,
         session_state,
         session_num,
+        player_incident_count,
         car_idx_lap_completed,
         lf_temp_m,
         rf_temp_m,

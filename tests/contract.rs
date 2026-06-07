@@ -22,6 +22,7 @@ fn minimal_frame() -> TelemetryFrame {
         session_tick: 9876,
         session_state: 4,
         session_num: 0,
+        player_incident_count: 0,
         car_idx_lap_completed: vec![3, 3],
         lf_temp_m: 0.0,
         rf_temp_m: 0.0,
@@ -70,7 +71,7 @@ fn lap_completed_contract_includes_aliases_and_snake_case_fields() {
         pit_frames: 0,
     };
 
-    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001");
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001", None, None);
     let json = normalized_event_json(&env);
 
     assert_envelope_contract(&json, "LAP_COMPLETED");
@@ -99,7 +100,7 @@ fn battle_contract_includes_leader_and_follower_numbers() {
         engagement_started_at_session_time_s: 12.0,
     };
 
-    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001");
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001", None, None);
     let json = normalized_event_json(&env);
 
     assert_envelope_contract(&json, "BATTLE_ENGAGED");
@@ -137,7 +138,7 @@ fn battle_closing_contract_uses_opponent_car_as_primary_identity() {
         prior_attack_time_s: 0.0,
     };
 
-    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001");
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001", None, None);
     let json = normalized_event_json(&env);
 
     assert_envelope_contract(&json, "BATTLE_CLOSING");
@@ -161,7 +162,7 @@ fn overtake_includes_overtaking_and_overtaken_cars() {
         positions_gained: 1,
     };
 
-    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001");
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001", None, None);
     let json = normalized_event_json(&env);
 
     assert_envelope_contract(&json, "OVERTAKE");
@@ -194,7 +195,7 @@ fn overtake_can_emit_without_overtaken_car_when_uncertain() {
         positions_gained: 1,
     };
 
-    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001");
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001", None, None);
     let json = normalized_event_json(&env);
 
     assert_envelope_contract(&json, "OVERTAKE");
@@ -224,7 +225,7 @@ fn overtake_for_lead_includes_both_cars() {
         positions_gained: 1,
     };
 
-    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001");
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001", None, None);
     let json = normalized_event_json(&env);
 
     assert_envelope_contract(&json, "OVERTAKE_FOR_LEAD");
@@ -251,7 +252,7 @@ fn battle_events_identify_both_sides_directly() {
         engagement_started_at_session_time_s: 50.0,
     };
 
-    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001");
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001", None, None);
     let json = normalized_event_json(&env);
 
     assert_envelope_contract(&json, "BATTLE_ENGAGED");
@@ -284,7 +285,7 @@ fn battle_engaged_includes_engagement_start_time() {
         engagement_started_at_session_time_s: 200.0,
     };
 
-    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001");
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001", None, None);
     let json = normalized_event_json(&env);
 
     assert_envelope_contract(&json, "BATTLE_ENGAGED");
@@ -317,7 +318,7 @@ fn battle_broken_contract_uses_final_gap_sec_and_duration() {
         engagement_started_at_session_time_s: 320.0,
     };
 
-    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001");
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001", None, None);
     let json = normalized_event_json(&env);
 
     assert_envelope_contract(&json, "BATTLE_BROKEN");
@@ -364,7 +365,7 @@ fn traffic_intercept_includes_structured_car_ref() {
         predicted_intercept_session_time: 200.0,
     };
 
-    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001");
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001", None, None);
     let json = normalized_event_json(&env);
 
     assert_envelope_contract(&json, "TRAFFIC_INTERCEPT");
@@ -392,7 +393,7 @@ fn horizon_closing_includes_both_car_refs() {
         estimated_laps_to_contact: 8,
     };
 
-    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001");
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001", None, None);
     let json = normalized_event_json(&env);
 
     assert_envelope_contract(&json, "HORIZON_CLOSING");
@@ -424,7 +425,7 @@ fn incident_cluster_includes_all_car_refs() {
         incident_type: Some("Incident".to_owned()),
     };
 
-    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001");
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001", None, None);
     let json = normalized_event_json(&env);
 
     assert_envelope_contract(&json, "INCIDENT_CLUSTER");
@@ -453,6 +454,38 @@ fn incident_cluster_includes_all_car_refs() {
 }
 
 #[test]
+fn incident_alert_includes_surface_and_speed_fields() {
+    let event = RaceEvent::IncidentAlert {
+        lap: 6,
+        session_time: 370.0,
+        car_idx: 1,
+        driver_incident_count: Some(4),
+        previous_track_surface: 3,
+        current_track_surface: 1,
+        previous_speed_mps: 68.0,
+        current_speed_mps: 48.0,
+        speed_drop_mps: 20.0,
+        severity: 0.29411766,
+        reason: "surface_change".to_owned(),
+    };
+
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001", None, None);
+    let json = normalized_event_json(&env);
+
+    assert_envelope_contract(&json, "INCIDENT_ALERT");
+    assert_eq!(json["scope"], "CAR_SCOPED");
+    assert!(json["car"].is_object());
+    assert_eq!(json["car"]["carIdx"], 1);
+    assert_eq!(json["payload"]["previousTrackSurface"], 3);
+    assert_eq!(json["payload"]["currentTrackSurface"], 1);
+    assert_eq!(json["payload"]["driverIncidentCount"], 4);
+    assert_eq!(json["payload"]["previousSpeedMps"], 68.0);
+    assert_eq!(json["payload"]["currentSpeedMps"], 48.0);
+    assert_eq!(json["payload"]["speedDropMps"], 20.0);
+    assert_eq!(json["payload"]["reason"], "surface_change");
+}
+
+#[test]
 fn battle_broken_with_no_gap_emits_null_final_gap() {
     let event = RaceEvent::BattleBroken {
         lap: 7,
@@ -464,7 +497,7 @@ fn battle_broken_with_no_gap_emits_null_final_gap() {
         engagement_started_at_session_time_s: 390.0,
     };
 
-    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001");
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001", None, None);
     let json = normalized_event_json(&env);
 
     assert_envelope_contract(&json, "BATTLE_BROKEN");
@@ -495,7 +528,7 @@ fn flag_yellow_local_includes_location_and_trigger() {
         linked_incident_id: Some(8),
     };
 
-    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001");
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001", None, None);
     let json = normalized_event_json(&env);
 
     assert_envelope_contract(&json, "FLAG_YELLOW_LOCAL");
@@ -543,7 +576,7 @@ fn flag_yellow_local_unknown_scope_omits_trigger_car() {
         linked_incident_id: None,
     };
 
-    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001");
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001", None, None);
     let json = normalized_event_json(&env);
 
     assert_envelope_contract(&json, "FLAG_YELLOW_LOCAL");
@@ -566,7 +599,7 @@ fn session_wide_events_not_car_scoped() {
         session_time: 10.0,
     };
 
-    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001");
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001", None, None);
     let json = normalized_event_json(&env);
 
     assert_envelope_contract(&json, "RACE_GREEN");
@@ -582,11 +615,36 @@ fn session_event_envelope_does_not_include_player_car_ref() {
         session_time: 200.0,
     };
 
-    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001");
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001", None, None);
     let json = normalized_event_json(&env);
 
     assert_envelope_contract(&json, "FLAG_YELLOW_FULL_COURSE");
     assert_eq!(json["scope"], "SESSION_SCOPED");
     assert_eq!(json["payload"]["eventScope"], "SESSION_SCOPED");
     assert!(json.get("car").is_none());
+}
+
+#[test]
+fn micro_sector_loss_contract_is_car_scoped() {
+    let event = RaceEvent::MicroSectorLoss {
+        lap: 7,
+        session_time: 420.0,
+        bucket_from: 12,
+        bucket_to: 15,
+        lap_dist_pct_from: 0.60,
+        lap_dist_pct_to: 0.80,
+        cumulative_delta_s: 0.24,
+    };
+
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001", None, None);
+    let json = normalized_event_json(&env);
+
+    assert_envelope_contract(&json, "MICRO_SECTOR_LOSS");
+    assert_eq!(json["scope"], "CAR_SCOPED");
+    assert_eq!(json["payload"]["eventScope"], "CAR_SCOPED");
+    assert!(json["car"].is_object());
+    assert_eq!(json["payload"]["bucket_from"], 12);
+    assert_eq!(json["payload"]["bucket_to"], 15);
+    let delta = json["payload"]["cumulative_delta_s"].as_f64().expect("delta should be numeric");
+    assert!((delta - 0.24).abs() < 1e-4);
 }

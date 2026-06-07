@@ -103,6 +103,24 @@ pub enum RaceEvent {
         lap:          u8,
         session_time: f32,
     },
+    IracingConnected {
+        lap:          u8,
+        session_time: f32,
+    },
+    IracingDisconnected {
+        lap:          u8,
+        session_time: f32,
+    },
+    DriverEnteredCar {
+        lap:            u8,
+        session_time:   f32,
+        player_car_idx: u8,
+    },
+    DriverExitedCar {
+        lap:            u8,
+        session_time:   f32,
+        player_car_idx: u8,
+    },
     Overtake {
         lap:                u8,
         session_time:       f32,
@@ -168,6 +186,19 @@ pub enum RaceEvent {
         coast_duration_s:         f32,
         coast_start_lap_dist_pct: f32,
         coast_start_speed_mps:    f32,
+    },
+    IncidentAlert {
+        lap:                    u8,
+        session_time:           f32,
+        car_idx:                u8,
+        driver_incident_count:  Option<i32>,
+        previous_track_surface: i32,
+        current_track_surface:  i32,
+        previous_speed_mps:     f32,
+        current_speed_mps:      f32,
+        speed_drop_mps:         f32,
+        severity:               f32,
+        reason:                 String,
     },
     MicroSectorGain {
         lap:               u8,
@@ -284,7 +315,10 @@ impl RaceEvent {
             Self::RaceGreen { .. }
             | Self::RaceCheckered { .. }
             | Self::FlagYellowFullCourse { .. } => EventScope::SessionScoped,
-            Self::PublisherHello { .. } | Self::PublisherGoodbye { .. } => EventScope::RigScoped,
+            Self::PublisherHello { .. }
+            | Self::PublisherGoodbye { .. }
+            | Self::IracingConnected { .. }
+            | Self::IracingDisconnected { .. } => EventScope::RigScoped,
             _ => EventScope::CarScoped,
         }
     }

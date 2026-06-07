@@ -44,6 +44,10 @@ pub struct TelemetryFrame {
     /// Absent from JSONL fixtures; defaults to 0.
     #[serde(default)]
     pub session_num:          i32,
+    /// Player incident count from iRacing (`PlayerCarMyIncidentCount`).
+    /// Absent from some fixtures/mocks; defaults to 0.
+    #[serde(default)]
+    pub player_incident_count: i32,
     /// Laps completed per car, indexed by car_idx.
     /// Used to provide `leaderLap` context in `PublisherEventContext`.
     /// Absent from JSONL fixtures; defaults to empty vec.

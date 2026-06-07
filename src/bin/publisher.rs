@@ -142,7 +142,7 @@ fn pipeline_main(
         engine::NarrativeEngine,
         lifecycle::LifecyclePublisher,
         publisher_event::{build_event, PublisherEvent},
-        race_event::EventScope,
+        race_event::{EventScope, RaceEvent},
         session_info::{is_ai_session, parse_sub_session_id, synthetic_sub_session_id, RosterCache, SessionMetadata},
         telemetry_frame::TelemetryFrame,
         transport::PublisherTransport,
@@ -204,6 +204,7 @@ fn pipeline_main(
     let mut last_frame: Option<TelemetryFrame> = None;
     let mut session_info_read_failures: u32 = 0;
     let mut sub_session_blocked_frames: u32 = 0;
+    let mut emit_iracing_connected = true;
     // Car-scoped events held back while the roster hasn't yet resolved driverName.
     // Flushed after each roster update. Capped at 64 entries.
     let mut pending_events: Vec<PublisherEvent> = Vec::new();
@@ -242,6 +243,29 @@ fn pipeline_main(
     while running.load(Ordering::SeqCst) {
         if !reader.is_connected() {
             println!("[publisher] iRacing disconnected — reconnecting...");
+            if sub_session_id > 0 {
+                if let Some(frame) = &last_frame {
+                    let disconnected = RaceEvent::IracingDisconnected {
+                        lap: frame.lap,
+                        session_time: frame.session_time,
+                    };
+                    log_event(&disconnected, roster_cache.roster(), frame);
+                    let pe = build_event(
+                        &disconnected,
+                        frame,
+                        roster_cache.roster(),
+                        &race_session_id,
+                        &rig_id,
+                        current_session_meta.as_ref(),
+                        Some(sub_session_id),
+                    );
+                    transport.enqueue(pe);
+                    status.lock().unwrap().events_enqueued_total += 1;
+                    if let Err(e) = transport.flush(frame.session_time as f64, frame.session_tick, sub_session_id) {
+                        eprintln!("[publisher] flush error after IRACING_DISCONNECTED: {e}");
+                    }
+                }
+            }
             {
                 let mut s = status.lock().unwrap();
                 s.iracing_connected = false;
@@ -262,6 +286,7 @@ fn pipeline_main(
             last_session_num = None;
             current_session_meta = None;
             race_session_id = String::new();
+            emit_iracing_connected = true;
             println!("[publisher] reconnected");
             status.lock().unwrap().iracing_connected = true;
             continue;
@@ -385,6 +410,26 @@ fn pipeline_main(
                         // and queueing a HELLO with race_session_id="0" could leave
                         // a stale event in the transport queue after the first transition.
                         if lifecycle.is_fresh() && sub_session_id > 0 {
+                            if emit_iracing_connected {
+                                let connected = RaceEvent::IracingConnected {
+                                    lap: frame.lap,
+                                    session_time: frame.session_time,
+                                };
+                                log_event(&connected, roster_cache.roster(), &frame);
+                                let pe = build_event(
+                                    &connected,
+                                    &frame,
+                                    roster_cache.roster(),
+                                    &race_session_id,
+                                    &rig_id,
+                                    current_session_meta.as_ref(),
+                                    Some(sub_session_id),
+                                );
+                                transport.enqueue(pe);
+                                status.lock().unwrap().events_enqueued_total += 1;
+                                emit_iracing_connected = false;
+                            }
+
                             let hello = lifecycle.on_activate(frame.lap, frame.session_time);
                             let pe = build_event(
                                 &hello,
@@ -605,6 +650,16 @@ fn log_event(
         RaceEvent::RaceCheckered { .. }        => println!("[publisher] RACE_CHECKERED — session event"),
         RaceEvent::FlagYellowFullCourse { .. } => println!("[publisher] FLAG_YELLOW_FULL_COURSE — session event"),
         RaceEvent::FlagYellowLocal { .. }      => println!("[publisher] FLAG_YELLOW_LOCAL"),
+        RaceEvent::IracingConnected { .. }     => println!("[publisher] IRACING_CONNECTED — telemetry feed available"),
+        RaceEvent::IracingDisconnected { .. }  => println!("[publisher] IRACING_DISCONNECTED — telemetry feed dropped"),
+        RaceEvent::DriverEnteredCar { player_car_idx, .. } => {
+            let player = car_num(roster, *player_car_idx);
+            println!("[publisher] DRIVER_ENTERED_CAR — #{player}");
+        }
+        RaceEvent::DriverExitedCar { player_car_idx, .. } => {
+            let player = car_num(roster, *player_car_idx);
+            println!("[publisher] DRIVER_EXITED_CAR — #{player}");
+        }
         RaceEvent::IncidentAlert { car_idx, reason, speed_drop_mps, .. } => {
             let player = car_num(roster, *car_idx);
             println!("[publisher] INCIDENT_ALERT — #{player}, {reason}, speed drop {speed_drop_mps:.1} m/s");

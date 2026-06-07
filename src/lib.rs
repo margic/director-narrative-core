@@ -1,5 +1,6 @@
 pub mod anchor_sampler;
 pub mod battle_state;
+pub mod basic_incident;
 pub mod braking_profile;
 pub mod car_registry;
 pub mod compression_zone;

@@ -133,7 +133,7 @@ mod platform {
 
             // Verify that non-optional required vars are present.
             let optional = ["LapLastLapTime", "SessionTick",
-                            "SessionState", "SessionNum", "CarIdxLapCompleted"];
+                            "SessionState", "SessionNum", "CarIdxTrackSurface", "CarIdxLapCompleted"];
             let missing = REQUIRED_VARS.iter()
                 .filter(|&&n| !optional.contains(&n))
                 .any(|name| !var_index.contains_key(*name));

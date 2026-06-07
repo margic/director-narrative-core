@@ -1,5 +1,8 @@
 use crate::race_event::RaceEvent;
 
+const MIN_BUCKET_DELTA_S: f32 = 0.005;
+const MIN_STREAK_DELTA_S: f32 = 0.02;
+
 pub struct MicroSectorTracker {
     pub best_seg: Vec<Option<f32>>,
     pub current_lap_times: Vec<Option<f32>>,
@@ -37,28 +40,97 @@ impl MicroSectorTracker {
     pub fn on_lap_end(&mut self, lap: u8, session_time: f32, clean_lap: bool) -> Vec<RaceEvent> {
         let mut events = Vec::new();
         if clean_lap && self.clean_laps_completed > 0 {
-            let mut streak_start = None;
-            let mut streak_delta = 0.0;
-            let mut streak_end = 0u8;
+            let mut gain_start = None;
+            let mut gain_delta = 0.0;
+            let mut gain_end = 0u8;
+
+            let mut loss_start = None;
+            let mut loss_delta = 0.0;
+            let mut loss_end = 0u8;
+
             for idx in 0..self.current_lap_times.len() {
                 match (self.current_lap_times[idx], self.best_seg[idx]) {
                     (Some(cur), Some(best)) if cur < best => {
-                        if streak_start.is_none() {
-                            streak_start = Some(idx as u8);
-                            streak_delta = 0.0;
+                        let delta = best - cur;
+                        if delta < MIN_BUCKET_DELTA_S {
+                            if let Some(start) = gain_start.take() {
+                                if gain_delta >= MIN_STREAK_DELTA_S {
+                                    events.push(gain_event(lap, session_time, start, gain_end, gain_delta, self.current_lap_times.len()));
+                                }
+                            }
+                            if let Some(start) = loss_start.take() {
+                                if loss_delta >= MIN_STREAK_DELTA_S {
+                                    events.push(loss_event(lap, session_time, start, loss_end, loss_delta, self.current_lap_times.len()));
+                                }
+                            }
+                            continue;
                         }
-                        streak_delta += best - cur;
-                        streak_end = idx as u8;
+
+                        if let Some(start) = loss_start.take() {
+                            if loss_delta >= MIN_STREAK_DELTA_S {
+                                events.push(loss_event(lap, session_time, start, loss_end, loss_delta, self.current_lap_times.len()));
+                            }
+                        }
+
+                        if gain_start.is_none() {
+                            gain_start = Some(idx as u8);
+                            gain_delta = 0.0;
+                        }
+                        gain_delta += delta;
+                        gain_end = idx as u8;
+                    }
+                    (Some(cur), Some(best)) if cur > best => {
+                        let delta = cur - best;
+                        if delta < MIN_BUCKET_DELTA_S {
+                            if let Some(start) = gain_start.take() {
+                                if gain_delta >= MIN_STREAK_DELTA_S {
+                                    events.push(gain_event(lap, session_time, start, gain_end, gain_delta, self.current_lap_times.len()));
+                                }
+                            }
+                            if let Some(start) = loss_start.take() {
+                                if loss_delta >= MIN_STREAK_DELTA_S {
+                                    events.push(loss_event(lap, session_time, start, loss_end, loss_delta, self.current_lap_times.len()));
+                                }
+                            }
+                            continue;
+                        }
+
+                        if let Some(start) = gain_start.take() {
+                            if gain_delta >= MIN_STREAK_DELTA_S {
+                                events.push(gain_event(lap, session_time, start, gain_end, gain_delta, self.current_lap_times.len()));
+                            }
+                        }
+
+                        if loss_start.is_none() {
+                            loss_start = Some(idx as u8);
+                            loss_delta = 0.0;
+                        }
+                        loss_delta += delta;
+                        loss_end = idx as u8;
                     }
                     _ => {
-                        if let Some(start) = streak_start.take() {
-                            events.push(gain_event(lap, session_time, start, streak_end, streak_delta, self.current_lap_times.len()));
+                        if let Some(start) = gain_start.take() {
+                            if gain_delta >= MIN_STREAK_DELTA_S {
+                                events.push(gain_event(lap, session_time, start, gain_end, gain_delta, self.current_lap_times.len()));
+                            }
+                        }
+                        if let Some(start) = loss_start.take() {
+                            if loss_delta >= MIN_STREAK_DELTA_S {
+                                events.push(loss_event(lap, session_time, start, loss_end, loss_delta, self.current_lap_times.len()));
+                            }
                         }
                     }
                 }
             }
-            if let Some(start) = streak_start.take() {
-                events.push(gain_event(lap, session_time, start, streak_end, streak_delta, self.current_lap_times.len()));
+            if let Some(start) = gain_start.take() {
+                if gain_delta >= MIN_STREAK_DELTA_S {
+                    events.push(gain_event(lap, session_time, start, gain_end, gain_delta, self.current_lap_times.len()));
+                }
+            }
+            if let Some(start) = loss_start.take() {
+                if loss_delta >= MIN_STREAK_DELTA_S {
+                    events.push(loss_event(lap, session_time, start, loss_end, loss_delta, self.current_lap_times.len()));
+                }
             }
         }
 
@@ -93,6 +165,18 @@ fn gain_event(lap: u8, session_time: f32, start: u8, end: u8, delta: f32, anchor
     }
 }
 
+fn loss_event(lap: u8, session_time: f32, start: u8, end: u8, delta: f32, anchor_count: usize) -> RaceEvent {
+    RaceEvent::MicroSectorLoss {
+        lap,
+        session_time,
+        bucket_from: start,
+        bucket_to: end,
+        lap_dist_pct_from: start as f32 / anchor_count as f32,
+        lap_dist_pct_to: (end as f32 + 1.0) / anchor_count as f32,
+        cumulative_delta_s: delta,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,5 +195,46 @@ mod tests {
         }
         let events = tracker.on_lap_end(2, 120.0, true);
         assert!(events.iter().any(|event| matches!(event, RaceEvent::MicroSectorGain { bucket_from: 12, bucket_to: 15, .. })));
+    }
+
+    #[test]
+    fn emits_loss_for_degraded_anchor_run() {
+        let mut tracker = MicroSectorTracker::new(20);
+        for bucket in 0..20u8 {
+            tracker.on_anchor_crossing(bucket as f32, bucket);
+        }
+        tracker.on_lap_end(1, 60.0, true);
+
+        for bucket in 0..20u8 {
+            let t = if (8..=10).contains(&bucket) {
+                bucket as f32 + 0.03 * (bucket - 7) as f32
+            } else {
+                bucket as f32
+            };
+            tracker.on_anchor_crossing(t, bucket);
+        }
+        let events = tracker.on_lap_end(2, 120.0, true);
+        assert!(events.iter().any(|event| matches!(event, RaceEvent::MicroSectorLoss { bucket_from: 8, bucket_to: 10, .. })));
+    }
+
+    #[test]
+    fn dirty_lap_emits_no_micro_sector_events() {
+        let mut tracker = MicroSectorTracker::new(20);
+        for bucket in 0..20u8 {
+            tracker.on_anchor_crossing(bucket as f32, bucket);
+        }
+        tracker.on_lap_end(1, 60.0, true);
+
+        for bucket in 0..20u8 {
+            let t = if (12..=15).contains(&bucket) {
+                bucket as f32 - 0.075 * (bucket - 11) as f32
+            } else {
+                bucket as f32
+            };
+            tracker.on_anchor_crossing(t, bucket);
+        }
+
+        let events = tracker.on_lap_end(2, 120.0, false);
+        assert!(events.is_empty(), "dirty laps must not emit micro-sector gain/loss events");
     }
 }

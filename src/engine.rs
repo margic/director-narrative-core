@@ -6,6 +6,7 @@ use crate::battle_state::{
 };
 use crate::braking_profile::BrakingProfileDetector;
 use crate::car_registry::CarRegistry;
+use crate::basic_incident::BasicIncidentDetector;
 use crate::compression_zone::CompressionZoneDetector;
 use crate::fuel_projection::FuelProjection;
 use crate::gap_finder::{find_cars_ahead, find_cars_behind};
@@ -62,11 +63,13 @@ pub struct NarrativeEngine {
     engagement_start_beh_t: Option<f32>,
     prev_session_state: i32,
     prev_session_flags: u32,
+    prev_in_car: bool,
     prev_lap: Option<u8>,
     prev_on_pit: bool,
     prev_position: Option<u8>,
     prev_anchor_bucket: Option<u8>,
     car_registry: CarRegistry,
+    basic_incident: BasicIncidentDetector,
     roster: SessionRoster,
     horizon: HorizonDetector,
     tire_degradation: TireDegradation,
@@ -114,6 +117,7 @@ impl NarrativeEngine {
             engagement_start_beh_t: None,
             prev_session_state: 0,
             prev_session_flags: 0,
+            prev_in_car: false,
             prev_lap: None,
             prev_on_pit: false,
             prev_position: None,
@@ -133,6 +137,7 @@ impl NarrativeEngine {
             track_length_m: 5000.0,
             logged_tire_suppressed: false,
             logged_fuel_suppressed: false,
+            basic_incident: BasicIncidentDetector::new(),
         }
     }
 
@@ -140,6 +145,14 @@ impl NarrativeEngine {
         let mut events = Vec::new();
         self.car_registry
             .update_from_frame(frame, &self.roster, frame.session_tick, self.anchor_count);
+        events.extend(self.basic_incident.update(
+            &self.car_registry,
+            frame.lap,
+            frame.session_time,
+            frame.session_tick,
+            frame.player_car_idx,
+            frame.player_incident_count,
+        ));
         self.tire_degradation.update_ema(frame);
         if let Some(event) = self.lift_coast.update(frame) {
             events.push(event);
@@ -166,6 +179,20 @@ impl NarrativeEngine {
         }
         if session_state == 5 && self.prev_session_state != 5 {
             events.push(RaceEvent::RaceCheckered { lap, session_time: t });
+        }
+        let in_car = session_state != 0;
+        if in_car && !self.prev_in_car {
+            events.push(RaceEvent::DriverEnteredCar {
+                lap,
+                session_time: t,
+                player_car_idx: frame.player_car_idx,
+            });
+        } else if !in_car && self.prev_in_car {
+            events.push(RaceEvent::DriverExitedCar {
+                lap,
+                session_time: t,
+                player_car_idx: frame.player_car_idx,
+            });
         }
         if session_flags & CAUTION != 0 && self.prev_session_flags & CAUTION == 0 {
             events.push(RaceEvent::FlagYellowFullCourse { lap, session_time: t });
@@ -207,6 +234,7 @@ impl NarrativeEngine {
                 linked_incident_id,
             });
         }
+        self.prev_in_car = in_car;
         self.prev_session_state = session_state;
         self.prev_session_flags = session_flags;
 
@@ -681,6 +709,7 @@ mod tests {
             session_tick: 0,
             session_state,
             session_num: 0,
+            player_incident_count: 0,
             car_idx_lap_completed: vec![lap as i32, lap as i32],
             lf_temp_m: 0.0,
             rf_temp_m: 0.0,
@@ -711,6 +740,7 @@ mod tests {
             session_tick: 0,
             session_state: 4,
             session_num: 0,
+            player_incident_count: 0,
             car_idx_lap_completed: vec![lap as i32, lap as i32],
             lf_temp_m: 0.0,
             rf_temp_m: 0.0,
