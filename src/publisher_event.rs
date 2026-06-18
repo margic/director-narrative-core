@@ -205,6 +205,8 @@ fn enrich_payload(
                 leader_follower_indices(frame, *player_car_idx, *opponent_car_idx);
             let leader = resolve_car(leader_idx, roster);
             let follower = resolve_car(follower_idx, roster);
+            let leader_pos = car_race_position(frame, leader_idx);
+            let follower_pos = car_race_position(frame, follower_idx);
 
             // Legacy fields for transition window
             obj.insert("leaderCarNumber".to_owned(), Value::String(leader.car_number.clone()));
@@ -213,6 +215,10 @@ fn enrich_payload(
             // New structured car references (primary source of truth)
             obj.insert("leaderCar".to_owned(), serde_json::to_value(&leader).unwrap_or(Value::Null));
             obj.insert("followerCar".to_owned(), serde_json::to_value(&follower).unwrap_or(Value::Null));
+
+            // Explicit race positions for both sides of the battle.
+            obj.insert("leaderRacePosition".to_owned(), option_u8_json(leader_pos));
+            obj.insert("followerRacePosition".to_owned(), option_u8_json(follower_pos));
 
             // Gap at engagement (sanitized) and engagement start time (camelCase aliases)
             obj.insert("engagementGapSec".to_owned(), sanitize_sentinel_json(*gap_s));
@@ -223,6 +229,8 @@ fn enrich_payload(
                 leader_follower_indices(frame, *player_car_idx, *opponent_car_idx);
             let leader = resolve_car(leader_idx, roster);
             let follower = resolve_car(follower_idx, roster);
+            let leader_pos = car_race_position(frame, leader_idx);
+            let follower_pos = car_race_position(frame, follower_idx);
 
             // Legacy fields for transition window
             obj.insert("leaderCarNumber".to_owned(), Value::String(leader.car_number.clone()));
@@ -231,6 +239,10 @@ fn enrich_payload(
             // New structured car references (primary source of truth)
             obj.insert("leaderCar".to_owned(), serde_json::to_value(&leader).unwrap_or(Value::Null));
             obj.insert("followerCar".to_owned(), serde_json::to_value(&follower).unwrap_or(Value::Null));
+
+            // Explicit race positions for both sides of the battle.
+            obj.insert("leaderRacePosition".to_owned(), option_u8_json(leader_pos));
+            obj.insert("followerRacePosition".to_owned(), option_u8_json(follower_pos));
 
             // Final gap (None when the gap was a sentinel / car no longer visible)
             obj.insert("finalGapSec".to_owned(), option_f32_json(*final_gap_sec));
@@ -242,6 +254,8 @@ fn enrich_payload(
                 leader_follower_indices(frame, *player_car_idx, *opponent_car_idx);
             let leader = resolve_car(leader_idx, roster);
             let follower = resolve_car(follower_idx, roster);
+            let leader_pos = car_race_position(frame, leader_idx);
+            let follower_pos = car_race_position(frame, follower_idx);
             
             // Legacy fields for transition window
             obj.insert("leaderCarNumber".to_owned(), Value::String(leader.car_number.clone()));
@@ -250,6 +264,10 @@ fn enrich_payload(
             // New structured car references (primary source of truth)
             obj.insert("leaderCar".to_owned(), serde_json::to_value(&leader).unwrap_or(Value::Null));
             obj.insert("followerCar".to_owned(), serde_json::to_value(&follower).unwrap_or(Value::Null));
+
+            // Explicit race positions for both sides of the battle.
+            obj.insert("leaderRacePosition".to_owned(), option_u8_json(leader_pos));
+            obj.insert("followerRacePosition".to_owned(), option_u8_json(follower_pos));
         }
         RaceEvent::Overtake { car_idx, overtaken_car_idx, .. } => {
             let overtaking_car = resolve_car(*car_idx, roster);
@@ -361,6 +379,13 @@ fn option_f32_json(v: Option<f32>) -> Value {
     }
 }
 
+fn option_u8_json(v: Option<u8>) -> Value {
+    match v {
+        Some(n) => json!(n),
+        None => Value::Null,
+    }
+}
+
 /// Convert a raw f32 telemetry value to JSON, mapping sentinel values
 /// (NaN, Infinite, or values >= `F32_SENTINEL_THRESHOLD` such as `f32::MAX`)
 /// to `null` to prevent invalid data from reaching Cosmos.
@@ -392,6 +417,14 @@ fn leader_follower_indices(frame: &TelemetryFrame, player_idx: u8, opponent_idx:
         (Some(pp), Some(op)) if pp < op => (player_idx, opponent_idx),
         _ => (player_idx, opponent_idx),
     }
+}
+
+fn car_race_position(frame: &TelemetryFrame, car_idx: u8) -> Option<u8> {
+    frame
+        .car_idx_position
+        .get(car_idx as usize)
+        .copied()
+        .filter(|p| *p > 0)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -570,6 +603,8 @@ mod tests {
         let json: Value = serde_json::to_value(&env).unwrap();
         assert_eq!(json["payload"]["leaderCarNumber"], "1");
         assert_eq!(json["payload"]["followerCarNumber"], "0");
+        assert_eq!(json["payload"]["leaderRacePosition"], 4);
+        assert_eq!(json["payload"]["followerRacePosition"], 5);
     }
 
     #[test]
