@@ -47,6 +47,8 @@ pub struct PublisherSection {
     pub rc_api_url:        String,
     /// Interval between batch POST calls, in milliseconds.
     pub batch_interval_ms: u64,
+    /// Interval between PUBLISHER_HEARTBEAT events, in milliseconds. `0` disables.
+    pub heartbeat_interval_ms: u64,
 }
 
 impl Default for PublisherSection {
@@ -54,6 +56,7 @@ impl Default for PublisherSection {
         Self {
             rc_api_url:        "https://simracecenter.com".to_owned(),
             batch_interval_ms: 500,
+            heartbeat_interval_ms: 15_000,
         }
     }
 }
@@ -124,8 +127,9 @@ struct RawAuth {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct RawPublisher {
-    rc_api_url:        Option<String>,
-    batch_interval_ms: Option<u64>,
+    rc_api_url:            Option<String>,
+    batch_interval_ms:     Option<u64>,
+    heartbeat_interval_ms: Option<u64>,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -176,6 +180,12 @@ fn apply_env_overrides(raw: &mut RawConfig) {
             raw.publisher.batch_interval_ms = Some(n);
         }
     }
+
+    if let Ok(v) = env::var("PUBLISHER_HEARTBEAT_INTERVAL_MS") {
+        if let Ok(n) = v.parse::<u64>() {
+            raw.publisher.heartbeat_interval_ms = Some(n);
+        }
+    }
 }
 
 fn build_and_validate(raw: RawConfig) -> Result<PublisherConfig, ConfigError> {
@@ -208,6 +218,8 @@ fn build_and_validate(raw: RawConfig) -> Result<PublisherConfig, ConfigError> {
                 .unwrap_or(defaults.rc_api_url),
             batch_interval_ms: raw.publisher.batch_interval_ms
                 .unwrap_or(defaults.batch_interval_ms),
+            heartbeat_interval_ms: raw.publisher.heartbeat_interval_ms
+                .unwrap_or(defaults.heartbeat_interval_ms),
         },
     })
 }
@@ -239,8 +251,9 @@ client_secret = "secret-789"
 scope         = "api://rc/.default"
 
 [publisher]
-rc_api_url        = "https://api.example.com"
-batch_interval_ms = 250
+rc_api_url            = "https://api.example.com"
+batch_interval_ms     = 250
+heartbeat_interval_ms = 5000
 "#);
         assert_eq!(cfg.auth.tenant_id,     "tenant-123");
         assert_eq!(cfg.auth.client_id,     "client-456");
@@ -248,6 +261,7 @@ batch_interval_ms = 250
         assert_eq!(cfg.auth.scope,         "api://rc/.default");
         assert_eq!(cfg.publisher.rc_api_url,        "https://api.example.com");
         assert_eq!(cfg.publisher.batch_interval_ms, 250);
+        assert_eq!(cfg.publisher.heartbeat_interval_ms, 5000);
     }
 
     #[test]
@@ -261,6 +275,21 @@ client_secret = "s"
         assert_eq!(cfg.auth.scope,                   "api://racecontrol-api-a780e279-1cb6-4ed0-9ef6-49029aa50a42/.default");
         assert_eq!(cfg.publisher.rc_api_url,         "https://simracecenter.com");
         assert_eq!(cfg.publisher.batch_interval_ms,  500);
+        assert_eq!(cfg.publisher.heartbeat_interval_ms, 15_000);
+    }
+
+    #[test]
+    fn heartbeat_interval_zero_accepted() {
+        let cfg = parse(r#"
+[auth]
+tenant_id     = "t"
+client_id     = "c"
+client_secret = "s"
+
+[publisher]
+heartbeat_interval_ms = 0
+"#);
+        assert_eq!(cfg.publisher.heartbeat_interval_ms, 0);
     }
 
     #[test]
@@ -287,8 +316,9 @@ client_secret = "s"
                 cert_thumbprint: None,
             },
             publisher: RawPublisher {
-                rc_api_url:        Some("https://original.com".to_owned()),
-                batch_interval_ms: Some(500),
+                rc_api_url:            Some("https://original.com".to_owned()),
+                batch_interval_ms:     Some(500),
+                heartbeat_interval_ms: Some(15_000),
             },
         };
 

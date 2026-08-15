@@ -307,6 +307,12 @@ pub enum RaceEvent {
         lap:          u8,
         session_time: f32,
     },
+    PublisherHeartbeat {
+        lap:                   u8,
+        session_time:          f32,
+        version:               String,
+        events_enqueued_total: u64,
+    },
 }
 
 impl RaceEvent {
@@ -317,6 +323,7 @@ impl RaceEvent {
             | Self::FlagYellowFullCourse { .. } => EventScope::SessionScoped,
             Self::PublisherHello { .. }
             | Self::PublisherGoodbye { .. }
+            | Self::PublisherHeartbeat { .. }
             | Self::IracingConnected { .. }
             | Self::IracingDisconnected { .. } => EventScope::RigScoped,
             _ => EventScope::CarScoped,
