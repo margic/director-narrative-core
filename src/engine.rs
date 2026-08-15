@@ -141,10 +141,24 @@ impl NarrativeEngine {
         }
     }
 
+    /// Set the real track length parsed from the SessionInfo YAML. Values that
+    /// are not credible for a race track are ignored and the previous value
+    /// (default 5000 m) is retained.
+    pub fn set_track_length_m(&mut self, meters: f32) {
+        if meters.is_finite() && meters >= 100.0 {
+            self.track_length_m = meters;
+        }
+    }
+
     pub fn process_frame(&mut self, frame: &TelemetryFrame) -> Vec<RaceEvent> {
         let mut events = Vec::new();
-        self.car_registry
-            .update_from_frame(frame, &self.roster, frame.session_tick, self.anchor_count);
+        self.car_registry.update_from_frame(
+            frame,
+            &self.roster,
+            frame.session_tick,
+            self.anchor_count,
+            self.track_length_m,
+        );
         events.extend(self.basic_incident.update(
             &self.car_registry,
             frame.lap,

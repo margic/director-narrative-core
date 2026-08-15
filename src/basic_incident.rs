@@ -6,6 +6,17 @@ use crate::race_event::RaceEvent;
 
 const SPEED_DROP_THRESHOLD_MPS: f32 = 8.0;
 const SPEED_RATIO_THRESHOLD: f32 = 0.80;
+/// Minimum severity (speed drop as a fraction of prior speed) for a
+/// surface-transition alert. Filters routine off-track excursions where the
+/// car barely slows.
+const MIN_SURFACE_SEVERITY: f32 = 0.1;
+/// A car must have been moving at least this fast for a surface transition to
+/// count as an incident. Filters garage/pit-stall jitter.
+const MIN_PREV_SPEED_MPS: f32 = 5.0;
+/// iRacing `irsdk_TrkLoc`: cars not in world (garage, tow) report -1.
+const TRACK_SURFACE_NOT_IN_WORLD: i32 = -1;
+/// iRacing `irsdk_TrkLoc`: 0 means off track.
+const TRACK_SURFACE_OFF_TRACK: i32 = 0;
 
 #[derive(Clone, Copy)]
 struct CarSnapshot {
@@ -50,22 +61,36 @@ impl BasicIncidentDetector {
             };
 
             if let Some(prev) = self.last_snapshot.get(&car.car_idx).copied() {
-                let surface_changed = snapshot.track_surface != prev.track_surface;
+                // Cars not in world (garage, tow) on either side of the
+                // transition carry no incident signal.
+                let in_world = snapshot.track_surface > TRACK_SURFACE_NOT_IN_WORLD
+                    && prev.track_surface > TRACK_SURFACE_NOT_IN_WORLD;
                 let speed_drop_mps = (prev.speed_ema_mps - snapshot.speed_ema_mps).max(0.0);
                 let speed_ratio = if prev.speed_ema_mps > 1.0 {
                     snapshot.speed_ema_mps / prev.speed_ema_mps
                 } else {
                     1.0
                 };
-                let severe_drop = speed_drop_mps >= SPEED_DROP_THRESHOLD_MPS
+                let severity = speed_drop_mps / prev.speed_ema_mps.max(1.0);
+                let was_moving = prev.speed_ema_mps >= MIN_PREV_SPEED_MPS;
+                let severe_drop = in_world
+                    && was_moving
+                    && speed_drop_mps >= SPEED_DROP_THRESHOLD_MPS
                     && speed_ratio <= SPEED_RATIO_THRESHOLD;
+                // Only a transition onto the off-track surface counts; surface
+                // recovery (off-track back onto the track) is not an incident.
+                let went_off_track = in_world
+                    && was_moving
+                    && snapshot.track_surface == TRACK_SURFACE_OFF_TRACK
+                    && prev.track_surface > TRACK_SURFACE_OFF_TRACK
+                    && severity >= MIN_SURFACE_SEVERITY;
                 let not_pit_transition = !snapshot.on_pit_road && !prev.on_pit_road;
 
-                // Emit all credible incident signatures:
-                // - surface transitions (off-track/contact aftermath)
+                // Emit credible incident signatures only:
+                // - off-track excursions with a real speed loss
                 // - severe speed collapses
                 // Keep edge-triggering so a single sustained condition does not spam.
-                let incident_condition = not_pit_transition && (surface_changed || severe_drop);
+                let incident_condition = not_pit_transition && (went_off_track || severe_drop);
                 if !incident_condition {
                     self.active_alerts.remove(&car.car_idx);
                 }
@@ -73,15 +98,12 @@ impl BasicIncidentDetector {
                 if incident_condition
                     && !self.active_alerts.contains(&car.car_idx)
                 {
-                    let severity = speed_drop_mps / prev.speed_ema_mps.max(1.0);
-                    let reason = if surface_changed && severe_drop {
+                    let reason = if went_off_track && severe_drop {
                         "surface_change_and_speed_drop"
                     } else if severe_drop {
                         "speed_drop"
-                    } else if snapshot.track_surface < prev.track_surface {
-                        "surface_drop"
                     } else {
-                        "surface_change"
+                        "surface_drop"
                     }
                     .to_owned();
 
@@ -216,5 +238,66 @@ mod tests {
         let events = detector.update(&registry, 4, 121.0, 120, 7, 0);
 
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn ignores_surface_change_without_speed_loss() {
+        let mut registry = CarRegistry::new();
+        registry.insert(car(9, 3, false, 60.0), 0);
+
+        let mut detector = BasicIncidentDetector::new();
+        let _ = detector.update(&registry, 4, 120.0, 60, 0, 0);
+
+        // Brief off-track excursion with no meaningful slowdown.
+        registry.get_mut(9).unwrap().track_surface = 0;
+        registry.get_mut(9).unwrap().speed_ema_mps = 59.0;
+        let events = detector.update(&registry, 4, 121.0, 120, 0, 0);
+        assert!(events.is_empty(), "low-severity off-track must not alert");
+    }
+
+    #[test]
+    fn ignores_surface_recovery() {
+        let mut registry = CarRegistry::new();
+        registry.insert(car(9, 0, false, 30.0), 0);
+
+        let mut detector = BasicIncidentDetector::new();
+        let _ = detector.update(&registry, 4, 120.0, 60, 0, 0);
+
+        // Rejoining the track (0 -> 3) is not an incident.
+        registry.get_mut(9).unwrap().track_surface = 3;
+        let events = detector.update(&registry, 4, 121.0, 120, 0, 0);
+        assert!(events.is_empty(), "surface recovery must not alert");
+    }
+
+    #[test]
+    fn ignores_not_in_world_transitions() {
+        let mut registry = CarRegistry::new();
+        registry.insert(car(9, -1, false, 0.0), 0);
+
+        let mut detector = BasicIncidentDetector::new();
+        let _ = detector.update(&registry, 4, 120.0, 60, 0, 0);
+
+        // Car enters the world (garage -> on track).
+        registry.get_mut(9).unwrap().track_surface = 3;
+        registry.get_mut(9).unwrap().speed_ema_mps = 0.0001;
+        let events = detector.update(&registry, 4, 121.0, 120, 0, 0);
+        assert!(events.is_empty(), "world enter/exit must not alert");
+    }
+
+    #[test]
+    fn emits_off_track_with_speed_loss() {
+        let mut registry = CarRegistry::new();
+        registry.insert(car(9, 3, false, 60.0), 0);
+
+        let mut detector = BasicIncidentDetector::new();
+        let _ = detector.update(&registry, 4, 120.0, 60, 0, 0);
+
+        registry.get_mut(9).unwrap().track_surface = 0;
+        registry.get_mut(9).unwrap().speed_ema_mps = 50.0;
+        let events = detector.update(&registry, 4, 121.0, 120, 0, 0);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RaceEvent::IncidentAlert { car_idx: 9, .. }
+        )));
     }
 }

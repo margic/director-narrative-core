@@ -658,6 +658,7 @@ mod tests {
             track_name: Some("Winton National".to_owned()),
             session_type: Some("Practice".to_owned()),
             session_laps: Some("unlimited".to_owned()),
+            track_length_m: Some(3000.0),
         };
 
         let env = build_event(&event, &frame, None, "s", "r", Some(&meta), Some(86268796));
