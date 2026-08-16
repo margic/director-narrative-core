@@ -394,6 +394,9 @@ fn pipeline_main(
                         }
 
                         let session_meta = SessionMetadata::parse(&yaml, frame.session_num);
+                        if let Some(track_length_m) = session_meta.track_length_m {
+                            engine.set_track_length_m(track_length_m);
+                        }
                         current_session_meta = Some(session_meta.clone());
                         {
                             let mut s = status.lock().unwrap();

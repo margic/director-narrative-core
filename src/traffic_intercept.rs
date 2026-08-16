@@ -3,6 +3,12 @@ use std::collections::HashMap;
 use crate::car_registry::{CarRegistry, CarState};
 use crate::race_event::RaceEvent;
 
+/// Physical bounds for a credible closing speed between two cars. Values
+/// outside this range indicate corrupted speed estimates (teleports, garage
+/// jitter) or a closure too slow to matter.
+const MIN_RELATIVE_SPEED_MPS: f32 = 1.0;
+const MAX_RELATIVE_SPEED_MPS: f32 = 100.0;
+
 pub struct TrafficInterceptDetector {
     pub last_bucket: HashMap<(u8, u8), u8>,
 }
@@ -28,7 +34,10 @@ impl TrafficInterceptDetector {
         lap: u8,
         session_time: f32,
     ) -> Vec<RaceEvent> {
-        let cars: Vec<_> = registry.active_cars().collect();
+        let cars: Vec<_> = registry
+            .active_cars()
+            .filter(|car| !car.on_pit_road && car.track_surface >= 0)
+            .collect();
         let mut events = Vec::new();
         for leader in &cars {
             for traffic in &cars {
@@ -77,7 +86,7 @@ pub fn predict_intercept(
     track_length_m: f32,
 ) -> Option<InterceptPrediction> {
     let relative_speed_mps = leader.speed_ema_mps - traffic.speed_ema_mps;
-    if relative_speed_mps <= 0.0 {
+    if !(MIN_RELATIVE_SPEED_MPS..=MAX_RELATIVE_SPEED_MPS).contains(&relative_speed_mps) {
         return None;
     }
     let mut delta_pct = traffic.lap_dist_pct - leader.lap_dist_pct;
@@ -136,5 +145,30 @@ mod tests {
         let mut detector = TrafficInterceptDetector::new();
         let events = detector.detect(&registry, 20, 5000.0, 10, 600.0);
         assert!(events.iter().any(|e| matches!(e, RaceEvent::TrafficIntercept { leader_car_idx: 1, traffic_car_idx: 2, .. })));
+    }
+
+    #[test]
+    fn rejects_implausible_relative_speed() {
+        let mut registry = CarRegistry::new();
+        // Poisoned speed estimate (teleport artefact) must not predict an intercept.
+        registry.insert(car(1, 10, 0.10, 90_000.0, 1), 0);
+        registry.insert(car(2, 9, 0.20, 40.0, 1), 0);
+        let mut detector = TrafficInterceptDetector::new();
+        let events = detector.detect(&registry, 20, 5000.0, 10, 600.0);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn skips_cars_not_in_world_or_in_pit() {
+        let mut registry = CarRegistry::new();
+        let mut leader = car(1, 10, 0.10, 70.0, 1);
+        leader.track_surface = -1;
+        registry.insert(leader, 0);
+        let mut traffic = car(2, 9, 0.20, 40.0, 1);
+        traffic.on_pit_road = true;
+        registry.insert(traffic, 0);
+        let mut detector = TrafficInterceptDetector::new();
+        let events = detector.detect(&registry, 20, 5000.0, 10, 600.0);
+        assert!(events.is_empty());
     }
 }

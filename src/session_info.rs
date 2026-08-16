@@ -196,6 +196,8 @@ pub struct SessionMetadata {
     pub session_type: Option<String>,
     /// "unlimited" or a lap count string
     pub session_laps: Option<String>,
+    /// Track length in metres, from `WeekendInfo.TrackLength` (e.g. "3.70 km").
+    pub track_length_m: Option<f32>,
 }
 
 impl SessionMetadata {
@@ -212,6 +214,12 @@ impl SessionMetadata {
             .track_display_name
             .or(root.weekend_info.track_name)
             .filter(|s| !s.is_empty());
+
+        let track_length_m = root
+            .weekend_info
+            .track_length
+            .as_deref()
+            .and_then(parse_track_length_meters);
 
         let sessions = &root.session_info.sessions;
         let session = if sessions.is_empty() {
@@ -231,9 +239,14 @@ impl SessionMetadata {
             track_name,
             session_type,
             session_laps,
+            track_length_m,
         };
 
-        if meta.track_name.is_none() || meta.session_type.is_none() || meta.session_laps.is_none() {
+        if meta.track_name.is_none()
+            || meta.session_type.is_none()
+            || meta.session_laps.is_none()
+            || meta.track_length_m.is_none()
+        {
             let fallback = parse_metadata_fallback(yaml);
             if meta.track_name.is_none() {
                 meta.track_name = fallback.track_name;
@@ -244,16 +257,40 @@ impl SessionMetadata {
             if meta.session_laps.is_none() {
                 meta.session_laps = fallback.session_laps;
             }
+            if meta.track_length_m.is_none() {
+                meta.track_length_m = fallback.track_length_m;
+            }
         }
 
         meta
     }
 }
 
+/// Parse an iRacing `TrackLength` string (e.g. "3.70 km", "0.90 mi") into metres.
+pub fn parse_track_length_meters(raw: &str) -> Option<f32> {
+    let raw = raw.trim().trim_matches('"');
+    let numeric: String = raw
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+        .collect();
+    let value: f32 = numeric.parse().ok()?;
+    let unit = raw[numeric.len()..].trim().to_ascii_lowercase();
+    let meters = if unit.starts_with("mi") {
+        value * 1609.344
+    } else if unit.starts_with('m') && !unit.starts_with("mi") {
+        value
+    } else {
+        // iRacing reports km; treat missing/unknown units as km.
+        value * 1000.0
+    };
+    (meters > 0.0).then_some(meters)
+}
+
 fn parse_metadata_fallback(yaml: &str) -> SessionMetadata {
     let mut track_name: Option<String> = None;
     let mut session_type: Option<String> = None;
     let mut session_laps: Option<String> = None;
+    let mut track_length_m: Option<f32> = None;
 
     for line in yaml.lines() {
         let line = line.trim();
@@ -291,7 +328,17 @@ fn parse_metadata_fallback(yaml: &str) -> SessionMetadata {
             }
         }
 
-        if track_name.is_some() && session_type.is_some() && session_laps.is_some() {
+        if track_length_m.is_none() {
+            if let Some(rest) = line.strip_prefix("TrackLength:") {
+                track_length_m = parse_track_length_meters(rest);
+            }
+        }
+
+        if track_name.is_some()
+            && session_type.is_some()
+            && session_laps.is_some()
+            && track_length_m.is_some()
+        {
             break;
         }
     }
@@ -300,6 +347,7 @@ fn parse_metadata_fallback(yaml: &str) -> SessionMetadata {
         track_name,
         session_type,
         session_laps,
+        track_length_m,
     }
 }
 
@@ -419,6 +467,8 @@ struct YamlWeekendInfo {
     track_display_name: Option<String>,
     #[serde(rename = "TrackName", default)]
     track_name: Option<String>,
+    #[serde(rename = "TrackLength", default)]
+    track_length: Option<String>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -692,4 +742,37 @@ SessionLaps: 45
                 assert_eq!(meta.session_type.as_deref(), Some("Race"));
                 assert_eq!(meta.session_laps.as_deref(), Some("45"));
         }
+
+    #[test]
+    fn parse_track_length_km() {
+        assert_eq!(parse_track_length_meters("3.70 km"), Some(3700.0));
+        assert_eq!(parse_track_length_meters("\"5.84 km\""), Some(5840.0));
+    }
+
+    #[test]
+    fn parse_track_length_miles() {
+        let m = parse_track_length_meters("0.90 mi").expect("parse");
+        assert!((m - 1448.41).abs() < 0.1, "got {m}");
+    }
+
+    #[test]
+    fn parse_track_length_rejects_garbage() {
+        assert_eq!(parse_track_length_meters(""), None);
+        assert_eq!(parse_track_length_meters("unknown"), None);
+        assert_eq!(parse_track_length_meters("0.0 km"), None);
+    }
+
+    #[test]
+    fn session_metadata_parses_track_length() {
+        let yaml = r#"
+WeekendInfo:
+    TrackName: test_track
+    TrackLength: 3.70 km
+SessionInfo:
+    Sessions:
+        - SessionType: Race
+"#;
+        let meta = SessionMetadata::parse(yaml, 0);
+        assert_eq!(meta.track_length_m, Some(3700.0));
+    }
 }

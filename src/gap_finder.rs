@@ -31,6 +31,7 @@ pub fn find_cars_ahead(frame: &TelemetryFrame, lap_time_s: f32, n: usize) -> Vec
             if diff < -0.5 { diff += 1.0; } // S/F line wrap
 
             let gap_s = diff * lap_time_s;
+            if gap_s < 0.0                 { return None; } // race order / track position disagree
             if gap_s > MAX_BATTLE_GAP_S    { return None; } // too far away
 
             Some((car_idx, gap_s))
@@ -68,6 +69,7 @@ pub fn find_cars_behind(frame: &TelemetryFrame, lap_time_s: f32, n: usize) -> Ve
             if diff < 0.0 { diff += 1.0; } // S/F line wrap
 
             let gap_s = diff * lap_time_s;
+            if gap_s < 0.0                 { return None; }
             if gap_s > MAX_BATTLE_GAP_S    { return None; }
 
             Some((car_idx, gap_s))
@@ -169,6 +171,16 @@ mod tests {
         f.car_idx_on_pit_road[1] = true;
         let gaps = find_cars_ahead(&f, 10.0, 5);
         assert!(gaps.is_empty(), "pit-road car must be excluded");
+    }
+
+    #[test]
+    fn negative_gap_excluded() {
+        // Car 1 is ahead in race order (position 3) but physically slightly
+        // behind on lap_dist_pct (e.g. lapped-traffic edge case): diff = -0.1
+        // does not trip the -0.5 wrap threshold and would yield a negative gap.
+        let f = frame(0.5, &[(1, 0.4, 3)]);
+        let gaps = find_cars_ahead(&f, 10.0, 5);
+        assert!(gaps.is_empty(), "negative gaps must be excluded");
     }
 
     #[test]

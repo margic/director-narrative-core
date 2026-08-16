@@ -5,6 +5,10 @@ use crate::battle_state::BattleState;
 use crate::session_info::SessionRoster;
 use crate::telemetry_frame::TelemetryFrame;
 
+/// Upper bound for a credible car speed. Progress jumps above this rate are
+/// teleports (resets, tows) and must not feed the speed estimate.
+const MAX_PLAUSIBLE_SPEED_MPS: f32 = 130.0;
+
 pub struct CarRegistry {
     cars: [Option<CarState>; 64],
     last_seen_tick: [i64; 64],
@@ -60,6 +64,7 @@ impl CarRegistry {
         roster: &SessionRoster,
         session_tick: i64,
         anchor_count: usize,
+        track_length_m: f32,
     ) {
         let mut in_frame = [false; 64];
         for (i, &position) in frame.car_idx_position.iter().enumerate().take(64) {
@@ -108,12 +113,18 @@ impl CarRegistry {
             let dt_ticks = session_tick.saturating_sub(self.last_seen_tick[i]);
             if dt_ticks > 0 {
                 let dt_s = dt_ticks as f32 / 60.0;
-                let raw_speed = ((new_progress - prev_progress).max(0.0) * 5000.0) / dt_s;
-                state.speed_ema_mps = if state.speed_ema_mps <= 0.0 {
-                    raw_speed
-                } else {
-                    0.1 * raw_speed + 0.9 * state.speed_ema_mps
-                };
+                let raw_speed = ((new_progress - prev_progress).max(0.0) * track_length_m) / dt_s;
+                if track_surface < 0 || state.track_surface < 0 {
+                    // Car not in world (garage, tow) — no meaningful speed.
+                    state.speed_ema_mps = 0.0;
+                } else if raw_speed <= MAX_PLAUSIBLE_SPEED_MPS {
+                    state.speed_ema_mps = if state.speed_ema_mps <= 0.0 {
+                        raw_speed
+                    } else {
+                        0.1 * raw_speed + 0.9 * state.speed_ema_mps
+                    };
+                }
+                // Implausible progress jump (teleport): keep the previous estimate.
             }
 
             state.current_position = position;
@@ -287,7 +298,7 @@ mod tests {
     #[test]
     fn slot_allocation() {
         let mut registry = CarRegistry::new();
-        registry.update_from_frame(&frame(false, 1, 0), &roster(), 0, 12);
+        registry.update_from_frame(&frame(false, 1, 0), &roster(), 0, 12, 5000.0);
         assert!(registry.get(0).is_some());
         assert!(registry.get(1).is_some());
     }
@@ -295,8 +306,8 @@ mod tests {
     #[test]
     fn pit_cycle_continuity() {
         let mut registry = CarRegistry::new();
-        registry.update_from_frame(&frame(false, 1, 0), &roster(), 0, 12);
-        registry.update_from_frame(&frame(true, 1, 60), &roster(), 60, 12);
+        registry.update_from_frame(&frame(false, 1, 0), &roster(), 0, 12, 5000.0);
+        registry.update_from_frame(&frame(true, 1, 60), &roster(), 60, 12, 5000.0);
         let car = registry.get(1).expect("car should persist through pit");
         assert!(car.on_pit_road);
         assert_eq!(car.driver_name, "GT3 A");
@@ -305,16 +316,64 @@ mod tests {
     #[test]
     fn disconnect_expiry() {
         let mut registry = CarRegistry::new();
-        registry.update_from_frame(&frame(false, 1, 0), &roster(), 0, 12);
-        registry.update_from_frame(&frame(false, 0, 3701), &roster(), 3701, 12);
+        registry.update_from_frame(&frame(false, 1, 0), &roster(), 0, 12, 5000.0);
+        registry.update_from_frame(&frame(false, 0, 3701), &roster(), 3701, 12, 5000.0);
         assert!(registry.get(1).is_none());
     }
 
     #[test]
     fn multi_class_car_classification() {
         let mut registry = CarRegistry::new();
-        registry.update_from_frame(&frame(false, 1, 0), &roster(), 0, 12);
+        registry.update_from_frame(&frame(false, 1, 0), &roster(), 0, 12, 5000.0);
         assert_eq!(registry.get(0).unwrap().car_class_id, 1);
         assert_eq!(registry.get(1).unwrap().car_class_id, 2);
+    }
+
+    #[test]
+    fn speed_uses_track_length() {
+        let mut registry = CarRegistry::new();
+        let mut f0 = frame(false, 1, 0);
+        f0.car_idx_lap_dist_pct = vec![0.2, 0.40];
+        registry.update_from_frame(&f0, &roster(), 0, 12, 4000.0);
+        let mut f1 = frame(false, 1, 60);
+        // Car 1 advances 1% of a 4000 m lap in 1 s -> 40 m/s.
+        f1.car_idx_lap_dist_pct = vec![0.2, 0.41];
+        registry.update_from_frame(&f1, &roster(), 60, 12, 4000.0);
+        let speed = registry.get(1).unwrap().speed_ema_mps;
+        assert!((speed - 40.0).abs() < 0.5, "expected ~40 m/s, got {speed}");
+    }
+
+    #[test]
+    fn teleport_does_not_poison_speed() {
+        let mut registry = CarRegistry::new();
+        let mut f0 = frame(false, 1, 0);
+        f0.car_idx_lap_dist_pct = vec![0.2, 0.40];
+        registry.update_from_frame(&f0, &roster(), 0, 12, 5000.0);
+        let mut f1 = frame(false, 1, 60);
+        f1.car_idx_lap_dist_pct = vec![0.2, 0.41];
+        registry.update_from_frame(&f1, &roster(), 60, 12, 5000.0);
+        let before = registry.get(1).unwrap().speed_ema_mps;
+        // Car 1 teleports 30% of the lap in one tick (reset/tow).
+        let mut f2 = frame(false, 1, 61);
+        f2.car_idx_lap_dist_pct = vec![0.2, 0.71];
+        registry.update_from_frame(&f2, &roster(), 61, 12, 5000.0);
+        let after = registry.get(1).unwrap().speed_ema_mps;
+        assert!(
+            (after - before).abs() < f32::EPSILON,
+            "teleport must keep previous speed estimate, got {after}"
+        );
+    }
+
+    #[test]
+    fn not_in_world_zeroes_speed() {
+        let mut registry = CarRegistry::new();
+        let mut f0 = frame(false, 1, 0);
+        f0.car_idx_lap_dist_pct = vec![0.2, 0.40];
+        registry.update_from_frame(&f0, &roster(), 0, 12, 5000.0);
+        let mut f1 = frame(false, 1, 60);
+        f1.car_idx_lap_dist_pct = vec![0.2, 0.41];
+        f1.car_idx_track_surface = vec![0, -1];
+        registry.update_from_frame(&f1, &roster(), 60, 12, 5000.0);
+        assert_eq!(registry.get(1).unwrap().speed_ema_mps, 0.0);
     }
 }
