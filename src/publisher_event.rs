@@ -219,6 +219,8 @@ fn enrich_payload(
             // Explicit race positions for both sides of the battle.
             obj.insert("leaderRacePosition".to_owned(), option_u8_json(leader_pos));
             obj.insert("followerRacePosition".to_owned(), option_u8_json(follower_pos));
+            obj.insert("playerRacePosition".to_owned(), option_u8_json(car_race_position(frame, *player_car_idx)));
+            obj.insert("opponentRacePosition".to_owned(), option_u8_json(car_race_position(frame, *opponent_car_idx)));
 
             // Gap at engagement (sanitized) and engagement start time (camelCase aliases)
             obj.insert("engagementGapSec".to_owned(), sanitize_sentinel_json(*gap_s));
@@ -243,6 +245,8 @@ fn enrich_payload(
             // Explicit race positions for both sides of the battle.
             obj.insert("leaderRacePosition".to_owned(), option_u8_json(leader_pos));
             obj.insert("followerRacePosition".to_owned(), option_u8_json(follower_pos));
+            obj.insert("playerRacePosition".to_owned(), option_u8_json(car_race_position(frame, *player_car_idx)));
+            obj.insert("opponentRacePosition".to_owned(), option_u8_json(car_race_position(frame, *opponent_car_idx)));
 
             // Final gap (None when the gap was a sentinel / car no longer visible)
             obj.insert("finalGapSec".to_owned(), option_f32_json(*final_gap_sec));
@@ -268,6 +272,12 @@ fn enrich_payload(
             // Explicit race positions for both sides of the battle.
             obj.insert("leaderRacePosition".to_owned(), option_u8_json(leader_pos));
             obj.insert("followerRacePosition".to_owned(), option_u8_json(follower_pos));
+            obj.insert("playerRacePosition".to_owned(), option_u8_json(car_race_position(frame, *player_car_idx)));
+            obj.insert("opponentRacePosition".to_owned(), option_u8_json(car_race_position(frame, *opponent_car_idx)));
+        }
+        RaceEvent::VulnerabilityAlert { attacker_idx, defender_idx, .. } => {
+            obj.insert("attackerPosition".to_owned(), option_u8_json(car_race_position(frame, *attacker_idx)));
+            obj.insert("defenderPosition".to_owned(), option_u8_json(car_race_position(frame, *defender_idx)));
         }
         RaceEvent::Overtake { car_idx, overtaken_car_idx, .. } => {
             let overtaking_car = resolve_car(*car_idx, roster);
@@ -605,6 +615,105 @@ mod tests {
         assert_eq!(json["payload"]["followerCarNumber"], "0");
         assert_eq!(json["payload"]["leaderRacePosition"], 4);
         assert_eq!(json["payload"]["followerRacePosition"], 5);
+        assert_eq!(json["payload"]["playerRacePosition"], 5);
+        assert_eq!(json["payload"]["opponentRacePosition"], 4);
+    }
+
+    #[test]
+    fn battle_closing_and_broken_payloads_include_player_and_opponent_positions() {
+        let closing = RaceEvent::BattleClosing {
+            lap: 4,
+            session_time: 1234.5,
+            player_car_idx: 0,
+            opponent_car_idx: 1,
+            car_race_position: 3,
+            closing_rate_sec_per_lap: 0.43,
+            slope_info: SlopeInfo {
+                median_slope: -0.43,
+                anchors_qualifying: 5,
+                anchors_agreeing: 4,
+                hotspot_lap_dist_pct: 0.62,
+            },
+            prior_skirmishes: 0,
+            prior_attack_time_s: 0.0,
+        };
+        let broken = RaceEvent::BattleBroken {
+            lap: 5,
+            session_time: 1300.0,
+            player_car_idx: 0,
+            opponent_car_idx: 1,
+            final_gap_sec: Some(2.1),
+            car_race_position: 3,
+            engagement_started_at_session_time_s: 1234.5,
+        };
+
+        for event in [closing, broken] {
+            let env = build_event(&event, &minimal_frame(), None, "s", "r", None, None);
+            let json: Value = serde_json::to_value(&env).unwrap();
+            assert_eq!(json["payload"]["playerRacePosition"], 5);
+            assert_eq!(json["payload"]["opponentRacePosition"], 4);
+            assert_eq!(json["payload"]["leaderRacePosition"], 4);
+            assert_eq!(json["payload"]["followerRacePosition"], 5);
+        }
+    }
+
+    #[test]
+    fn battle_positions_null_when_unresolvable() {
+        let event = RaceEvent::BattleEngaged {
+            lap: 2,
+            session_time: 12.0,
+            player_car_idx: 0,
+            opponent_car_idx: 9, // out of range of car_idx_position
+            gap_s: 0.4,
+            car_race_position: 4,
+            prior_skirmishes: 0,
+            prior_attack_time_s: 0.0,
+            engagement_started_at_session_time_s: 12.0,
+        };
+
+        let env = build_event(&event, &minimal_frame(), None, "s", "r", None, None);
+        let json: Value = serde_json::to_value(&env).unwrap();
+        assert_eq!(json["payload"]["playerRacePosition"], 5);
+        assert!(json["payload"]["opponentRacePosition"].is_null());
+    }
+
+    #[test]
+    fn vulnerability_alert_payload_includes_attacker_and_defender_positions() {
+        let event = RaceEvent::VulnerabilityAlert {
+            lap: 4,
+            session_time: 1234.5,
+            vulnerability: 0.8,
+            defender_idx: 1,
+            attacker_idx: 0,
+            tire_contribution: 0.3,
+            closing_contribution: 0.2,
+            proximity_contribution: 0.2,
+            fuel_contribution: 0.1,
+        };
+
+        let env = build_event(&event, &minimal_frame(), None, "s", "r", None, None);
+        let json: Value = serde_json::to_value(&env).unwrap();
+        assert_eq!(json["payload"]["attackerPosition"], 5);
+        assert_eq!(json["payload"]["defenderPosition"], 4);
+    }
+
+    #[test]
+    fn heartbeat_event_uses_rig_scope_and_carries_counters() {
+        let event = RaceEvent::PublisherHeartbeat {
+            lap: 4,
+            session_time: 1234.5,
+            version: "0.1.0".to_owned(),
+            events_enqueued_total: 17,
+        };
+
+        let env = build_event(&event, &minimal_frame(), None, "s", "r", None, None);
+        let json: Value = serde_json::to_value(&env).unwrap();
+        assert_eq!(env.scope, EventScope::RigScoped);
+        assert!(env.car.is_none());
+        assert_eq!(json["type"], "PUBLISHER_HEARTBEAT");
+        assert_eq!(json["scope"], "RIG_SCOPED");
+        assert_eq!(json["payload"]["version"], "0.1.0");
+        assert_eq!(json["payload"]["events_enqueued_total"], 17);
     }
 
     #[test]

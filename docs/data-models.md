@@ -226,11 +226,11 @@ pub struct SlopeInfo {
 ```
 
 **Lifecycle liveness contract (v2):**
-- No dedicated `PUBLISHER_HEARTBEAT` event is emitted.
-- Liveness is refreshed by every authenticated `/api/publisher/v2/ingest` request, including `PUBLISHER_HELLO`, `PUBLISHER_GOODBYE`, and normal event batches.
+- A rig-scoped `PUBLISHER_HEARTBEAT` event is emitted on a wall-clock timer (`[publisher] heartbeat_interval_ms`, default 15000 ms; `0` disables) whenever iRacing is connected and a valid `subSessionId` is resolved. Its payload carries `lap`, `session_time`, `version`, and `events_enqueued_total`.
+- Liveness is refreshed by every authenticated `/api/publisher/v2/ingest` request, including `PUBLISHER_HELLO`, `PUBLISHER_HEARTBEAT`, `PUBLISHER_GOODBYE`, and normal event batches.
 - `PUBLISHER_HELLO` is sent when the rig starts a session.
 - `PUBLISHER_GOODBYE` is sent only on clean shutdown and is the only explicit check-in clear signal.
-- If the rig is connected but idle, publisher remains silent; liveness remains valid for up to 30 minutes since the last received message.
+- Heartbeats keep a quiet-but-connected rig distinguishable from a dead stream; liveness remains valid for up to 30 minutes since the last received message.
 
 ### 4.1 Serialised Example Payloads
 

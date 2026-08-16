@@ -140,7 +140,7 @@ fn pipeline_main(
 
     use director_narrative_core::{
         engine::NarrativeEngine,
-        lifecycle::LifecyclePublisher,
+        lifecycle::{HeartbeatScheduler, LifecyclePublisher},
         publisher_event::{build_event, PublisherEvent},
         race_event::{EventScope, RaceEvent},
         session_info::{is_ai_session, parse_sub_session_id, synthetic_sub_session_id, RosterCache, SessionMetadata},
@@ -196,6 +196,7 @@ fn pipeline_main(
 
     let mut engine      = NarrativeEngine::new(10);
     let mut lifecycle       = LifecyclePublisher::new(env!("CARGO_PKG_VERSION"));
+    let mut heartbeat       = HeartbeatScheduler::new(cfg.publisher.heartbeat_interval_ms);
     let mut roster_cache    = RosterCache::new();
     let mut race_session_id = String::from("0");
     let mut sub_session_id: i64 = 0;
@@ -521,6 +522,26 @@ fn pipeline_main(
                     continue;
                 }
                 sub_session_blocked_frames = 0;
+
+                // Heartbeat — rig-scoped liveness signal on a wall-clock timer,
+                // gated on the same connected + resolved-subSessionId conditions
+                // as HELLO, delivered via the normal batch path.
+                if heartbeat.due(std::time::Instant::now()) {
+                    let enqueued_total = status.lock().unwrap().events_enqueued_total;
+                    let hb = lifecycle.heartbeat(frame.lap, frame.session_time, enqueued_total);
+                    let pe = build_event(
+                        &hb,
+                        &frame,
+                        roster,
+                        &race_session_id,
+                        &rig_id,
+                        current_session_meta.as_ref(),
+                        Some(sub_session_id),
+                    );
+                    transport.enqueue(pe);
+                    status.lock().unwrap().events_enqueued_total += 1;
+                }
+
                 match transport.tick_result(
                     frame.session_time as f64,
                     frame.session_tick,
