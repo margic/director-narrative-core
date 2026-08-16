@@ -5,6 +5,8 @@ pub mod braking_profile;
 pub mod car_registry;
 pub mod compression_zone;
 pub mod config;
+pub mod controls;
+pub mod controls_input;
 pub mod engine;
 pub mod fuel_projection;
 pub mod gap_finder;

@@ -11,6 +11,7 @@ use std::time::{Duration, SystemTime};
 
 use eframe::egui::{self, Color32, RichText, ScrollArea, Vec2};
 
+use director_narrative_core::controls::{ControlAction, ControlsState};
 use director_narrative_core::publisher_status::PublisherStatus;
 
 // ── Colours ────────────────────────────────────────────────────────────────
@@ -22,11 +23,15 @@ const GREY:   Color32 = Color32::from_rgb(0x80, 0x80, 0x80);
 const CYAN:   Color32 = Color32::from_rgb(0x00, 0xbc, 0xd4);
 const DIM:    Color32 = Color32::from_rgb(0xb0, 0xb0, 0xb0);
 const RACE_TEXT: Color32 = Color32::from_rgb(0x2e, 0x7d, 0x32);
+/// Apex Orange — primary action colour from the brand palette.
+const ORANGE: Color32 = Color32::from_rgb(0xff, 0x5f, 0x1f);
 
 // ── App ────────────────────────────────────────────────────────────────────
 
 pub struct PublisherApp {
     status: Arc<Mutex<PublisherStatus>>,
+    /// Wheel-button bindings, shared with the input thread that learns them.
+    controls: Arc<Mutex<ControlsState>>,
     /// Shutdown flag — set when the window is closed so the pipeline thread
     /// can flush and exit.
     running: Arc<std::sync::atomic::AtomicBool>,
@@ -34,10 +39,11 @@ pub struct PublisherApp {
 
 impl PublisherApp {
     pub fn new(
-        status:  Arc<Mutex<PublisherStatus>>,
-        running: Arc<std::sync::atomic::AtomicBool>,
+        status:   Arc<Mutex<PublisherStatus>>,
+        controls: Arc<Mutex<ControlsState>>,
+        running:  Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
-        Self { status, running }
+        Self { status, controls, running }
     }
 }
 
@@ -53,7 +59,7 @@ impl eframe::App for PublisherApp {
         let status = self.status.lock().unwrap();
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.set_min_size(Vec2::new(460.0, 620.0));
+            ui.set_min_size(Vec2::new(460.0, 700.0));
 
             // ── iRacing block ────────────────────────────────────────────
             ui.add_space(4.0);
@@ -72,6 +78,13 @@ impl eframe::App for PublisherApp {
             // ── Counter bar ──────────────────────────────────────────────
             ui.add_space(4.0);
             counter_bar(ui, &status);
+
+            ui.add_space(6.0);
+            ui.separator();
+
+            // ── Driver controls ──────────────────────────────────────────
+            ui.add_space(6.0);
+            controls_block(ui, &self.controls);
 
             ui.add_space(4.0);
             ui.separator();
@@ -245,17 +258,94 @@ fn event_colour(event_type: &str) -> (Color32, bool) {
     }
 }
 
+/// Wheel-button bindings, with click-to-bind learn mode.
+///
+/// Clicking `Bind` arms the input thread; the next button the driver presses on
+/// any HID wheel is captured and written to `controls.toml`, so the binding
+/// survives into future sessions without any manual configuration.
+fn controls_block(ui: &mut egui::Ui, controls: &Arc<Mutex<ControlsState>>) {
+    let mut state = controls.lock().unwrap();
+
+    ui.horizontal(|ui| {
+        let (dot, label) = match (state.config.enabled, state.last_error.is_some()) {
+            (_, true)      => (RED, "INPUT UNAVAILABLE"),
+            (false, false) => (GREY, "DISABLED"),
+            (true, false)  => (GREEN, "LISTENING"),
+        };
+        status_dot(ui, dot);
+        ui.label(RichText::new("Driver Controls").strong());
+        ui.label(RichText::new(label).color(dot));
+        ui.label(
+            RichText::new(format!("{} wheel device(s)", state.devices_seen))
+                .color(DIM)
+                .small(),
+        );
+    });
+
+    ui.indent("controls_indent", |ui| {
+        for action in ControlAction::ALL {
+            let bound = state
+                .config
+                .binding_for(action)
+                .map(|b| format!("{}  ·  button {}", b.device, b.button));
+            let learning = state.learning == Some(action);
+
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(action.label()).small());
+                let detail = if learning {
+                    RichText::new("press a wheel button…").color(ORANGE).small()
+                } else {
+                    match &bound {
+                        Some(text) => RichText::new(text.clone()).color(CYAN).small().monospace(),
+                        None => RichText::new("not bound").color(DIM).small(),
+                    }
+                };
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if learning {
+                        if ui.button("Cancel").clicked() {
+                            state.learning = None;
+                        }
+                    } else {
+                        let bind = egui::Button::new(RichText::new("Bind").color(Color32::BLACK))
+                            .fill(ORANGE);
+                        if ui.add(bind).clicked() {
+                            state.learning = Some(action);
+                        }
+                        if bound.is_some() && ui.button("Clear").clicked() {
+                            state.clear_binding(action);
+                        }
+                    }
+                    ui.label(detail);
+                });
+            });
+        }
+
+        if let Some((action, at_ms)) = state.last_request {
+            ui.label(
+                RichText::new(format!("last request: {action} @ {at_ms}"))
+                    .color(DIM)
+                    .small()
+                    .monospace(),
+            );
+        }
+        if let Some(err) = state.last_error.clone() {
+            ui.label(RichText::new(err).color(RED).small());
+        }
+    });
+}
+
 // ── Entry point ────────────────────────────────────────────────────────────
 
 /// Launch the eframe window. Blocks until the window is closed.
 pub fn run_ui(
-    status:  Arc<Mutex<PublisherStatus>>,
-    running: Arc<std::sync::atomic::AtomicBool>,
+    status:   Arc<Mutex<PublisherStatus>>,
+    controls: Arc<Mutex<ControlsState>>,
+    running:  Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("SimCenter Publisher")
-            .with_inner_size([480.0, 640.0])
+            .with_inner_size([480.0, 720.0])
             .with_resizable(false),
         ..Default::default()
     };
@@ -264,7 +354,7 @@ pub fn run_ui(
         options,
         Box::new(|cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
-            Ok(Box::new(PublisherApp::new(status, running)))
+            Ok(Box::new(PublisherApp::new(status, controls, running)))
         }),
     )
 }
@@ -272,10 +362,17 @@ pub fn run_ui(
 #[cfg(target_os = "windows")]
 #[allow(dead_code)]
 fn main() {
+    use director_narrative_core::controls::{self, ControlsConfig};
+
     let status = Arc::new(Mutex::new(PublisherStatus::default()));
     let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let controls_file = controls::controls_path(None);
+    let controls = Arc::new(Mutex::new(ControlsState::new(
+        controls::load_controls(&controls_file).unwrap_or_else(|_| ControlsConfig::default()),
+        controls_file,
+    )));
 
-    if let Err(e) = run_ui(status, running) {
+    if let Err(e) = run_ui(status, controls, running) {
         eprintln!("[publisher-ui] error: {e}");
         std::process::exit(1);
     }
