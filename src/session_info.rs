@@ -53,6 +53,20 @@ pub struct CarRef {
     pub flair_name: Option<String>,
 }
 
+impl CarRef {
+    /// Stable driver identity used by the sandbox to match a driver across
+    /// sessions, where `carIdx` is not stable.
+    ///
+    /// Prefers the iRacing CustID and falls back to the case-folded display
+    /// name, mirroring the sandbox's `driver_id_from_roster_entry`.
+    pub fn driver_id(&self) -> String {
+        match self.user_id {
+            Some(id) => format!("user:{id}"),
+            None => format!("name:{}", self.driver_name.trim().to_lowercase()),
+        }
+    }
+}
+
 /// Immutable roster built from one parse of the `SessionInfo` YAML.
 pub struct SessionRoster {
     cars: HashMap<u8, CarRef>,
@@ -584,6 +598,30 @@ mod tests {
     fn parse_returns_all_drivers() {
         let roster = SessionInfoParser::build(FIXTURE_YAML).expect("parse should succeed");
         assert_eq!(roster.len(), 4);
+    }
+
+    #[test]
+    fn driver_id_prefers_the_iracing_cust_id() {
+        let roster = SessionInfoParser::build(FIXTURE_YAML).expect("parse");
+        let car = roster.lookup(0).expect("carIdx 0 should exist");
+        assert_eq!(car.driver_id(), "user:123456");
+    }
+
+    #[test]
+    fn driver_id_falls_back_to_the_normalized_name() {
+        let car = CarRef {
+            car_idx: 3,
+            car_number: "7".to_owned(),
+            driver_name: "  Ada Lovelace ".to_owned(),
+            team_name: None,
+            car_class_short_name: None,
+            car_class_id: None,
+            user_id: None,
+            irating: None,
+            lic_string: None,
+            flair_name: None,
+        };
+        assert_eq!(car.driver_id(), "name:ada lovelace");
     }
 
     #[test]

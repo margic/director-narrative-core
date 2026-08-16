@@ -313,6 +313,42 @@ pub enum RaceEvent {
         version:               String,
         events_enqueued_total: u64,
     },
+    /// Driver pressed their bound "focus on me" wheel button. Car-scoped so
+    /// the sandbox can resolve the requesting car from the roster.
+    FocusMeRequested {
+        lap:             u8,
+        session_time:    f32,
+        player_car_idx:  u8,
+        /// Idempotency key — stable across transport retries.
+        request_id:      String,
+        /// Monotonic per-publisher counter, orders presses inside one tick.
+        press_seq:       u64,
+        /// Stable driver identity: `user:<iRacing userId>` or `name:<normalized>`.
+        driver_id:       String,
+        rig_id:          String,
+        /// `wheel_button` or `simulated`.
+        source:          String,
+        button:          u16,
+        /// Wall-clock milliseconds since the Unix epoch.
+        requested_at_ms: i64,
+        /// Airtime the requesting driver asked for, in milliseconds.
+        dwell_ms:        u32,
+    },
+    /// Driver pressed their bound pause/resume button. Rig-scoped: it acts on
+    /// the broadcast agent, not on a car.
+    BroadcastControlRequested {
+        lap:             u8,
+        session_time:    f32,
+        /// Always `toggle` — the sandbox owns pause/resume state.
+        action:          String,
+        request_id:      String,
+        press_seq:       u64,
+        driver_id:       String,
+        rig_id:          String,
+        source:          String,
+        button:          u16,
+        requested_at_ms: i64,
+    },
 }
 
 impl RaceEvent {
@@ -325,7 +361,8 @@ impl RaceEvent {
             | Self::PublisherGoodbye { .. }
             | Self::PublisherHeartbeat { .. }
             | Self::IracingConnected { .. }
-            | Self::IracingDisconnected { .. } => EventScope::RigScoped,
+            | Self::IracingDisconnected { .. }
+            | Self::BroadcastControlRequested { .. } => EventScope::RigScoped,
             _ => EventScope::CarScoped,
         }
     }

@@ -5,11 +5,15 @@
 //!
 //! ```powershell
 //! publisher.exe [--config <path-to-publisher.toml>] [--no-ui] [--dry-run]
+//!               [--simulate <focus_me|broadcast_toggle>]
 //! ```
 //!
 //! `--dry-run`  Print each JSON batch to stdout instead of POSTing to Race
 //!              Control. Use this to verify the wire format while iRacing is
 //!              running without touching the live API.
+//!
+//! `--simulate` Publish one driver control request as if the bound wheel
+//!              button had been pressed — no HID hardware needed.
 //!
 //! Config can also be supplied entirely via environment variables
 //! (see `src/config.rs`). Press Ctrl-C for a clean shutdown.
@@ -35,6 +39,7 @@ fn run() {
 
     use director_narrative_core::{
         config,
+        controls::{self, ControlsState},
         publisher_status::PublisherStatus,
     };
 
@@ -43,6 +48,13 @@ fn run() {
     let config_path = parse_config_path();
     let no_ui       = std::env::args().any(|a| a == "--no-ui");
     let dry_run     = std::env::args().any(|a| a == "--dry-run");
+    let simulate    = match parse_simulate() {
+        Ok(s) => s,
+        Err(arg) => {
+            eprintln!("[publisher] unknown --simulate action '{arg}' (expected focus_me or broadcast_toggle)");
+            std::process::exit(2);
+        }
+    };
 
     let cfg = match config::load(config_path.as_deref()) {
         Ok(c) => c,
@@ -53,6 +65,7 @@ fn run() {
     };
 
     let resolved_config_path = config_path
+        .as_ref()
         .map(|p| p.display().to_string())
         .or_else(|| {
             std::env::current_exe().ok().and_then(|exe| {
@@ -88,6 +101,26 @@ fn run() {
         s
     }));
 
+    // Wheel-button bindings live beside publisher.toml so the driver's learned
+    // buttons survive restarts without touching the credential-bearing config.
+    let controls_file = controls::controls_path(config_path.as_deref());
+    let controls = Arc::new(Mutex::new(match controls::load_controls(&controls_file) {
+        Ok(c) => {
+            println!(
+                "[controls] {} ({} binding(s))",
+                controls_file.display(),
+                c.bindings.len()
+            );
+            ControlsState::new(c, controls_file)
+        }
+        Err(e) => {
+            eprintln!("[controls] {e} — starting with no bindings");
+            let mut s = ControlsState::new(controls::ControlsConfig::default(), controls_file);
+            s.last_error = Some(e);
+            s
+        }
+    }));
+
     // ── 3. Ctrl-C handler ─────────────────────────────────────────────────
 
     {
@@ -100,14 +133,22 @@ fn run() {
 
     // ── 4. Pipeline thread ────────────────────────────────────────────────
 
-    let pipeline_running = running.clone();
-    let pipeline_status  = status.clone();
-    let pipeline_cfg     = cfg.clone();
+    let pipeline_running  = running.clone();
+    let pipeline_status   = status.clone();
+    let pipeline_cfg      = cfg.clone();
+    let pipeline_controls = controls.clone();
 
     let pipeline = std::thread::Builder::new()
         .name("publisher-pipeline".into())
         .spawn(move || {
-            pipeline_main(pipeline_cfg, pipeline_running, pipeline_status, dry_run);
+            pipeline_main(
+                pipeline_cfg,
+                pipeline_running,
+                pipeline_status,
+                pipeline_controls,
+                dry_run,
+                simulate,
+            );
         })
         .expect("failed to spawn pipeline thread");
 
@@ -116,7 +157,7 @@ fn run() {
     if no_ui {
         pipeline.join().ok();
     } else {
-        if let Err(e) = publisher_ui::run_ui(status, running.clone()) {
+        if let Err(e) = publisher_ui::run_ui(status, controls, running.clone()) {
             eprintln!("[publisher] UI error: {e}");
         }
         // Window closed — signal pipeline to stop and wait for flush.
@@ -131,14 +172,18 @@ fn run() {
 
 #[cfg(target_os = "windows")]
 fn pipeline_main(
-    cfg:     director_narrative_core::config::PublisherConfig,
-    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    status:  std::sync::Arc<std::sync::Mutex<director_narrative_core::publisher_status::PublisherStatus>>,
-    dry_run: bool,
+    cfg:      director_narrative_core::config::PublisherConfig,
+    running:  std::sync::Arc<std::sync::atomic::AtomicBool>,
+    status:   std::sync::Arc<std::sync::Mutex<director_narrative_core::publisher_status::PublisherStatus>>,
+    controls: std::sync::Arc<std::sync::Mutex<director_narrative_core::controls::ControlsState>>,
+    dry_run:  bool,
+    simulate: Option<director_narrative_core::controls::ControlAction>,
 ) {
     use std::sync::atomic::Ordering;
 
     use director_narrative_core::{
+        controls::{now_wall_clock_ms, simulated_request, ControlRequest},
+        controls_input,
         engine::NarrativeEngine,
         lifecycle::{HeartbeatScheduler, LifecyclePublisher},
         publisher_event::{build_event, PublisherEvent},
@@ -209,6 +254,18 @@ fn pipeline_main(
     // Car-scoped events held back while the roster hasn't yet resolved driverName.
     // Flushed after each roster update. Capped at 64 entries.
     let mut pending_events: Vec<PublisherEvent> = Vec::new();
+
+    // ── Driver controls ───────────────────────────────────────────────────
+    // Wheel buttons are read on their own thread and handed over as accepted
+    // requests; requests arriving before the roster resolves the driver are
+    // held here so the published event always carries a real driver identity.
+    let controls_rx = controls_input::spawn(controls.clone(), running.clone());
+    let mut pending_requests: Vec<ControlRequest> = simulate
+        .map(|action| vec![simulated_request(action, now_wall_clock_ms())])
+        .unwrap_or_default();
+    if let Some(action) = simulate {
+        println!("[controls] --simulate {action}: request queued");
+    }
 
     // ── First frame ───────────────────────────────────────────────────────
     // PUBLISHER_HELLO is deferred: it is emitted once the SessionInfo YAML is
@@ -523,6 +580,55 @@ fn pipeline_main(
                 }
                 sub_session_blocked_frames = 0;
 
+                // Driver control requests. Published as soon as the requesting
+                // driver is known and flushed immediately — the broadcast agent
+                // must react to a button press, not to the next batch window.
+                while let Ok(request) = controls_rx.try_recv() {
+                    if pending_requests.len() < 8 {
+                        pending_requests.push(request);
+                    } else {
+                        eprintln!("[controls] dropping request: driver identity unresolved");
+                    }
+                }
+                if !pending_requests.is_empty() {
+                    let requester = roster
+                        .and_then(|r| r.lookup(frame.player_car_idx))
+                        .filter(|car| !car.driver_name.is_empty());
+                    if let Some(car) = requester {
+                        let driver_id = car.driver_id();
+                        for request in std::mem::take(&mut pending_requests) {
+                            let event = control_race_event(&request, &frame, &driver_id, &rig_id);
+                            log_event(&event, roster, &frame);
+                            let log_entry = make_log_entry(&event, &frame, roster);
+                            let pe = build_event(
+                                &event,
+                                &frame,
+                                roster,
+                                &race_session_id,
+                                &rig_id,
+                                current_session_meta.as_ref(),
+                                Some(sub_session_id),
+                            );
+                            transport.enqueue(pe);
+                            {
+                                let mut s = status.lock().unwrap();
+                                s.events_enqueued_total += 1;
+                                s.push_event_log(log_entry);
+                            }
+                        }
+                        if let Err(e) = transport.flush(
+                            frame.session_time as f64,
+                            frame.session_tick,
+                            sub_session_id,
+                        ) {
+                            eprintln!("[controls] flush error: {e}");
+                            let mut s = status.lock().unwrap();
+                            s.calls_total  += 1;
+                            s.calls_failed += 1;
+                        }
+                    }
+                }
+
                 // Heartbeat — rig-scoped liveness signal on a wall-clock timer,
                 // gated on the same connected + resolved-subSessionId conditions
                 // as HELLO, delivered via the normal batch path.
@@ -606,6 +712,62 @@ fn parse_config_path() -> Option<std::path::PathBuf> {
     args.windows(2)
         .find(|w| w[0] == "--config")
         .map(|w| std::path::PathBuf::from(&w[1]))
+}
+
+/// Parse `--simulate <action>`. `Err` carries the unrecognised action.
+fn parse_simulate() -> Result<Option<director_narrative_core::controls::ControlAction>, String> {
+    use director_narrative_core::controls::ControlAction;
+    let args: Vec<String> = std::env::args().collect();
+    match args.windows(2).find(|w| w[0] == "--simulate") {
+        None => Ok(None),
+        Some(w) => ControlAction::parse(&w[1])
+            .map(Some)
+            .ok_or_else(|| w[1].clone()),
+    }
+}
+
+/// Turn an accepted control request into the event published to Race Control.
+///
+/// `driver_id` identifies the driver at the wheel of `frame.player_car_idx`;
+/// the sandbox uses it to resolve the requester's onboard scene when several
+/// rigs are configured.
+#[cfg(target_os = "windows")]
+fn control_race_event(
+    request:   &director_narrative_core::controls::ControlRequest,
+    frame:     &director_narrative_core::telemetry_frame::TelemetryFrame,
+    driver_id: &str,
+    rig_id:    &str,
+) -> director_narrative_core::race_event::RaceEvent {
+    use director_narrative_core::controls::{ControlAction, FOCUS_DWELL_MS};
+    use director_narrative_core::race_event::RaceEvent;
+
+    match request.action {
+        ControlAction::FocusMe => RaceEvent::FocusMeRequested {
+            lap:             frame.lap,
+            session_time:    frame.session_time,
+            player_car_idx:  frame.player_car_idx,
+            request_id:      request.request_id.clone(),
+            press_seq:       request.press_seq,
+            driver_id:       driver_id.to_owned(),
+            rig_id:          rig_id.to_owned(),
+            source:          request.source.clone(),
+            button:          request.button,
+            requested_at_ms: request.requested_at_ms,
+            dwell_ms:        FOCUS_DWELL_MS,
+        },
+        ControlAction::BroadcastToggle => RaceEvent::BroadcastControlRequested {
+            lap:             frame.lap,
+            session_time:    frame.session_time,
+            action:          "toggle".to_owned(),
+            request_id:      request.request_id.clone(),
+            press_seq:       request.press_seq,
+            driver_id:       driver_id.to_owned(),
+            rig_id:          rig_id.to_owned(),
+            source:          request.source.clone(),
+            button:          request.button,
+            requested_at_ms: request.requested_at_ms,
+        },
+    }
 }
 
 /// Retry loop: block until `SharedMemReader::try_connect()` succeeds.

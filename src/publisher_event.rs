@@ -135,6 +135,7 @@ fn primary_car_idx(event: &RaceEvent, player_car_idx: u8) -> u8 {
         | RaceEvent::BattleBroken  { opponent_car_idx, .. }
         | RaceEvent::BattleClosing { opponent_car_idx, .. } => *opponent_car_idx,
         RaceEvent::IncidentAlert { car_idx, .. } => *car_idx,
+        RaceEvent::FocusMeRequested { player_car_idx, .. } => *player_car_idx,
         _ => player_car_idx,
     }
 }

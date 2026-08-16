@@ -648,3 +648,93 @@ fn micro_sector_loss_contract_is_car_scoped() {
     let delta = json["payload"]["cumulative_delta_s"].as_f64().expect("delta should be numeric");
     assert!((delta - 0.24).abs() < 1e-4);
 }
+
+#[test]
+fn focus_me_requested_contract_carries_requester_identity_and_dwell() {
+    let event = RaceEvent::FocusMeRequested {
+        lap: 4,
+        session_time: 1234.5,
+        player_car_idx: 1,
+        request_id: "req-1".to_owned(),
+        press_seq: 3,
+        driver_id: "user:123456".to_owned(),
+        rig_id: "rig-001".to_owned(),
+        source: "wheel_button".to_owned(),
+        button: 7,
+        requested_at_ms: 1_700_000_000_000,
+        dwell_ms: 10_000,
+    };
+
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001", None, None);
+    let json = normalized_event_json(&env);
+
+    assert_envelope_contract(&json, "FOCUS_ME_REQUESTED");
+    assert_eq!(json["scope"], "CAR_SCOPED");
+    // The subject is the requesting driver's car.
+    assert_eq!(json["car"]["carIdx"], 1);
+    assert_eq!(json["payload"]["request_id"], "req-1");
+    assert_eq!(json["payload"]["press_seq"], 3);
+    assert_eq!(json["payload"]["driver_id"], "user:123456");
+    assert_eq!(json["payload"]["rig_id"], "rig-001");
+    assert_eq!(json["payload"]["source"], "wheel_button");
+    assert_eq!(json["payload"]["button"], 7);
+    assert_eq!(json["payload"]["dwell_ms"], 10_000);
+    assert_eq!(json["payload"]["requested_at_ms"], 1_700_000_000_000i64);
+}
+
+#[test]
+fn broadcast_control_requested_is_rig_scoped_and_carries_no_car() {
+    let event = RaceEvent::BroadcastControlRequested {
+        lap: 4,
+        session_time: 1234.5,
+        action: "toggle".to_owned(),
+        request_id: "req-2".to_owned(),
+        press_seq: 4,
+        driver_id: "user:123456".to_owned(),
+        rig_id: "rig-001".to_owned(),
+        source: "simulated".to_owned(),
+        button: 3,
+        requested_at_ms: 1_700_000_000_001,
+    };
+
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001", None, None);
+    let json = normalized_event_json(&env);
+
+    assert_envelope_contract(&json, "BROADCAST_CONTROL_REQUESTED");
+    assert_eq!(json["scope"], "RIG_SCOPED");
+    assert!(json.get("car").is_none());
+    assert_eq!(json["payload"]["action"], "toggle");
+    assert_eq!(json["payload"]["request_id"], "req-2");
+    assert_eq!(json["payload"]["source"], "simulated");
+}
+
+#[test]
+fn two_requests_in_the_same_tick_stay_distinguishable() {
+    let request = |request_id: &str, press_seq: u64, driver: &str, car_idx: u8| {
+        RaceEvent::FocusMeRequested {
+            lap: 4,
+            session_time: 1234.5,
+            player_car_idx: car_idx,
+            request_id: request_id.to_owned(),
+            press_seq,
+            driver_id: driver.to_owned(),
+            rig_id: format!("rig-{driver}"),
+            source: "wheel_button".to_owned(),
+            button: 7,
+            requested_at_ms: 1_700_000_000_000,
+            dwell_ms: 10_000,
+        }
+    };
+
+    let frame = minimal_frame();
+    let a = build_event(&request("req-a", 1, "user:1", 0), &frame, None, "s", "rig-a", None, None);
+    let b = build_event(&request("req-b", 2, "user:2", 1), &frame, None, "s", "rig-b", None, None);
+
+    // Same subSessionId, tick, and type: only the request identity separates
+    // them, which is what the sandbox deduplicates on.
+    assert_eq!(a.session_tick, b.session_tick);
+    assert_ne!(a.id, b.id);
+    assert_ne!(a.payload["request_id"], b.payload["request_id"]);
+    assert_ne!(a.payload["press_seq"], b.payload["press_seq"]);
+    assert_ne!(a.payload["driver_id"], b.payload["driver_id"]);
+}
