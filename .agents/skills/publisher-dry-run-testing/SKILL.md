@@ -1,0 +1,1 @@
+file://C:/Users/Administrator/repos/director-narrative-core/.agents/skills/publisher-dry-run-testing/SKILL.md
