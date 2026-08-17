@@ -115,6 +115,26 @@ python3 scripts/prototype_narrative.py
 | [docs/test-harness.md](docs/test-harness.md) | JSONL fixtures, Rust unit and scenario tests, CI integration |
 | [docs/iracing-mmap-reference.md](docs/iracing-mmap-reference.md) | Shared-memory layout, mock mmap workflow, snapshot export, and detector validation checklist |
 
+## Event Catalog Contract
+
+[`contracts/publisher-event-catalog.json`](contracts/publisher-event-catalog.json) is the checked-in
+list of every `type` the publisher puts on the wire and the envelope scope it sends. Race Control
+keeps an identical copy at `api/contracts/publisher-event-catalog.json` and asserts its ingest
+allowlist accepts every entry, so a type this repo emits but Race Control does not know about fails a
+test instead of being rejected at runtime with `unknown type "..."`.
+
+Adding a `RaceEvent` variant therefore means:
+
+1. register it in `RaceEventKind` and give it a scope (the compiler requires both);
+2. regenerate the catalog:
+   ```bash
+   UPDATE_PUBLISHER_EVENT_CATALOG=1 cargo test --test event_catalog_contract
+   ```
+3. copy the regenerated file into `margic/racecontrol` and add the type to `PUBLISHER_EVENT_TYPES`.
+
+Set the `RACECONTROL_CONTRACT_TOKEN` repository secret (a token with read access to
+`margic/racecontrol`) to have CI fail on step 3 being skipped rather than trusting the checklist.
+
 ## Key Design Decisions
 
 **Spatial anchoring over time-window buffering.** The original RFC proposed `bufferTime()` / `pairwise()` over the raw gap stream. The Nürburgring data shows gap derivatives of ±2-4 s/lap from accordion noise alone — this would fire false `PUSH` events in every braking zone. Anchoring at fixed `LapDistPct` checkpoints cancels this noise exactly.

@@ -1,4 +1,5 @@
 use serde::Serialize;
+use strum::{Display, EnumIter, IntoEnumIterator};
 
 use crate::battle_state::SlopeInfo;
 
@@ -351,19 +352,156 @@ pub enum RaceEvent {
     },
 }
 
-impl RaceEvent {
-    pub fn event_scope(&self) -> EventScope {
+/// Discriminant of [`RaceEvent`]: one variant per emitted event type, with the
+/// payload fields stripped.
+///
+/// This exists so the wire contract can be enumerated without constructing an
+/// event of every variant. [`RaceEvent::kind`] and [`RaceEventKind::scope`] are
+/// exhaustive matches, so a new `RaceEvent` variant does not compile until it is
+/// registered here and given a scope, and the catalog contract test then fails
+/// until `contracts/publisher-event-catalog.json` is regenerated — which is the
+/// signal that Race Control's ingest catalog needs the new type too.
+///
+/// `serialize_all` mirrors the `rename_all` on `RaceEvent`, so
+/// [`RaceEventKind::event_type`] is the same string serde writes to the
+/// envelope's `type` field.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Display, EnumIter)]
+#[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
+pub enum RaceEventKind {
+    BattleEngaged,
+    BattleBroken,
+    BattleClosing,
+    HorizonClosing,
+    HorizonClosingResolved,
+    RaceGreen,
+    FlagYellowFullCourse,
+    FlagYellowLocal,
+    RaceCheckered,
+    IracingConnected,
+    IracingDisconnected,
+    DriverEnteredCar,
+    DriverExitedCar,
+    Overtake,
+    OvertakeForLead,
+    LapCompleted,
+    PitEntry,
+    PitExit,
+    TireDegradation,
+    FuelProjection,
+    FuelSavingTechnique,
+    IncidentAlert,
+    MicroSectorGain,
+    MicroSectorLoss,
+    BrakingProfile,
+    TrafficIntercept,
+    VulnerabilityAlert,
+    VulnerabilityResolved,
+    IncidentCluster,
+    IncidentClusterResolved,
+    TrafficCompressionZone,
+    PublisherHello,
+    PublisherGoodbye,
+    PublisherHeartbeat,
+    FocusMeRequested,
+    BroadcastControlRequested,
+}
+
+impl RaceEventKind {
+    /// Every event type the publisher can emit, in declaration order.
+    pub fn all() -> impl Iterator<Item = Self> {
+        Self::iter()
+    }
+
+    /// Wire value of the envelope's `type` field, e.g. `"BATTLE_ENGAGED"`.
+    pub fn event_type(self) -> String {
+        self.to_string()
+    }
+
+    pub fn scope(self) -> EventScope {
         match self {
-            Self::RaceGreen { .. }
-            | Self::RaceCheckered { .. }
-            | Self::FlagYellowFullCourse { .. } => EventScope::SessionScoped,
-            Self::PublisherHello { .. }
-            | Self::PublisherGoodbye { .. }
-            | Self::PublisherHeartbeat { .. }
-            | Self::IracingConnected { .. }
-            | Self::IracingDisconnected { .. }
-            | Self::BroadcastControlRequested { .. } => EventScope::RigScoped,
-            _ => EventScope::CarScoped,
+            Self::RaceGreen | Self::RaceCheckered | Self::FlagYellowFullCourse => {
+                EventScope::SessionScoped
+            }
+            Self::PublisherHello
+            | Self::PublisherGoodbye
+            | Self::PublisherHeartbeat
+            | Self::IracingConnected
+            | Self::IracingDisconnected
+            | Self::BroadcastControlRequested => EventScope::RigScoped,
+            Self::BattleEngaged
+            | Self::BattleBroken
+            | Self::BattleClosing
+            | Self::HorizonClosing
+            | Self::HorizonClosingResolved
+            | Self::FlagYellowLocal
+            | Self::DriverEnteredCar
+            | Self::DriverExitedCar
+            | Self::Overtake
+            | Self::OvertakeForLead
+            | Self::LapCompleted
+            | Self::PitEntry
+            | Self::PitExit
+            | Self::TireDegradation
+            | Self::FuelProjection
+            | Self::FuelSavingTechnique
+            | Self::IncidentAlert
+            | Self::MicroSectorGain
+            | Self::MicroSectorLoss
+            | Self::BrakingProfile
+            | Self::TrafficIntercept
+            | Self::VulnerabilityAlert
+            | Self::VulnerabilityResolved
+            | Self::IncidentCluster
+            | Self::IncidentClusterResolved
+            | Self::TrafficCompressionZone
+            | Self::FocusMeRequested => EventScope::CarScoped,
         }
+    }
+}
+
+impl RaceEvent {
+    pub fn kind(&self) -> RaceEventKind {
+        match self {
+            Self::BattleEngaged { .. } => RaceEventKind::BattleEngaged,
+            Self::BattleBroken { .. } => RaceEventKind::BattleBroken,
+            Self::BattleClosing { .. } => RaceEventKind::BattleClosing,
+            Self::HorizonClosing { .. } => RaceEventKind::HorizonClosing,
+            Self::HorizonClosingResolved { .. } => RaceEventKind::HorizonClosingResolved,
+            Self::RaceGreen { .. } => RaceEventKind::RaceGreen,
+            Self::FlagYellowFullCourse { .. } => RaceEventKind::FlagYellowFullCourse,
+            Self::FlagYellowLocal { .. } => RaceEventKind::FlagYellowLocal,
+            Self::RaceCheckered { .. } => RaceEventKind::RaceCheckered,
+            Self::IracingConnected { .. } => RaceEventKind::IracingConnected,
+            Self::IracingDisconnected { .. } => RaceEventKind::IracingDisconnected,
+            Self::DriverEnteredCar { .. } => RaceEventKind::DriverEnteredCar,
+            Self::DriverExitedCar { .. } => RaceEventKind::DriverExitedCar,
+            Self::Overtake { .. } => RaceEventKind::Overtake,
+            Self::OvertakeForLead { .. } => RaceEventKind::OvertakeForLead,
+            Self::LapCompleted { .. } => RaceEventKind::LapCompleted,
+            Self::PitEntry { .. } => RaceEventKind::PitEntry,
+            Self::PitExit { .. } => RaceEventKind::PitExit,
+            Self::TireDegradation { .. } => RaceEventKind::TireDegradation,
+            Self::FuelProjection { .. } => RaceEventKind::FuelProjection,
+            Self::FuelSavingTechnique { .. } => RaceEventKind::FuelSavingTechnique,
+            Self::IncidentAlert { .. } => RaceEventKind::IncidentAlert,
+            Self::MicroSectorGain { .. } => RaceEventKind::MicroSectorGain,
+            Self::MicroSectorLoss { .. } => RaceEventKind::MicroSectorLoss,
+            Self::BrakingProfile { .. } => RaceEventKind::BrakingProfile,
+            Self::TrafficIntercept { .. } => RaceEventKind::TrafficIntercept,
+            Self::VulnerabilityAlert { .. } => RaceEventKind::VulnerabilityAlert,
+            Self::VulnerabilityResolved { .. } => RaceEventKind::VulnerabilityResolved,
+            Self::IncidentCluster { .. } => RaceEventKind::IncidentCluster,
+            Self::IncidentClusterResolved { .. } => RaceEventKind::IncidentClusterResolved,
+            Self::TrafficCompressionZone { .. } => RaceEventKind::TrafficCompressionZone,
+            Self::PublisherHello { .. } => RaceEventKind::PublisherHello,
+            Self::PublisherGoodbye { .. } => RaceEventKind::PublisherGoodbye,
+            Self::PublisherHeartbeat { .. } => RaceEventKind::PublisherHeartbeat,
+            Self::FocusMeRequested { .. } => RaceEventKind::FocusMeRequested,
+            Self::BroadcastControlRequested { .. } => RaceEventKind::BroadcastControlRequested,
+        }
+    }
+
+    pub fn event_scope(&self) -> EventScope {
+        self.kind().scope()
     }
 }

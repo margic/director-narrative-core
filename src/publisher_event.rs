@@ -86,11 +86,12 @@ pub fn build_event(
     // Serialise the event, hoist the discriminator tag, use remainder as payload.
     let mut event_value =
         serde_json::to_value(race_event).expect("RaceEvent is always serialisable");
-    let event_type = event_value
-        .as_object_mut()
-        .and_then(|m| m.remove("event_type"))
-        .and_then(|v| v.as_str().map(str::to_owned))
-        .unwrap_or_default();
+    if let Some(map) = event_value.as_object_mut() {
+        map.remove("event_type");
+    }
+    // Taken from the catalogued kind rather than the serialised tag so the wire
+    // `type` and `contracts/publisher-event-catalog.json` cannot drift apart.
+    let event_type = race_event.kind().event_type();
     let scope = race_event.event_scope();
     let mut payload = event_value;
     enrich_payload(&mut payload, race_event, frame, roster);

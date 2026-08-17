@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --all-targets
+
+      # Includes tests/event_catalog_contract.rs, which fails when a new
+      # RaceEvent variant is not in contracts/publisher-event-catalog.json.
+      - name: Test
+        run: cargo test
+
+  contract-sync:
+    name: Race Control accepts every published event type
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Compares the event catalog against Race Control's mirrored copy so a
+      # publisher release cannot ship a type the ingest API would reject with
+      # `unknown type "..."`. Skipped (not failed) when no cross-repo token is
+      # configured, since the secret is unavailable to fork PRs.
+      - name: Compare catalog with margic/racecontrol
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RACECONTROL_CONTRACT_TOKEN }}
+          RACECONTROL_REPO: margic/racecontrol
+          RACECONTROL_PATH: api/contracts/publisher-event-catalog.json
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::notice::RACECONTROL_CONTRACT_TOKEN not set - skipping cross-repo catalog check"
+            exit 0
+          fi
+          curl -fsSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github.raw" \
+            "https://api.github.com/repos/${RACECONTROL_REPO}/contents/${RACECONTROL_PATH}?ref=main" \
+            -o racecontrol-catalog.json
+          if ! diff -u contracts/publisher-event-catalog.json racecontrol-catalog.json; then
+            echo "::error::${RACECONTROL_REPO} ${RACECONTROL_PATH} is out of sync. Mirror contracts/publisher-event-catalog.json there and add any new type to PUBLISHER_EVENT_TYPES."
+            exit 1
+          fi
