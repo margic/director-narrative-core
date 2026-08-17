@@ -131,12 +131,20 @@ fn run() {
         .expect("error setting Ctrl-C handler");
     }
 
-    // ── 4. Pipeline thread ────────────────────────────────────────────────
+    // ── 4. Wheel-button listener ──────────────────────────────────────────
+    // Started here rather than inside the pipeline: the pipeline blocks in
+    // `connect_loop` until iRacing is running, and a driver binds buttons in
+    // the UI before launching the sim. Accepted presses queue on the channel
+    // until the pipeline can stamp them with live session state.
+
+    let controls_rx =
+        director_narrative_core::controls_input::spawn(controls.clone(), running.clone());
+
+    // ── 5. Pipeline thread ────────────────────────────────────────────────
 
     let pipeline_running  = running.clone();
     let pipeline_status   = status.clone();
     let pipeline_cfg      = cfg.clone();
-    let pipeline_controls = controls.clone();
 
     let pipeline = std::thread::Builder::new()
         .name("publisher-pipeline".into())
@@ -145,14 +153,14 @@ fn run() {
                 pipeline_cfg,
                 pipeline_running,
                 pipeline_status,
-                pipeline_controls,
+                controls_rx,
                 dry_run,
                 simulate,
             );
         })
         .expect("failed to spawn pipeline thread");
 
-    // ── 5. UI or headless ─────────────────────────────────────────────────
+    // ── 6. UI or headless ─────────────────────────────────────────────────
 
     if no_ui {
         pipeline.join().ok();
@@ -175,7 +183,7 @@ fn pipeline_main(
     cfg:      director_narrative_core::config::PublisherConfig,
     running:  std::sync::Arc<std::sync::atomic::AtomicBool>,
     status:   std::sync::Arc<std::sync::Mutex<director_narrative_core::publisher_status::PublisherStatus>>,
-    controls: std::sync::Arc<std::sync::Mutex<director_narrative_core::controls::ControlsState>>,
+    controls_rx: std::sync::mpsc::Receiver<director_narrative_core::controls::ControlRequest>,
     dry_run:  bool,
     simulate: Option<director_narrative_core::controls::ControlAction>,
 ) {
@@ -183,7 +191,6 @@ fn pipeline_main(
 
     use director_narrative_core::{
         controls::{now_wall_clock_ms, simulated_request, ControlRequest},
-        controls_input,
         engine::NarrativeEngine,
         lifecycle::{HeartbeatScheduler, LifecyclePublisher},
         publisher_event::{build_event, PublisherEvent},
@@ -256,10 +263,10 @@ fn pipeline_main(
     let mut pending_events: Vec<PublisherEvent> = Vec::new();
 
     // ── Driver controls ───────────────────────────────────────────────────
-    // Wheel buttons are read on their own thread and handed over as accepted
+    // Wheel buttons are read on their own thread — started by the caller
+    // before this pipeline waits for iRacing — and handed over as accepted
     // requests; requests arriving before the roster resolves the driver are
     // held here so the published event always carries a real driver identity.
-    let controls_rx = controls_input::spawn(controls.clone(), running.clone());
     let mut pending_requests: Vec<ControlRequest> = simulate
         .map(|action| vec![simulated_request(action, now_wall_clock_ms())])
         .unwrap_or_default();
