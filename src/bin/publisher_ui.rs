@@ -242,6 +242,11 @@ fn event_log(ui: &mut egui::Ui, s: &PublisherStatus) {
         });
 }
 
+/// Trim the HID revision suffix so the binding fits beside the action label.
+fn short_device(device: &str) -> &str {
+    device.split("&REV_").next().unwrap_or(device)
+}
+
 fn event_colour(event_type: &str) -> (Color32, bool) {
     if event_type.starts_with("BATTLE_") {
         (AMBER, false)
@@ -267,10 +272,15 @@ fn controls_block(ui: &mut egui::Ui, controls: &Arc<Mutex<ControlsState>>) {
     let mut state = controls.lock().unwrap();
 
     ui.horizontal(|ui| {
-        let (dot, label) = match (state.config.enabled, state.last_error.is_some()) {
-            (_, true)      => (RED, "INPUT UNAVAILABLE"),
-            (false, false) => (GREY, "DISABLED"),
-            (true, false)  => (GREEN, "LISTENING"),
+        let (dot, label) = match (
+            state.config.enabled,
+            state.last_error.is_some(),
+            state.listening,
+        ) {
+            (_, true, _)         => (RED, "INPUT UNAVAILABLE"),
+            (false, false, _)    => (GREY, "DISABLED"),
+            (true, false, false) => (ORANGE, "INPUT STARTING"),
+            (true, false, true)  => (GREEN, "LISTENING"),
         };
         status_dot(ui, dot);
         ui.label(RichText::new("Driver Controls").strong());
@@ -287,7 +297,7 @@ fn controls_block(ui: &mut egui::Ui, controls: &Arc<Mutex<ControlsState>>) {
             let bound = state
                 .config
                 .binding_for(action)
-                .map(|b| format!("{}  ·  button {}", b.device, b.button));
+                .map(|b| format!("{}  ·  button {}", short_device(&b.device), b.button));
             let learning = state.learning == Some(action);
 
             ui.horizontal(|ui| {
@@ -315,7 +325,9 @@ fn controls_block(ui: &mut egui::Ui, controls: &Arc<Mutex<ControlsState>>) {
                             state.clear_binding(action);
                         }
                     }
-                    ui.label(detail);
+                    // Right-to-left layouts don't clip, so a long device string
+                    // would otherwise overprint the action label on the left.
+                    ui.add(egui::Label::new(detail).truncate());
                 });
             });
         }

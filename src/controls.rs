@@ -343,6 +343,10 @@ pub struct ControlsState {
     pub last_request: Option<(ControlAction, i64)>,
     /// Number of HID devices Raw Input is listening to.
     pub devices_seen: usize,
+    /// True once the input backend has registered for Raw Input. Until then a
+    /// `Bind` click cannot capture anything, so the UI must not claim to be
+    /// listening.
+    pub listening: bool,
     /// Last input/persistence error, surfaced in the UI.
     pub last_error: Option<String>,
 }
@@ -356,6 +360,7 @@ impl ControlsState {
             last_captured: None,
             last_request: None,
             devices_seen: 0,
+            listening: false,
             last_error: None,
         }
     }
