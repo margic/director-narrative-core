@@ -133,6 +133,7 @@ mod windows_backend {
                     eprintln!("[controls] input unavailable: {e}");
                     controls.lock().unwrap().last_error = Some(e);
                 }
+                controls.lock().unwrap().listening = false;
             });
         if let Err(e) = spawned {
             eprintln!("[controls] could not start input thread: {e}");
@@ -147,6 +148,7 @@ mod windows_backend {
     ) -> Result<(), String> {
         let hwnd = create_message_window()?;
         register_devices(hwnd)?;
+        controls.lock().unwrap().listening = true;
         println!("[controls] listening for wheel buttons (Raw Input HID)");
 
         let mut tracker = PressTracker::new();
