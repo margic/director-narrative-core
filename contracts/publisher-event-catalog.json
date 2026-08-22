@@ -142,6 +142,14 @@
       "type": "FOCUS_ME_REQUESTED"
     },
     {
+      "scope": "CAR_SCOPED",
+      "type": "DRIVER_MATERIAL"
+    },
+    {
+      "scope": "SESSION_SCOPED",
+      "type": "SESSION_RESET"
+    },
+    {
       "scope": "RIG_SCOPED",
       "type": "BROADCAST_CONTROL_REQUESTED"
     }

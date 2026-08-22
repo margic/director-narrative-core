@@ -343,6 +343,49 @@ pub enum RaceEvent {
         /// Airtime the requesting driver asked for, in milliseconds.
         dwell_ms:        u32,
     },
+    /// Periodic state of the driver at the wheel of this rig, emitted on a
+    /// wall-clock cadence regardless of whether anything notable happened.
+    ///
+    /// The consumer needs a steady supply of material for the drivers it is
+    /// meant to cover: a rig that produces no narrative events for minutes at a
+    /// time otherwise looks stale next to a busy midfield battle.
+    DriverMaterial {
+        lap:               u8,
+        session_time:      f32,
+        player_car_idx:    u8,
+        position:          u8,
+        laps_completed:    i32,
+        lap_dist_pct:      f32,
+        last_lap_time_s:   Option<f32>,
+        best_lap_time_s:   Option<f32>,
+        /// Gap to the car ahead in race order, seconds. `None` when nobody is
+        /// within a credible battle gap.
+        gap_ahead_s:       Option<f32>,
+        car_ahead_idx:     Option<u8>,
+        gap_behind_s:      Option<f32>,
+        car_behind_idx:    Option<u8>,
+        on_pit_road:       bool,
+        track_surface:     i32,
+        speed_mps:         f32,
+        fuel_level_l:      f32,
+        incident_count:    i32,
+        session_state:     i32,
+        /// Wall-clock seconds since the previous `DRIVER_MATERIAL` from this rig.
+        interval_s:        f32,
+    },
+    /// The publisher discarded all session-scoped state because iRacing moved to
+    /// a different session. Consumers should drop cached car indices, battles,
+    /// and driver bindings for `previous_sub_session_id` when they see this.
+    SessionReset {
+        lap:                     u8,
+        session_time:            f32,
+        previous_sub_session_id: Option<i64>,
+        sub_session_id:          i64,
+        previous_session_num:    Option<i32>,
+        session_num:             i32,
+        /// Machine-readable cause, e.g. `sub_session_changed`.
+        reason:                  String,
+    },
     /// Driver pressed their bound pause/resume button. Rig-scoped: it acts on
     /// the broadcast agent, not on a car.
     BroadcastControlRequested {
@@ -411,6 +454,8 @@ pub enum RaceEventKind {
     PublisherGoodbye,
     PublisherHeartbeat,
     FocusMeRequested,
+    DriverMaterial,
+    SessionReset,
     BroadcastControlRequested,
 }
 
@@ -427,9 +472,10 @@ impl RaceEventKind {
 
     pub fn scope(self) -> EventScope {
         match self {
-            Self::RaceGreen | Self::RaceCheckered | Self::FlagYellowFullCourse => {
-                EventScope::SessionScoped
-            }
+            Self::RaceGreen
+            | Self::RaceCheckered
+            | Self::FlagYellowFullCourse
+            | Self::SessionReset => EventScope::SessionScoped,
             Self::PublisherHello
             | Self::PublisherGoodbye
             | Self::PublisherHeartbeat
@@ -462,6 +508,7 @@ impl RaceEventKind {
             | Self::IncidentCluster
             | Self::IncidentClusterResolved
             | Self::TrafficCompressionZone
+            | Self::DriverMaterial
             | Self::FocusMeRequested => EventScope::CarScoped,
         }
     }
@@ -505,6 +552,8 @@ impl RaceEvent {
             Self::PublisherGoodbye { .. } => RaceEventKind::PublisherGoodbye,
             Self::PublisherHeartbeat { .. } => RaceEventKind::PublisherHeartbeat,
             Self::FocusMeRequested { .. } => RaceEventKind::FocusMeRequested,
+            Self::DriverMaterial { .. } => RaceEventKind::DriverMaterial,
+            Self::SessionReset { .. } => RaceEventKind::SessionReset,
             Self::BroadcastControlRequested { .. } => RaceEventKind::BroadcastControlRequested,
         }
     }

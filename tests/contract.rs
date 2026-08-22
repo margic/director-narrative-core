@@ -930,3 +930,112 @@ fn two_requests_in_the_same_tick_stay_distinguishable() {
     assert_ne!(a.payload["press_seq"], b.payload["press_seq"]);
     assert_ne!(a.payload["driver_id"], b.payload["driver_id"]);
 }
+
+#[test]
+fn driver_material_publishes_the_full_state_of_the_rigs_own_driver() {
+    let event = RaceEvent::DriverMaterial {
+        lap: 4,
+        session_time: 1234.5,
+        player_car_idx: 0,
+        position: 5,
+        laps_completed: 3,
+        lap_dist_pct: 0.5,
+        last_lap_time_s: Some(88.2),
+        best_lap_time_s: Some(87.9),
+        gap_ahead_s: Some(1.4),
+        car_ahead_idx: Some(1),
+        gap_behind_s: None,
+        car_behind_idx: None,
+        on_pit_road: false,
+        track_surface: 3,
+        speed_mps: 61.5,
+        fuel_level_l: 42.25,
+        incident_count: 4,
+        session_state: 4,
+        interval_s: 25.0,
+    };
+
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001", None, None);
+    let json = normalized_event_json(&env);
+
+    assert_envelope_contract(&json, "DRIVER_MATERIAL");
+    let payload = &json["payload"];
+    assert_eq!(payload["subjectRole"], "DRIVER");
+    assert_eq!(payload["subjectCarIdx"], 0);
+    assert_eq!(payload["position"], 5);
+    assert_eq!(payload["lapsCompleted"], 3);
+    assert_eq!(payload["onPitRoad"], false);
+    assert_eq!(payload["trackSurface"], 3);
+    assert_eq!(payload["incidentCount"], 4);
+    assert_eq!(payload["sessionState"], 4);
+    assert!((payload["intervalS"].as_f64().unwrap() - 25.0).abs() < 1e-6);
+    assert!((payload["lastLapTime"].as_f64().unwrap() - 88.2).abs() < 1e-4);
+    assert!((payload["bestLapTime"].as_f64().unwrap() - 87.9).abs() < 1e-4);
+    assert!((payload["gapAhead"].as_f64().unwrap() - 1.4).abs() < 1e-4);
+    assert!(payload["gapBehind"].is_null());
+    assert_eq!(payload["carAheadIdx"], 1);
+    assert!(payload["carAhead"].is_object());
+    assert!(payload["carBehind"].is_null());
+    // Snake-case originals stay for the transition window.
+    assert_eq!(payload["laps_completed"], 3);
+    assert_eq!(payload["track_surface"], 3);
+}
+
+#[test]
+fn session_reset_names_the_old_and_new_sessions() {
+    let event = RaceEvent::SessionReset {
+        lap: 0,
+        session_time: 12.0,
+        previous_sub_session_id: Some(88_087_370),
+        sub_session_id: 88_087_411,
+        previous_session_num: Some(2),
+        session_num: 0,
+        reason: "sub_session_changed".to_owned(),
+    };
+
+    let env = build_event(&event, &minimal_frame(), None, "88087411", "rig-001", None, Some(88_087_411));
+    let json = normalized_event_json(&env);
+
+    assert_envelope_contract(&json, "SESSION_RESET");
+    let payload = &json["payload"];
+    // Session-scoped: no subject car to invalidate against.
+    assert_eq!(payload["subjectRole"], "SESSION");
+    assert_eq!(json["scope"], "SESSION_SCOPED");
+    assert_eq!(payload["previousSubSessionId"], 88_087_370i64);
+    assert_eq!(payload["subSessionId"], 88_087_411i64);
+    assert_eq!(payload["previousSessionNum"], 2);
+    assert_eq!(payload["sessionNum"], 0);
+    assert_eq!(payload["reason"], "sub_session_changed");
+    assert_eq!(json["context"]["subSessionId"], 88_087_411i64);
+}
+
+#[test]
+fn pit_exit_publishes_an_unclassified_car_without_dropping_identity() {
+    let event = RaceEvent::PitExit {
+        lap: 0,
+        session_time: 40.0,
+        player_car_idx: 0,
+        position: 0,
+    };
+
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001", None, None);
+    let json = normalized_event_json(&env);
+
+    assert_envelope_contract(&json, "PIT_EXIT");
+    assert_eq!(json["payload"]["position"], 0);
+    assert_eq!(json["payload"]["subjectRole"], "DRIVER");
+    assert_eq!(json["payload"]["subjectCarIdx"], 0);
+}
+
+#[test]
+fn race_checkered_is_session_scoped() {
+    let event = RaceEvent::RaceCheckered { lap: 42, session_time: 3600.0 };
+
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001", None, None);
+    let json = normalized_event_json(&env);
+
+    assert_envelope_contract(&json, "RACE_CHECKERED");
+    assert_eq!(json["scope"], "SESSION_SCOPED");
+    assert_eq!(json["payload"]["subjectRole"], "SESSION");
+}
+
