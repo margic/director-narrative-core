@@ -239,9 +239,12 @@ Example:
 
 ### `RACE_CHECKERED`
 
-Trigger:
+Trigger (whichever arrives first, once per session):
 
-- `session_state` transitions into `5` from a different previous state.
+- `session_state` transitions into `5` (Checkered) from a different previous state, or
+- `session_flags` carries the checkered bit (`0x0001`), or
+- `session_state` goes straight from `4` (Racing) to `6` (CoolDown), which is what
+  short practice/qualifying sessions do.
 
 Example:
 
@@ -444,6 +447,10 @@ Example:
 Trigger:
 
 - `on_pit_road` transitions true -> false.
+
+Pit transitions are detected before the unclassified-car guard, so a car sitting
+in its stall with `position == 0` (or on lap 0) still publishes its
+`PIT_ENTRY`/`PIT_EXIT` pair. `position` is published as reported, `0` included.
 
 Example:
 
@@ -804,6 +811,71 @@ Example:
   "event_type": "PUBLISHER_GOODBYE",
   "lap": 26,
   "session_time": 1799.8
+}
+```
+
+### `DRIVER_MATERIAL`
+
+Trigger:
+
+- Wall-clock cadence, every `publisher.driver_material_interval_ms` (default
+  25 000 ms; `0` disables, env override `PUBLISHER_DRIVER_MATERIAL_INTERVAL_MS`).
+  The timer restarts on a sub-session change, and the event is suppressed while
+  the roster has not yet resolved the rig driver's name.
+
+This is the rig's own driver/car state on a fixed cadence, so a consumer always
+has current material for its favored drivers through a quiet stint rather than
+waiting for a narrative event.
+
+Example:
+
+```json
+{
+  "event_type": "DRIVER_MATERIAL",
+  "lap": 12,
+  "session_time": 1234.5,
+  "player_car_idx": 7,
+  "position": 5,
+  "laps_completed": 11,
+  "lap_dist_pct": 0.51,
+  "last_lap_time_s": 88.2,
+  "best_lap_time_s": 87.9,
+  "gap_ahead_s": 1.4,
+  "car_ahead_idx": 3,
+  "gap_behind_s": 2.8,
+  "car_behind_idx": 9,
+  "on_pit_road": false,
+  "track_surface": 3,
+  "speed_mps": 61.5,
+  "fuel_level_l": 42.25,
+  "incident_count": 4,
+  "session_state": 4,
+  "interval_s": 25.0
+}
+```
+
+### `SESSION_RESET`
+
+Trigger:
+
+- The publisher observes a new `sub_session_id` while a previous one was active,
+  emitted against the **new** session id before any of its events.
+
+Every car index, battle, and rig-to-car binding cached for
+`previous_sub_session_id` is stale from this event onward.
+
+Example:
+
+```json
+{
+  "event_type": "SESSION_RESET",
+  "lap": 0,
+  "session_time": 12.0,
+  "previous_sub_session_id": 88087370,
+  "sub_session_id": 88087411,
+  "previous_session_num": 2,
+  "session_num": 0,
+  "reason": "sub_session_changed"
 }
 ```
 

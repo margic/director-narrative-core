@@ -233,6 +233,7 @@ pub struct SlopeInfo {
 - `PUBLISHER_HELLO` is sent when the rig starts a session.
 - `PUBLISHER_GOODBYE` is sent only on clean shutdown and is the only explicit check-in clear signal.
 - Heartbeats keep a quiet-but-connected rig distinguishable from a dead stream; liveness remains valid for up to 30 minutes since the last received message.
+- A car-scoped `DRIVER_MATERIAL` event is emitted on its own wall-clock timer (`[publisher] driver_material_interval_ms`, default 25000 ms; `0` disables) describing the publishing rig's driver. Heartbeats say the rig is alive; driver material says what its driver is doing, and is the intended source of coverage freshness for a consumer.
 
 ### 4.1 Serialised Example Payloads
 

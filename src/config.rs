@@ -49,6 +49,8 @@ pub struct PublisherSection {
     pub batch_interval_ms: u64,
     /// Interval between PUBLISHER_HEARTBEAT events, in milliseconds. `0` disables.
     pub heartbeat_interval_ms: u64,
+    /// Interval between DRIVER_MATERIAL events, in milliseconds. `0` disables.
+    pub driver_material_interval_ms: u64,
 }
 
 impl Default for PublisherSection {
@@ -57,6 +59,7 @@ impl Default for PublisherSection {
             rc_api_url:        "https://simracecenter.com".to_owned(),
             batch_interval_ms: 500,
             heartbeat_interval_ms: 15_000,
+            driver_material_interval_ms: 25_000,
         }
     }
 }
@@ -130,6 +133,7 @@ struct RawPublisher {
     rc_api_url:            Option<String>,
     batch_interval_ms:     Option<u64>,
     heartbeat_interval_ms: Option<u64>,
+    driver_material_interval_ms: Option<u64>,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -186,6 +190,12 @@ fn apply_env_overrides(raw: &mut RawConfig) {
             raw.publisher.heartbeat_interval_ms = Some(n);
         }
     }
+
+    if let Ok(v) = env::var("PUBLISHER_DRIVER_MATERIAL_INTERVAL_MS") {
+        if let Ok(n) = v.parse::<u64>() {
+            raw.publisher.driver_material_interval_ms = Some(n);
+        }
+    }
 }
 
 fn build_and_validate(raw: RawConfig) -> Result<PublisherConfig, ConfigError> {
@@ -220,6 +230,8 @@ fn build_and_validate(raw: RawConfig) -> Result<PublisherConfig, ConfigError> {
                 .unwrap_or(defaults.batch_interval_ms),
             heartbeat_interval_ms: raw.publisher.heartbeat_interval_ms
                 .unwrap_or(defaults.heartbeat_interval_ms),
+            driver_material_interval_ms: raw.publisher.driver_material_interval_ms
+                .unwrap_or(defaults.driver_material_interval_ms),
         },
     })
 }
@@ -319,6 +331,7 @@ heartbeat_interval_ms = 0
                 rc_api_url:            Some("https://original.com".to_owned()),
                 batch_interval_ms:     Some(500),
                 heartbeat_interval_ms: Some(15_000),
+                driver_material_interval_ms: Some(25_000),
             },
         };
 

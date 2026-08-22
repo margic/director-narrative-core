@@ -415,7 +415,8 @@ fn event_roles(event: &RaceEvent, frame: &TelemetryFrame) -> EventRoles {
         },
         RaceEvent::RaceGreen { .. }
         | RaceEvent::RaceCheckered { .. }
-        | RaceEvent::FlagYellowFullCourse { .. } => EventRoles::session(SubjectRole::Session),
+        | RaceEvent::FlagYellowFullCourse { .. }
+        | RaceEvent::SessionReset { .. } => EventRoles::session(SubjectRole::Session),
         // System events are about the rig, but still name its car so the
         // consumer can bind the rig to a car without a separate lookup.
         RaceEvent::PublisherHello { .. }
@@ -424,7 +425,8 @@ fn event_roles(event: &RaceEvent, frame: &TelemetryFrame) -> EventRoles {
         | RaceEvent::IracingConnected { .. }
         | RaceEvent::IracingDisconnected { .. }
         | RaceEvent::BroadcastControlRequested { .. } => EventRoles::solo(me, SubjectRole::Rig),
-        RaceEvent::FocusMeRequested { player_car_idx, .. } => {
+        RaceEvent::FocusMeRequested { player_car_idx, .. }
+        | RaceEvent::DriverMaterial { player_car_idx, .. } => {
             EventRoles::solo(*player_car_idx, SubjectRole::Driver)
         }
         // Everything else describes the rig's own driving: laps, pit, tires,
@@ -635,6 +637,30 @@ fn enrich_payload(
             obj.insert("followerRacePosition".to_owned(), option_u8_json(follower_pos));
             obj.insert("playerRacePosition".to_owned(), option_u8_json(car_race_position(frame, *player_car_idx)));
             obj.insert("opponentRacePosition".to_owned(), option_u8_json(car_race_position(frame, *opponent_car_idx)));
+        }
+        RaceEvent::DriverMaterial {
+            last_lap_time_s,
+            best_lap_time_s,
+            gap_ahead_s,
+            car_ahead_idx,
+            gap_behind_s,
+            car_behind_idx,
+            track_surface,
+            ..
+        } => {
+            obj.insert("lastLapTime".to_owned(), option_f32_json(*last_lap_time_s));
+            obj.insert("bestLapTime".to_owned(), option_f32_json(*best_lap_time_s));
+            obj.insert("gapAhead".to_owned(), option_f32_json(*gap_ahead_s));
+            obj.insert("gapBehind".to_owned(), option_f32_json(*gap_behind_s));
+            obj.insert("trackSurface".to_owned(), json!(track_surface));
+            // Name the neighbours so the consumer can build a battle without a
+            // second lookup against its own roster copy.
+            let neighbour = |idx: &Option<u8>| {
+                idx.map(|i| serde_json::to_value(resolve_car(i, roster)).unwrap_or(Value::Null))
+                    .unwrap_or(Value::Null)
+            };
+            obj.insert("carAhead".to_owned(), neighbour(car_ahead_idx));
+            obj.insert("carBehind".to_owned(), neighbour(car_behind_idx));
         }
         RaceEvent::VulnerabilityAlert { attacker_idx, defender_idx, .. } => {
             obj.insert("attackerPosition".to_owned(), option_u8_json(car_race_position(frame, *attacker_idx)));

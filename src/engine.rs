@@ -25,8 +25,13 @@ use crate::vulnerability::VulnerabilityDetector;
 use crate::anchor_sampler::AnchorSampler;
 
 const PIT_LAP_FRAME_THRESH: u32 = 20;
+const CHECKERED: u32 = 0x0001;
 const YELLOW_WAVE: u32 = 0x0100;
 const CAUTION: u32 = 0x4000;
+/// iRacing `SessionState` values used for session lifecycle transitions.
+const SESSION_STATE_RACING: i32 = 4;
+const SESSION_STATE_CHECKERED: i32 = 5;
+const SESSION_STATE_COOLDOWN: i32 = 6;
 const YELLOW_ZONES: &[(u8, f32, f32)] = &[(1, 0.625, 0.646), (2, 0.616, 0.623)];
 /// Upper bound for a credible race gap. Real battle gaps are bounded by
 /// `MAX_BATTLE_GAP_S` (~5 s); anything at or above this value is a sentinel.
@@ -63,6 +68,7 @@ pub struct NarrativeEngine {
     engagement_start_beh_t: Option<f32>,
     prev_session_state: i32,
     prev_session_flags: u32,
+    checkered_emitted: bool,
     prev_in_car: bool,
     prev_lap: Option<u8>,
     prev_on_pit: bool,
@@ -117,6 +123,7 @@ impl NarrativeEngine {
             engagement_start_beh_t: None,
             prev_session_state: 0,
             prev_session_flags: 0,
+            checkered_emitted: false,
             prev_in_car: false,
             prev_lap: None,
             prev_on_pit: false,
@@ -147,6 +154,54 @@ impl NarrativeEngine {
     pub fn set_track_length_m(&mut self, meters: f32) {
         if meters.is_finite() && meters >= 100.0 {
             self.track_length_m = meters;
+        }
+    }
+
+    /// Snapshot of the driver at the wheel of this rig, for the periodic
+    /// `DRIVER_MATERIAL` event. The publisher owns the cadence and passes the
+    /// wall-clock `interval_s` since the previous one.
+    pub fn driver_material(&self, frame: &TelemetryFrame, interval_s: f32) -> RaceEvent {
+        let lap_t = self.lap_timer.best_estimate();
+        let ahead = find_cars_ahead(frame, lap_t, 1).first().copied();
+        let behind = find_cars_behind(frame, lap_t, 1).first().copied();
+        let me_idx = frame.player_car_idx as usize;
+        let me = self.car_registry.get(frame.player_car_idx);
+
+        RaceEvent::DriverMaterial {
+            lap: frame.lap,
+            session_time: frame.session_time,
+            player_car_idx: frame.player_car_idx,
+            position: frame.player_car_position,
+            laps_completed: frame
+                .car_idx_lap_completed
+                .get(me_idx)
+                .copied()
+                .unwrap_or(-1),
+            lap_dist_pct: frame.lap_dist_pct,
+            last_lap_time_s: me.map(|c| c.last_lap_time_s).filter(|t| *t > 0.0),
+            best_lap_time_s: self
+                .best_lap_time_s
+                .or_else(|| me.map(|c| c.best_lap_time_s))
+                .filter(|t| *t > 0.0),
+            gap_ahead_s: ahead.map(|(_, gap)| gap),
+            car_ahead_idx: ahead.map(|(idx, _)| idx),
+            gap_behind_s: behind.map(|(_, gap)| gap),
+            car_behind_idx: behind.map(|(idx, _)| idx),
+            on_pit_road: frame.on_pit_road,
+            track_surface: frame
+                .car_idx_track_surface
+                .get(me_idx)
+                .copied()
+                .unwrap_or(-1),
+            speed_mps: if frame.speed > 0.0 {
+                frame.speed
+            } else {
+                me.map(|c| c.speed_ema_mps).unwrap_or(0.0)
+            },
+            fuel_level_l: frame.fuel_level,
+            incident_count: frame.player_incident_count,
+            session_state: frame.session_state,
+            interval_s,
         }
     }
 
@@ -188,10 +243,21 @@ impl NarrativeEngine {
         let session_state = frame.session_state;
         let session_flags = frame.session_flags;
 
-        if session_state == 4 && self.prev_session_state != 4 {
+        if session_state == SESSION_STATE_RACING
+            && self.prev_session_state != SESSION_STATE_RACING
+        {
             events.push(RaceEvent::RaceGreen { lap, session_time: t });
         }
-        if session_state == 5 && self.prev_session_state != 5 {
+        // The checkered flag is signalled two ways and neither is reliable on
+        // its own: `SessionState` can step straight from Racing to CoolDown
+        // between sampled frames, and the flag bit can be set while the state
+        // still reads Racing. Fire on whichever arrives first, once per session.
+        let checkered_now = session_state == SESSION_STATE_CHECKERED
+            || session_flags & CHECKERED != 0
+            || (session_state == SESSION_STATE_COOLDOWN
+                && self.prev_session_state == SESSION_STATE_RACING);
+        if checkered_now && !self.checkered_emitted {
+            self.checkered_emitted = true;
             events.push(RaceEvent::RaceCheckered { lap, session_time: t });
         }
         let in_car = session_state != 0;
@@ -258,6 +324,15 @@ impl NarrativeEngine {
             self.record_lap_car_positions(lap, frame);
         }
 
+        // Pit transitions are detected before the unclassified-car guard below:
+        // a car in its pit stall reports position 0, so gating pit edges on a
+        // classified position swallowed every stint-opening PIT_EXIT.
+        if on_pit && !self.prev_on_pit {
+            events.push(RaceEvent::PitEntry { lap, session_time: t, player_car_idx: frame.player_car_idx, position: pos });
+        } else if !on_pit && self.prev_on_pit {
+            events.push(RaceEvent::PitExit { lap, session_time: t, player_car_idx: frame.player_car_idx, position: pos });
+        }
+
         if pos == 0 || lap < 1 {
             self.prev_lap = Some(lap);
             self.prev_on_pit = on_pit;
@@ -290,12 +365,6 @@ impl NarrativeEngine {
         }
         let nearest_ahead = cars_ahead.first().copied();
         let nearest_behind = cars_behind.first().copied();
-
-        if on_pit && !self.prev_on_pit {
-            events.push(RaceEvent::PitEntry { lap, session_time: t, player_car_idx: frame.player_car_idx, position: pos });
-        } else if !on_pit && self.prev_on_pit {
-            events.push(RaceEvent::PitExit { lap, session_time: t, player_car_idx: frame.player_car_idx, position: pos });
-        }
 
         match nearest_ahead {
             Some((car_idx, gap)) if gap < CLOSE_APPROACH_THRESH_S => {
@@ -798,6 +867,108 @@ mod tests {
         assert!(evs2.iter().any(|e| matches!(e, RaceEvent::RaceGreen { .. })));
         let evs3 = engine.process_frame(&frame_with_gap(1, 2.0, 4, 0.501));
         assert!(!evs3.iter().any(|e| matches!(e, RaceEvent::RaceGreen { .. })));
+    }
+
+    #[test]
+    fn pit_exit_fires_for_a_car_that_is_still_unclassified() {
+        // Leaving the pit stall on an out-lap: iRacing reports position 0 until
+        // the car is classified, which used to swallow the whole stint's
+        // PIT_ENTRY/PIT_EXIT pair.
+        let mut engine = NarrativeEngine::new(10);
+
+        let mut in_pits = frame_no_opponent(0, 10.0);
+        in_pits.player_car_position = 0;
+        in_pits.on_pit_road = true;
+        let entry = engine.process_frame(&in_pits);
+        assert!(entry
+            .iter()
+            .any(|e| matches!(e, RaceEvent::PitEntry { position: 0, .. })));
+
+        let mut leaving = frame_no_opponent(0, 40.0);
+        leaving.player_car_position = 0;
+        leaving.on_pit_road = false;
+        let exit = engine.process_frame(&leaving);
+        assert!(exit
+            .iter()
+            .any(|e| matches!(e, RaceEvent::PitExit { position: 0, .. })));
+    }
+
+    #[test]
+    fn race_checkered_fires_on_the_flag_bit_without_a_checkered_session_state() {
+        let mut engine = NarrativeEngine::new(10);
+        let _ = engine.process_frame(&frame_with_gap(1, 0.0, 4, 0.501));
+
+        let mut flagged = frame_with_gap(2, 10.0, 4, 0.501);
+        flagged.session_flags = CHECKERED;
+        let evs = engine.process_frame(&flagged);
+        assert!(evs.iter().any(|e| matches!(e, RaceEvent::RaceCheckered { .. })));
+
+        // Once per session: the flag stays set for the rest of the cool-down.
+        let mut still_flagged = frame_with_gap(2, 11.0, 5, 0.501);
+        still_flagged.session_flags = CHECKERED;
+        let repeat = engine.process_frame(&still_flagged);
+        assert!(!repeat.iter().any(|e| matches!(e, RaceEvent::RaceCheckered { .. })));
+    }
+
+    #[test]
+    fn race_checkered_fires_when_the_state_jumps_straight_to_cooldown() {
+        let mut engine = NarrativeEngine::new(10);
+        let _ = engine.process_frame(&frame_with_gap(1, 0.0, 4, 0.501));
+        let evs = engine.process_frame(&frame_with_gap(2, 10.0, 6, 0.501));
+        assert!(evs.iter().any(|e| matches!(e, RaceEvent::RaceCheckered { .. })));
+    }
+
+    #[test]
+    fn driver_material_names_the_rigs_own_car_and_its_neighbours() {
+        let mut engine = NarrativeEngine::new(10);
+        let mut frame = frame_with_gap(3, 300.0, 4, 0.505);
+        frame.speed = 61.5;
+        frame.fuel_level = 42.25;
+        frame.player_incident_count = 4;
+        for i in 0..5u8 {
+            let mut f = frame.clone();
+            f.session_time = 300.0 + i as f32;
+            let _ = engine.process_frame(&f);
+        }
+
+        let material = engine.driver_material(&frame, 25.0);
+        let RaceEvent::DriverMaterial {
+            player_car_idx,
+            position,
+            car_ahead_idx,
+            gap_ahead_s,
+            speed_mps,
+            fuel_level_l,
+            incident_count,
+            interval_s,
+            ..
+        } = material
+        else {
+            panic!("expected DRIVER_MATERIAL");
+        };
+        assert_eq!(player_car_idx, 0);
+        assert_eq!(position, 5);
+        assert_eq!(car_ahead_idx, Some(1));
+        assert!(gap_ahead_s.is_some_and(|g| g > 0.0));
+        assert_eq!(speed_mps, 61.5);
+        assert_eq!(fuel_level_l, 42.25);
+        assert_eq!(incident_count, 4);
+        assert_eq!(interval_s, 25.0);
+    }
+
+    #[test]
+    fn driver_material_is_emitted_even_with_an_empty_field() {
+        let engine = NarrativeEngine::new(10);
+        let material = engine.driver_material(&frame_no_opponent(1, 60.0), 20.0);
+        assert!(matches!(
+            material,
+            RaceEvent::DriverMaterial {
+                car_ahead_idx: None,
+                gap_ahead_s: None,
+                car_behind_idx: None,
+                ..
+            }
+        ));
     }
 
     #[test]

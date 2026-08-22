@@ -67,16 +67,21 @@ impl LifecyclePublisher {
     }
 }
 
-/// Wall-clock scheduler for `PUBLISHER_HEARTBEAT` emission.
+/// Wall-clock scheduler for periodic emissions — `PUBLISHER_HEARTBEAT` and
+/// `DRIVER_MATERIAL`.
 ///
-/// An interval of `0` disables heartbeats entirely. The first heartbeat is
+/// An interval of `0` disables the emission entirely. The first firing is
 /// due one full interval after the first [`due`] call (HELLO covers startup).
-pub struct HeartbeatScheduler {
+pub struct IntervalScheduler {
     interval: Option<Duration>,
     last:     Option<Instant>,
 }
 
-impl HeartbeatScheduler {
+/// Historic name of [`IntervalScheduler`], kept because the publisher's
+/// heartbeat is its original caller.
+pub type HeartbeatScheduler = IntervalScheduler;
+
+impl IntervalScheduler {
     /// Create a scheduler firing every `interval_ms` milliseconds; `0` disables.
     pub fn new(interval_ms: u64) -> Self {
         Self {
@@ -85,21 +90,25 @@ impl HeartbeatScheduler {
         }
     }
 
-    /// `true` when a heartbeat is due at `now`; advances the timer when it fires.
+    /// `true` when an emission is due at `now`; advances the timer when it fires.
     pub fn due(&mut self, now: Instant) -> bool {
-        let Some(interval) = self.interval else {
-            return false;
-        };
+        self.due_elapsed(now).is_some()
+    }
+
+    /// Elapsed time since the previous firing when one is due at `now`, so the
+    /// emitted event can state its own cadence.
+    pub fn due_elapsed(&mut self, now: Instant) -> Option<Duration> {
+        let interval = self.interval?;
         match self.last {
             None => {
                 self.last = Some(now);
-                false
+                None
             }
             Some(last) if now.duration_since(last) >= interval => {
                 self.last = Some(now);
-                true
+                Some(now.duration_since(last))
             }
-            Some(_) => false,
+            Some(_) => None,
         }
     }
 }
@@ -146,6 +155,22 @@ mod tests {
         assert!(hb.due(t0 + Duration::from_millis(1000)));
         assert!(!hb.due(t0 + Duration::from_millis(1500)));
         assert!(hb.due(t0 + Duration::from_millis(2000)));
+    }
+
+    #[test]
+    fn due_elapsed_reports_the_gap_since_the_previous_firing() {
+        let mut sched = IntervalScheduler::new(20_000);
+        let t0 = Instant::now();
+        assert_eq!(sched.due_elapsed(t0), None);
+        assert_eq!(sched.due_elapsed(t0 + Duration::from_secs(10)), None);
+        assert_eq!(
+            sched.due_elapsed(t0 + Duration::from_secs(25)),
+            Some(Duration::from_secs(25))
+        );
+        assert_eq!(
+            sched.due_elapsed(t0 + Duration::from_secs(46)),
+            Some(Duration::from_secs(21))
+        );
     }
 
     #[test]

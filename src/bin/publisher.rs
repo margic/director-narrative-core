@@ -192,7 +192,7 @@ fn pipeline_main(
     use director_narrative_core::{
         controls::{now_wall_clock_ms, simulated_request, ControlRequest},
         engine::NarrativeEngine,
-        lifecycle::{HeartbeatScheduler, LifecyclePublisher},
+        lifecycle::{HeartbeatScheduler, IntervalScheduler, LifecyclePublisher},
         publisher_event::{build_event, PublisherEvent},
         race_event::{EventScope, RaceEvent},
         session_info::{is_ai_session, parse_sub_session_id, synthetic_sub_session_id, RosterCache, SessionMetadata},
@@ -249,6 +249,7 @@ fn pipeline_main(
     let mut engine      = NarrativeEngine::new(10);
     let mut lifecycle       = LifecyclePublisher::new(env!("CARGO_PKG_VERSION"));
     let mut heartbeat       = HeartbeatScheduler::new(cfg.publisher.heartbeat_interval_ms);
+    let mut driver_material = IntervalScheduler::new(cfg.publisher.driver_material_interval_ms);
     let mut roster_cache    = RosterCache::new();
     let mut race_session_id = String::from("0");
     let mut sub_session_id: i64 = 0;
@@ -417,10 +418,41 @@ fn pipeline_main(
                                     );
                                 }
                                 // Reset session-scoped state.
+                                let previous_sub_session_id = sub_session_id;
                                 engine        = NarrativeEngine::new(10);
                                 lifecycle     = LifecyclePublisher::new(env!("CARGO_PKG_VERSION"));
                                 roster_cache  = RosterCache::new();
                                 pending_events.clear();
+                                driver_material = IntervalScheduler::new(
+                                    cfg.publisher.driver_material_interval_ms,
+                                );
+
+                                // Tell the consumer explicitly that every car
+                                // index it cached belongs to the old session.
+                                // Published against the *new* session id, since
+                                // that is the state the consumer must adopt.
+                                if previous_sub_session_id > 0 {
+                                    let reset = RaceEvent::SessionReset {
+                                        lap: frame.lap,
+                                        session_time: frame.session_time,
+                                        previous_sub_session_id: Some(previous_sub_session_id),
+                                        sub_session_id: sid,
+                                        previous_session_num: last_session_num,
+                                        session_num: frame.session_num,
+                                        reason: "sub_session_changed".to_owned(),
+                                    };
+                                    let pe = build_event(
+                                        &reset,
+                                        &frame,
+                                        None,
+                                        &sid.to_string(),
+                                        &rig_id,
+                                        None,
+                                        Some(sid),
+                                    );
+                                    transport.enqueue(pe);
+                                    status.lock().unwrap().events_enqueued_total += 1;
+                                }
                             }
                             sub_session_id  = sid;
                             race_session_id = sid.to_string();
@@ -653,6 +685,32 @@ fn pipeline_main(
                     );
                     transport.enqueue(pe);
                     status.lock().unwrap().events_enqueued_total += 1;
+                }
+
+                // Periodic driver material — the rig's own driver on a
+                // wall-clock cadence, so the consumer always has something
+                // current to cover even through a quiet stint.
+                if let Some(elapsed) = driver_material.due_elapsed(std::time::Instant::now()) {
+                    let event = engine.driver_material(&frame, elapsed.as_secs_f32());
+                    let log_entry = make_log_entry(&event, &frame, roster);
+                    let pe = build_event(
+                        &event,
+                        &frame,
+                        roster,
+                        &race_session_id,
+                        &rig_id,
+                        current_session_meta.as_ref(),
+                        Some(sub_session_id),
+                    );
+                    // Nothing worth saying about a driver the roster cannot name
+                    // yet; the next cadence tick carries the same state anyway,
+                    // so this is dropped rather than buffered.
+                    if !pe.car.as_ref().is_some_and(|car| car.driver_name.is_empty()) {
+                        transport.enqueue(pe);
+                        let mut s = status.lock().unwrap();
+                        s.events_enqueued_total += 1;
+                        s.push_event_log(log_entry);
+                    }
                 }
 
                 match transport.tick_result(

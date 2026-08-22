@@ -118,3 +118,14 @@ Noise is filtered at source (`src/basic_incident.rs`): incident-point increases
 are only published when the car is in the world, not on pit road, and was moving
 (≥ 5 m/s). Surface/speed-drop alerts already required not being in a pit
 transition.
+
+## 6. Periodic material and session lifecycle
+
+Added in the same additive contract (v2); no existing field changed.
+
+| Event | Scope | Purpose |
+| --- | --- | --- |
+| `DRIVER_MATERIAL` | car | The publishing rig's own driver/car state on a wall-clock cadence (default 25 s, `publisher.driver_material_interval_ms` / `PUBLISHER_DRIVER_MATERIAL_INTERVAL_MS`, `0` disables). Position, laps completed, last/best lap, nearest car ahead/behind with gaps, pit road, surface, speed, fuel, incident count, and the actual `interval_s` since the previous one. Prefer this over inferring freshness from narrative events: a quiet stint still produces material every cadence. |
+| `SESSION_RESET` | session | The publisher saw a new sub-session. Carries `previousSubSessionId`/`previousSessionNum` and the new `subSessionId`/`sessionNum` plus a `reason`, and is published against the new session before any of its other events. Every cached car index, battle, and rig-to-car binding for the previous sub-session is stale from here. |
+| `RACE_CHECKERED` | session | Now also fires on the checkered flag bit and on a Racing -> CoolDown state jump, once per session, not only on `SessionState::Checkered`. |
+| `PIT_EXIT` | car | Now detected before the unclassified-car guard, so a stall-bound car reporting `position == 0` still emits its entry/exit pair. |
