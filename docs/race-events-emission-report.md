@@ -227,13 +227,22 @@ Trigger:
 
 - `session_state` transitions into `4` from a different previous state.
 
+The very first frame after connecting has no previous state to transition from,
+so a session already running green produces a *snapshot*, not a flag. That case
+is marked `synthetic: true` / `origin: "CONNECT_SNAPSHOT"`; a real transition is
+`synthetic: false` / `origin: "SESSION_STATE_TRANSITION"`. A consumer modelling
+session lifecycle must ignore synthetic ones (this is why a Practice session
+could show four `RACE_GREEN` events, one per rig at connect).
+
 Example:
 
 ```json
 {
   "event_type": "RACE_GREEN",
   "lap": 1,
-  "session_time": 0.0
+  "session_time": 0.0,
+  "synthetic": false,
+  "origin": "SESSION_STATE_TRANSITION"
 }
 ```
 
@@ -252,9 +261,14 @@ Example:
 {
   "event_type": "RACE_CHECKERED",
   "lap": 35,
-  "session_time": 3600.0
+  "session_time": 3600.0,
+  "synthetic": false,
+  "origin": "SESSION_STATE_TRANSITION"
 }
 ```
+
+Carries the same `synthetic`/`origin` pair as `RACE_GREEN`: connecting to a
+session that is already past the flag reports `origin: "CONNECT_SNAPSHOT"`.
 
 ### `FLAG_YELLOW_FULL_COURSE`
 
@@ -822,10 +836,23 @@ Trigger:
   25 000 ms; `0` disables, env override `PUBLISHER_DRIVER_MATERIAL_INTERVAL_MS`).
   The timer restarts on a sub-session change, and the event is suppressed while
   the roster has not yet resolved the rig driver's name.
+- Suppressed while the car is on pit road (including sitting in the box) or not
+  in the world (`CarIdxTrackSurface < 0`); the gap-trend baseline is dropped at
+  the same time so the first material after a stop reports `UNKNOWN` rather than
+  a trend spanning the stop.
 
 This is the rig's own driver/car state on a fixed cadence, so a consumer always
 has current material for its favored drivers through a quiet stint rather than
-waiting for a narrative event.
+waiting for a narrative event. It does **not** depend on any other car being
+nearby: the `gap_*` fields are simply null in clean air.
+
+`delta_to_best_s` is the last lap against the driver's own best.
+`sector_bucket`/`sector_delta_to_best_s` come from the existing
+`MicroSectorTracker` spatial anchors — the segment just completed and its time
+against the driver's best for that same segment. Gap trends are only computed
+when the neighbouring car index is unchanged since the previous material event,
+otherwise `UNKNOWN`. `effort` is `PUSHING` when the driver is within threshold
+of their own sector/lap best or closing on the car ahead, else `HOLDING`.
 
 Example:
 
@@ -844,6 +871,12 @@ Example:
   "car_ahead_idx": 3,
   "gap_behind_s": 2.8,
   "car_behind_idx": 9,
+  "delta_to_best_s": 0.3,
+  "sector_bucket": 4,
+  "sector_delta_to_best_s": -0.12,
+  "gap_ahead_trend": "CLOSING",
+  "gap_behind_trend": "OPENING",
+  "effort": "PUSHING",
   "on_pit_road": false,
   "track_surface": 3,
   "speed_mps": 61.5,
@@ -859,10 +892,14 @@ Example:
 Trigger:
 
 - The publisher observes a new `sub_session_id` while a previous one was active,
-  emitted against the **new** session id before any of its events.
+  emitted against the **new** session id before any of its events
+  (`reason: "sub_session_changed"`).
+- The session clock restarts inside one sub-session — `session_time` drops by
+  more than 5 s with the same `sub_session_id` and `session_num`
+  (`reason: "session_clock_restarted"`, carrying `previous_session_time`).
 
-Every car index, battle, and rig-to-car binding cached for
-`previous_sub_session_id` is stale from this event onward.
+For a sub-session change, every car index, battle, and rig-to-car binding cached
+for `previous_sub_session_id` is stale from this event onward.
 
 Example:
 
@@ -875,7 +912,24 @@ Example:
   "sub_session_id": 88087411,
   "previous_session_num": 2,
   "session_num": 0,
+  "previous_session_time": null,
   "reason": "sub_session_changed"
+}
+```
+
+Session clock restart inside one sub-session:
+
+```json
+{
+  "event_type": "SESSION_RESET",
+  "lap": 0,
+  "session_time": 1.05,
+  "previous_sub_session_id": 88087370,
+  "sub_session_id": 88087370,
+  "previous_session_num": 0,
+  "session_num": 0,
+  "previous_session_time": 1983.23,
+  "reason": "session_clock_restarted"
 }
 ```
 

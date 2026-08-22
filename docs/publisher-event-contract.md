@@ -126,6 +126,26 @@ Added in the same additive contract (v2); no existing field changed.
 | Event | Scope | Purpose |
 | --- | --- | --- |
 | `DRIVER_MATERIAL` | car | The publishing rig's own driver/car state on a wall-clock cadence (default 25 s, `publisher.driver_material_interval_ms` / `PUBLISHER_DRIVER_MATERIAL_INTERVAL_MS`, `0` disables). Position, laps completed, last/best lap, nearest car ahead/behind with gaps, pit road, surface, speed, fuel, incident count, and the actual `interval_s` since the previous one. Prefer this over inferring freshness from narrative events: a quiet stint still produces material every cadence. |
-| `SESSION_RESET` | session | The publisher saw a new sub-session. Carries `previousSubSessionId`/`previousSessionNum` and the new `subSessionId`/`sessionNum` plus a `reason`, and is published against the new session before any of its other events. Every cached car index, battle, and rig-to-car binding for the previous sub-session is stale from here. |
+| `SESSION_RESET` | session | The publisher saw a new sub-session **or** the session clock restarting inside one. Carries `previousSubSessionId`/`previousSessionNum`/`previousSessionTime` and the new `subSessionId`/`sessionNum` plus a machine-readable `reason` (`sub_session_changed` or `session_clock_restarted`). For a sub-session change every cached car index, battle, and rig-to-car binding for the previous sub-session is stale from here. |
 | `RACE_CHECKERED` | session | Now also fires on the checkered flag bit and on a Racing -> CoolDown state jump, once per session, not only on `SessionState::Checkered`. |
 | `PIT_EXIT` | car | Now detected before the unclassified-car guard, so a stall-bound car reporting `position == 0` still emits its entry/exit pair. |
+| `RACE_GREEN` / `RACE_CHECKERED` | session | Now carry `synthetic` (bool) and `origin` (`SESSION_STATE_TRANSITION` or `CONNECT_SNAPSHOT`). A connect-time snapshot of the current session state is `synthetic: true` and must not be read as a real flag — this is what produced four `RACE_GREEN` events in a Practice session. |
+
+### `DRIVER_MATERIAL` payload
+
+Beyond the raw car state above, each material event carries the driver's own
+reference frame so a consumer can narrate a car running alone:
+
+| Field | Meaning |
+| --- | --- |
+| `deltaToBest` | Last lap minus the driver's own best lap, seconds; null until both exist. |
+| `sectorBucket` / `sectorDeltaToBest` | The most recently completed spatial anchor segment (from the existing `MicroSectorTracker`) and its time versus the driver's best for that same segment. |
+| `gapAhead` / `carAhead`, `gapBehind` / `carBehind` | Nearest car ahead/behind (resolved car reference) and the gap in seconds; null in clean air. |
+| `gapAheadTrend` / `gapBehindTrend` | `CLOSING`, `OPENING`, `STABLE`, or `UNKNOWN`. Trend is only computed against the *same* neighbouring car index as the previous cadence tick; otherwise `UNKNOWN`. |
+| `effort` | `PUSHING` or `HOLDING`, derived from sector/lap pace against the driver's own best and from a closing gap ahead. |
+| `interval_s` | Actual wall-clock seconds since the previous material event. |
+
+Material is suppressed while the car is on pit road (including the box) or not
+in the world (`CarIdxTrackSurface < 0`), and the trend baseline is dropped at
+that point so a stop never produces a fabricated trend. It is emitted
+regardless of proximity to other cars.

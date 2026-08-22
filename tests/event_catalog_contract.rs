@@ -19,7 +19,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use director_narrative_core::race_event::{EventScope, RaceEvent, RaceEventKind};
+use director_narrative_core::race_event::{EventScope, LifecycleOrigin, RaceEvent, RaceEventKind};
 use serde_json::{json, Value};
 
 const CATALOG_PATH: &str = "contracts/publisher-event-catalog.json";
@@ -108,6 +108,8 @@ fn kind_matches_the_serialised_discriminator_tag() {
         RaceEvent::RaceGreen {
             lap: 1,
             session_time: 10.0,
+            synthetic: false,
+            origin: LifecycleOrigin::SessionStateTransition,
         },
         RaceEvent::IracingConnected {
             lap: 0,

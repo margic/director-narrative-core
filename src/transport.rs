@@ -398,7 +398,7 @@ struct CachedToken {
 mod tests {
     use super::*;
     use crate::publisher_event::build_event;
-    use crate::race_event::RaceEvent;
+    use crate::race_event::{LifecycleOrigin, RaceEvent};
     use crate::telemetry_frame::TelemetryFrame;
 
     fn minimal_frame() -> TelemetryFrame {
@@ -458,7 +458,7 @@ mod tests {
             .create();
 
         let event = build_event(
-            &RaceEvent::RaceGreen { lap: 1, session_time: 10.0 },
+            &RaceEvent::RaceGreen { lap: 1, session_time: 10.0, synthetic: false, origin: LifecycleOrigin::SessionStateTransition },
             &minimal_frame(),
             None,
             "session-xyz",
@@ -477,7 +477,7 @@ mod tests {
     #[test]
     fn ingest_request_serialises_to_expected_shape() {
         let event = build_event(
-            &RaceEvent::RaceGreen { lap: 1, session_time: 10.0 },
+            &RaceEvent::RaceGreen { lap: 1, session_time: 10.0, synthetic: false, origin: LifecycleOrigin::SessionStateTransition },
             &minimal_frame(),
             None,
             "session-xyz",
@@ -517,7 +517,7 @@ mod tests {
 
         for _ in 0..2 {
             let event = build_event(
-                &RaceEvent::RaceGreen { lap: 1, session_time: 10.0 },
+                &RaceEvent::RaceGreen { lap: 1, session_time: 10.0, synthetic: false, origin: LifecycleOrigin::SessionStateTransition },
                 &frame,
                 None,
                 "s",

@@ -189,6 +189,10 @@ fn pipeline_main(
 ) {
     use std::sync::atomic::Ordering;
 
+    /// A session clock that goes backwards by more than this inside one
+    /// sub-session is a restart, not sampling jitter.
+    const SESSION_CLOCK_ROLLBACK_S: f32 = 5.0;
+
     use director_narrative_core::{
         controls::{now_wall_clock_ms, simulated_request, ControlRequest},
         engine::NarrativeEngine,
@@ -254,6 +258,9 @@ fn pipeline_main(
     let mut race_session_id = String::from("0");
     let mut sub_session_id: i64 = 0;
     let mut last_session_num: Option<i32> = None;
+    // `(sub_session_id, session_num, session_time)` of the last frame seen, for
+    // detecting a session clock restart inside one sub-session.
+    let mut last_session_clock: Option<(i64, i32, f32)> = None;
     let mut current_session_meta: Option<SessionMetadata> = None;
     let mut last_frame: Option<TelemetryFrame> = None;
     let mut session_info_read_failures: u32 = 0;
@@ -350,6 +357,7 @@ fn pipeline_main(
             pending_events.clear();
             sub_session_id  = 0;
             last_session_num = None;
+            last_session_clock = None;
             current_session_meta = None;
             race_session_id = String::new();
             emit_iracing_connected = true;
@@ -439,6 +447,7 @@ fn pipeline_main(
                                         sub_session_id: sid,
                                         previous_session_num: last_session_num,
                                         session_num: frame.session_num,
+                                        previous_session_time: None,
                                         reason: "sub_session_changed".to_owned(),
                                     };
                                     let pe = build_event(
@@ -563,6 +572,46 @@ fn pipeline_main(
                         }
                     }
                 }
+
+                // The session clock restarting inside one sub-session is a
+                // session reset iRacing does not otherwise announce: same
+                // subSessionId, same sessionNum, clock back near zero. Say it
+                // explicitly rather than leaving the consumer to infer it from
+                // tick-versus-time.
+                if let Some((prev_sid, prev_num, prev_t)) = last_session_clock {
+                    if prev_sid == sub_session_id
+                        && prev_num == frame.session_num
+                        && frame.session_time + SESSION_CLOCK_ROLLBACK_S < prev_t
+                    {
+                        let reset = RaceEvent::SessionReset {
+                            lap: frame.lap,
+                            session_time: frame.session_time,
+                            previous_sub_session_id: Some(sub_session_id),
+                            sub_session_id,
+                            previous_session_num: Some(prev_num),
+                            session_num: frame.session_num,
+                            previous_session_time: Some(prev_t),
+                            reason: "session_clock_restarted".to_owned(),
+                        };
+                        println!(
+                            "[publisher] SESSION_RESET \u{2014} session clock restarted {prev_t:.2}s -> {:.2}s",
+                            frame.session_time,
+                        );
+                        let pe = build_event(
+                            &reset,
+                            &frame,
+                            roster_cache.roster(),
+                            &race_session_id,
+                            &rig_id,
+                            current_session_meta.as_ref(),
+                            Some(sub_session_id),
+                        );
+                        transport.enqueue(pe);
+                        status.lock().unwrap().events_enqueued_total += 1;
+                    }
+                }
+                last_session_clock = (sub_session_id > 0)
+                    .then_some((sub_session_id, frame.session_num, frame.session_time));
 
                 let roster = roster_cache.roster();
                 let events = engine.process_frame(&frame);
@@ -690,8 +739,10 @@ fn pipeline_main(
                 // Periodic driver material — the rig's own driver on a
                 // wall-clock cadence, so the consumer always has something
                 // current to cover even through a quiet stint.
-                if let Some(elapsed) = driver_material.due_elapsed(std::time::Instant::now()) {
-                    let event = engine.driver_material(&frame, elapsed.as_secs_f32());
+                if let Some(event) = driver_material
+                    .due_elapsed(std::time::Instant::now())
+                    .and_then(|elapsed| engine.driver_material(&frame, elapsed.as_secs_f32()))
+                {
                     let log_entry = make_log_entry(&event, &frame, roster);
                     let pe = build_event(
                         &event,

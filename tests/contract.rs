@@ -1,6 +1,6 @@
 use director_narrative_core::battle_state::SlopeInfo;
 use director_narrative_core::publisher_event::{build_event, PublisherEvent};
-use director_narrative_core::race_event::{FlagScope, RaceEvent};
+use director_narrative_core::race_event::{DriverEffort, FlagScope, GapTrend, LifecycleOrigin, RaceEvent};
 use director_narrative_core::telemetry_frame::TelemetryFrame;
 use serde_json::Value;
 
@@ -789,6 +789,8 @@ fn session_wide_events_not_car_scoped() {
     let event = RaceEvent::RaceGreen {
         lap: 1,
         session_time: 10.0,
+        synthetic: false,
+        origin: LifecycleOrigin::SessionStateTransition,
     };
 
     let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001", None, None);
@@ -797,6 +799,8 @@ fn session_wide_events_not_car_scoped() {
     assert_envelope_contract(&json, "RACE_GREEN");
     assert_eq!(json["scope"], "SESSION_SCOPED");
     assert_eq!(json["payload"]["eventScope"], "SESSION_SCOPED");
+    assert_eq!(json["payload"]["synthetic"], false);
+    assert_eq!(json["payload"]["origin"], "SESSION_STATE_TRANSITION");
     assert!(json.get("car").is_none());
 }
 
@@ -946,6 +950,12 @@ fn driver_material_publishes_the_full_state_of_the_rigs_own_driver() {
         car_ahead_idx: Some(1),
         gap_behind_s: None,
         car_behind_idx: None,
+        delta_to_best_s: Some(0.3),
+        sector_bucket: Some(4),
+        sector_delta_to_best_s: Some(-0.12),
+        gap_ahead_trend: GapTrend::Closing,
+        gap_behind_trend: GapTrend::Unknown,
+        effort: DriverEffort::Pushing,
         on_pit_road: false,
         track_surface: 3,
         speed_mps: 61.5,
@@ -976,9 +986,60 @@ fn driver_material_publishes_the_full_state_of_the_rigs_own_driver() {
     assert_eq!(payload["carAheadIdx"], 1);
     assert!(payload["carAhead"].is_object());
     assert!(payload["carBehind"].is_null());
+    // Pace and effort material (item 1): the consumer can rank a quiet stint
+    // without waiting for a relational event.
+    assert!((payload["deltaToBest"].as_f64().unwrap() - 0.3).abs() < 1e-4);
+    assert!((payload["sectorDeltaToBest"].as_f64().unwrap() + 0.12).abs() < 1e-4);
+    assert_eq!(payload["sectorBucket"], 4);
+    assert_eq!(payload["gapAheadTrend"], "CLOSING");
+    assert_eq!(payload["gapBehindTrend"], "UNKNOWN");
+    assert_eq!(payload["effort"], "PUSHING");
     // Snake-case originals stay for the transition window.
     assert_eq!(payload["laps_completed"], 3);
     assert_eq!(payload["track_surface"], 3);
+}
+
+#[test]
+fn session_reset_reports_a_session_clock_restart_inside_one_sub_session() {
+    let event = RaceEvent::SessionReset {
+        lap: 0,
+        session_time: 1.05,
+        previous_sub_session_id: Some(88_087_370),
+        sub_session_id: 88_087_370,
+        previous_session_num: Some(0),
+        session_num: 0,
+        previous_session_time: Some(1983.23),
+        reason: "session_clock_restarted".to_owned(),
+    };
+
+    let env = build_event(&event, &minimal_frame(), None, "88087370", "rig-001", None, Some(88_087_370));
+    let json = normalized_event_json(&env);
+
+    assert_envelope_contract(&json, "SESSION_RESET");
+    let payload = &json["payload"];
+    assert_eq!(json["scope"], "SESSION_SCOPED");
+    assert_eq!(payload["reason"], "session_clock_restarted");
+    assert_eq!(payload["subSessionId"], 88_087_370i64);
+    assert_eq!(payload["previousSubSessionId"], 88_087_370i64);
+    assert_eq!(payload["sessionNum"], 0);
+    assert!((payload["previousSessionTime"].as_f64().unwrap() - 1983.23).abs() < 1e-2);
+}
+
+#[test]
+fn a_synthetic_green_is_marked_as_a_connect_snapshot() {
+    let event = RaceEvent::RaceGreen {
+        lap: 0,
+        session_time: 5.0,
+        synthetic: true,
+        origin: LifecycleOrigin::ConnectSnapshot,
+    };
+
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001", None, None);
+    let json = normalized_event_json(&env);
+
+    assert_envelope_contract(&json, "RACE_GREEN");
+    assert_eq!(json["payload"]["synthetic"], true);
+    assert_eq!(json["payload"]["origin"], "CONNECT_SNAPSHOT");
 }
 
 #[test]
@@ -990,6 +1051,7 @@ fn session_reset_names_the_old_and_new_sessions() {
         sub_session_id: 88_087_411,
         previous_session_num: Some(2),
         session_num: 0,
+        previous_session_time: None,
         reason: "sub_session_changed".to_owned(),
     };
 
@@ -1029,13 +1091,20 @@ fn pit_exit_publishes_an_unclassified_car_without_dropping_identity() {
 
 #[test]
 fn race_checkered_is_session_scoped() {
-    let event = RaceEvent::RaceCheckered { lap: 42, session_time: 3600.0 };
+    let event = RaceEvent::RaceCheckered {
+        lap: 42,
+        session_time: 3600.0,
+        synthetic: false,
+        origin: LifecycleOrigin::SessionStateTransition,
+    };
 
     let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001", None, None);
     let json = normalized_event_json(&env);
 
     assert_envelope_contract(&json, "RACE_CHECKERED");
     assert_eq!(json["scope"], "SESSION_SCOPED");
+    assert_eq!(json["payload"]["synthetic"], false);
+    assert_eq!(json["payload"]["origin"], "SESSION_STATE_TRANSITION");
     assert_eq!(json["payload"]["subjectRole"], "SESSION");
 }
 
