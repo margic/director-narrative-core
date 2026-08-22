@@ -57,6 +57,46 @@ fn assert_envelope_contract(json: &Value, expected_type: &str) {
     assert!(json["payload"].is_object());
     assert!(json["payload"].get("event_type").is_none());
     assert!(json["context"].is_object());
+    assert_identity_contract(json);
+}
+
+/// Publisher and subject identity are on *every* event, race and system alike.
+fn assert_identity_contract(json: &Value) {
+    assert_eq!(json["contractVersion"], 2);
+    assert!(json["sequence"].is_u64());
+    assert!(json["eventKey"].as_str().is_some_and(|k| k.starts_with("v2-")));
+
+    let rig_id = json["rigId"].as_str().expect("rigId");
+    let publisher = &json["publisher"];
+    assert_eq!(publisher["rigId"], rig_id);
+    assert_eq!(publisher["rigLabel"], rig_id);
+    assert!(publisher["carIdx"].is_u64());
+    assert!(publisher["carNumber"].is_string());
+    assert!(publisher["driverId"].as_str().is_some_and(|d| !d.is_empty()));
+
+    let payload = &json["payload"];
+    assert_eq!(payload["rigId"], rig_id);
+    assert_eq!(payload["rigLabel"], rig_id);
+    assert_eq!(payload["publisherCarIdx"], publisher["carIdx"]);
+    assert_eq!(payload["publisherCarNumber"], publisher["carNumber"]);
+    assert_eq!(payload["publisherDriverId"], publisher["driverId"]);
+    assert_eq!(payload["publisher"], *publisher);
+
+    assert!(payload["subjectRole"].is_string());
+    match json.get("subject") {
+        Some(subject) => {
+            assert_eq!(payload["subjectCarIdx"], subject["carIdx"]);
+            assert_eq!(payload["subjectCarNumber"], subject["carNumber"]);
+            assert_eq!(payload["subjectDriverId"], subject["driverId"]);
+            assert_eq!(subject["role"], payload["subjectRole"]);
+            assert!(subject["car"].is_object());
+        }
+        // Session-wide events have no subject car; the role still says so.
+        None => {
+            assert!(payload["subjectCarIdx"].is_null());
+            assert!(payload["subject"].is_null());
+        }
+    }
 }
 
 #[test]
@@ -377,6 +417,116 @@ fn traffic_intercept_includes_structured_car_ref() {
     assert!(json["payload"]["trafficCar"].is_object(), "trafficCar should be a structured object");
     assert_eq!(json["payload"]["trafficCar"]["carIdx"], 5);
     assert!(json["payload"]["trafficCar"]["carNumber"].is_string());
+
+    // Canonical role vocabulary: the catching car is the subject/attacker and
+    // the car being caught is the defender, whatever the family calls them.
+    assert_eq!(json["subject"]["role"], "ATTACKER");
+    assert_eq!(json["subject"]["carIdx"], 0);
+    assert_eq!(json["payload"]["attackerCarIdx"], 0);
+    assert_eq!(json["payload"]["defenderCarIdx"], 5);
+    assert_eq!(json["payload"]["defenderCar"]["carIdx"], 5);
+    assert_eq!(json["payload"]["leaderCarIdx"], 0, "camelCase twin of leader_car_idx");
+    assert_eq!(json["payload"]["trafficCarIdx"], 5, "camelCase twin of traffic_car_idx");
+}
+
+#[test]
+fn micro_sector_gain_names_the_publishing_driver_as_subject() {
+    let event = RaceEvent::MicroSectorGain {
+        lap: 5,
+        session_time: 300.0,
+        bucket_from: 3,
+        bucket_to: 4,
+        lap_dist_pct_from: 0.3,
+        lap_dist_pct_to: 0.4,
+        cumulative_delta_s: -0.21,
+        technique_hint: "earlier throttle".to_owned(),
+    };
+
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-rig1", None, None);
+    let json = normalized_event_json(&env);
+
+    assert_envelope_contract(&json, "MICRO_SECTOR_GAIN");
+    assert_eq!(json["subject"]["role"], "DRIVER");
+    assert_eq!(json["subject"]["carIdx"], 0);
+    assert_eq!(json["payload"]["subjectCarIdx"], 0);
+    let camel = json["payload"]["cumulativeDeltaS"].as_f64().expect("camelCase twin");
+    let snake = json["payload"]["cumulative_delta_s"].as_f64().expect("snake_case original kept");
+    assert!((camel - -0.21).abs() < 1e-4);
+    assert_eq!(camel, snake);
+}
+
+#[test]
+fn publisher_identity_is_distinct_from_the_subject_car() {
+    // The rig is car 0; the event is about car 5's incident.
+    let event = RaceEvent::IncidentAlert {
+        lap: 6,
+        session_time: 370.0,
+        car_idx: 5,
+        driver_incident_count: Some(4),
+        previous_track_surface: 3,
+        current_track_surface: 1,
+        previous_speed_mps: 68.0,
+        current_speed_mps: 48.0,
+        speed_drop_mps: 20.0,
+        severity: 0.29411766,
+        severity_normalized: 0.29411766,
+        incident_count_delta: None,
+        reason: "surface_change".to_owned(),
+    };
+
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-rig1", None, None);
+    let json = normalized_event_json(&env);
+
+    assert_envelope_contract(&json, "INCIDENT_ALERT");
+    assert_eq!(json["publisher"]["carIdx"], 0);
+    assert_eq!(json["subject"]["carIdx"], 5);
+    assert_eq!(json["subject"]["role"], "INCIDENT");
+    assert_ne!(json["payload"]["publisherCarIdx"], json["payload"]["subjectCarIdx"]);
+}
+
+#[test]
+fn system_events_carry_the_publishing_rig_identity() {
+    let event = RaceEvent::PublisherHeartbeat {
+        lap: 4,
+        session_time: 1234.5,
+        version: "0.1.5".to_owned(),
+        events_enqueued_total: 17,
+    };
+
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-rig1", None, None);
+    let json = normalized_event_json(&env);
+
+    assert_envelope_contract(&json, "PUBLISHER_HEARTBEAT");
+    assert_eq!(json["scope"], "RIG_SCOPED");
+    assert_eq!(json["payload"]["rigLabel"], "rig-rig1");
+    assert_eq!(json["subject"]["role"], "RIG");
+    assert_eq!(json["subject"]["carIdx"], 0);
+}
+
+#[test]
+fn events_published_on_one_tick_have_distinct_event_keys() {
+    let event = RaceEvent::TrafficIntercept {
+        lap: 3,
+        session_time: 180.0,
+        leader_car_idx: 0,
+        traffic_car_idx: 5,
+        cross_class: false,
+        distance_m: 200.0,
+        relative_speed_mps: 10.0,
+        time_to_intercept_s: 20.0,
+        intercept_bucket: 12,
+        intercept_lap_dist_pct: 0.6,
+        predicted_intercept_session_time: 200.0,
+    };
+    let frame = minimal_frame();
+
+    let first = build_event(&event, &frame, None, "s", "rig-rig1", None, Some(88087370));
+    let second = build_event(&event, &frame, None, "s", "rig-rig1", None, Some(88087370));
+
+    assert_eq!(first.session_tick, second.session_tick);
+    assert_ne!(first.event_key, second.event_key);
+    assert_ne!(first.id, second.id);
+    assert!(first.event_key.starts_with("v2-88087370-9876-TRAFFIC_INTERCEPT-"));
 }
 
 #[test]
@@ -466,6 +616,8 @@ fn incident_alert_includes_surface_and_speed_fields() {
         current_speed_mps: 48.0,
         speed_drop_mps: 20.0,
         severity: 0.29411766,
+        severity_normalized: 0.29411766,
+        incident_count_delta: None,
         reason: "surface_change".to_owned(),
     };
 
@@ -483,6 +635,46 @@ fn incident_alert_includes_surface_and_speed_fields() {
     assert_eq!(json["payload"]["currentSpeedMps"], 48.0);
     assert_eq!(json["payload"]["speedDropMps"], 20.0);
     assert_eq!(json["payload"]["reason"], "surface_change");
+    // Documented surface key, alongside the current-prefixed one.
+    assert_eq!(json["payload"]["trackSurface"], 1);
+    // Raw magnitude and the 0–1 score a quality floor can use.
+    let score = json["payload"]["severityScore"].as_f64().unwrap();
+    let normalized = json["payload"]["severityNormalized"].as_f64().unwrap();
+    assert!((score - 0.294).abs() < 1e-3, "expected ~0.294, got {score}");
+    assert!((normalized - 0.294).abs() < 1e-3, "expected ~0.294, got {normalized}");
+    assert!(json["payload"]["incidentCountDelta"].is_null());
+}
+
+#[test]
+fn incident_count_alert_normalizes_raw_iracing_points() {
+    let event = RaceEvent::IncidentAlert {
+        lap: 6,
+        session_time: 370.0,
+        car_idx: 0,
+        driver_incident_count: Some(6),
+        previous_track_surface: 3,
+        current_track_surface: 3,
+        previous_speed_mps: 40.0,
+        current_speed_mps: 39.6,
+        speed_drop_mps: 0.4,
+        severity: 2.0,
+        severity_normalized: 0.5,
+        incident_count_delta: Some(2),
+        reason: "incident_count_increase".to_owned(),
+    };
+
+    let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001", None, None);
+    let json = normalized_event_json(&env);
+
+    assert_envelope_contract(&json, "INCIDENT_ALERT");
+    // `severity` stays the raw iRacing point delta for existing consumers.
+    assert_eq!(json["payload"]["severity"], 2.0);
+    assert_eq!(json["payload"]["severityScore"], 2.0);
+    assert_eq!(json["payload"]["incidentCountDelta"], 2);
+    // …and the normalized score is inside the documented 0–1 range.
+    let normalized = json["payload"]["severityNormalized"].as_f64().unwrap();
+    assert!((0.0..=1.0).contains(&normalized), "expected 0-1, got {normalized}");
+    assert_eq!(normalized, 0.5);
 }
 
 #[test]

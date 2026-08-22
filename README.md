@@ -114,6 +114,7 @@ python3 scripts/prototype_narrative.py
 | [docs/data-models.md](docs/data-models.md) | Complete Rust struct definitions with field-level documentation |
 | [docs/test-harness.md](docs/test-harness.md) | JSONL fixtures, Rust unit and scenario tests, CI integration |
 | [docs/iracing-mmap-reference.md](docs/iracing-mmap-reference.md) | Shared-memory layout, mock mmap workflow, snapshot export, and detector validation checklist |
+| [docs/publisher-event-contract.md](docs/publisher-event-contract.md) | Published wire contract: envelope, publisher/subject identity, role vocabulary, payload naming, incident severity |
 
 ## Event Catalog Contract
 

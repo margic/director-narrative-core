@@ -77,7 +77,9 @@ pub struct TelemetryFrame {
     pub session_info_update: u32,
 
     /// SessionTick — sim step counter (~16 ms resolution).
-    /// Used as the deduplication key on Race Control per (raceSessionId, session_tick, event_type).
+    /// Part of the envelope's `eventKey`, which is the deduplication key on
+    /// Race Control. The (raceSessionId, session_tick, event_type) triple alone
+    /// is not unique — several events of one family can share a tick.
     #[serde(default)]
     pub session_tick: i64,
 

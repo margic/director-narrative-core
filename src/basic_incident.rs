@@ -17,6 +17,12 @@ const MIN_PREV_SPEED_MPS: f32 = 5.0;
 const TRACK_SURFACE_NOT_IN_WORLD: i32 = -1;
 /// iRacing `irsdk_TrkLoc`: 0 means off track.
 const TRACK_SURFACE_OFF_TRACK: i32 = 0;
+/// A car slower than this counts as stationary: incident points gained while
+/// crawling (pit stall, grid, tow) describe no on-track moment.
+const STATIONARY_SPEED_MPS: f32 = 5.0;
+/// Incident points at which an `incident_count_increase` alert is treated as
+/// maximally severe. iRacing awards 0x/1x/2x/4x per infraction.
+const MAX_INCIDENT_POINTS: f32 = 4.0;
 
 #[derive(Clone, Copy)]
 struct CarSnapshot {
@@ -119,6 +125,8 @@ impl BasicIncidentDetector {
                         current_speed_mps: snapshot.speed_ema_mps,
                         speed_drop_mps,
                         severity,
+                        severity_normalized: severity.clamp(0.0, 1.0),
+                        incident_count_delta: None,
                         reason,
                     });
                     if car.car_idx == player_car_idx {
@@ -142,21 +150,33 @@ impl BasicIncidentDetector {
                     speed_ema_mps: car.speed_ema_mps,
                 });
                 let speed_drop_mps = (prev.speed_ema_mps - car.speed_ema_mps).max(0.0);
-                let severity = (player_incident_count - previous_count) as f32;
+                let points = (player_incident_count - previous_count) as f32;
 
-                events.push(RaceEvent::IncidentAlert {
-                    lap,
-                    session_time,
-                    car_idx: player_car_idx,
-                    driver_incident_count: Some(player_incident_count),
-                    previous_track_surface: prev.track_surface,
-                    current_track_surface: car.track_surface,
-                    previous_speed_mps: prev.speed_ema_mps,
-                    current_speed_mps: car.speed_ema_mps,
-                    speed_drop_mps,
-                    severity,
-                    reason: "incident_count_increase".to_owned(),
-                });
+                // Points accrued in the pit lane, out of the world, or while
+                // crawling are bookkeeping, not a broadcastable moment.
+                let in_world = car.track_surface > TRACK_SURFACE_NOT_IN_WORLD
+                    && prev.track_surface > TRACK_SURFACE_NOT_IN_WORLD;
+                let in_pits = car.on_pit_road || prev.on_pit_road;
+                let was_moving = prev.speed_ema_mps >= STATIONARY_SPEED_MPS
+                    || car.speed_ema_mps >= STATIONARY_SPEED_MPS;
+
+                if in_world && !in_pits && was_moving {
+                    events.push(RaceEvent::IncidentAlert {
+                        lap,
+                        session_time,
+                        car_idx: player_car_idx,
+                        driver_incident_count: Some(player_incident_count),
+                        previous_track_surface: prev.track_surface,
+                        current_track_surface: car.track_surface,
+                        previous_speed_mps: prev.speed_ema_mps,
+                        current_speed_mps: car.speed_ema_mps,
+                        speed_drop_mps,
+                        severity: points,
+                        severity_normalized: (points / MAX_INCIDENT_POINTS).clamp(0.0, 1.0),
+                        incident_count_delta: Some(player_incident_count - previous_count),
+                        reason: "incident_count_increase".to_owned(),
+                    });
+                }
             }
         }
         self.last_player_incident_count = Some(player_incident_count);
@@ -299,5 +319,96 @@ mod tests {
             event,
             RaceEvent::IncidentAlert { car_idx: 9, .. }
         )));
+    }
+
+    #[test]
+    fn ignores_incident_points_gained_in_the_pit_stall() {
+        let mut registry = CarRegistry::new();
+        // Crawling in the pit stall, as in the pit-lane noise from the capture.
+        registry.insert(car(7, 2, true, 0.9), 0);
+
+        let mut detector = BasicIncidentDetector::new();
+        let _ = detector.update(&registry, 4, 120.0, 60, 7, 0);
+
+        registry.get_mut(7).unwrap().speed_ema_mps = 0.5;
+        let events = detector.update(&registry, 4, 121.0, 120, 7, 2);
+
+        assert!(events.is_empty(), "pit-stall incident points must not alert");
+    }
+
+    #[test]
+    fn ignores_incident_points_gained_while_stationary_on_track() {
+        let mut registry = CarRegistry::new();
+        registry.insert(car(7, 3, false, 0.4), 0);
+
+        let mut detector = BasicIncidentDetector::new();
+        let _ = detector.update(&registry, 4, 120.0, 60, 7, 0);
+
+        registry.get_mut(7).unwrap().speed_ema_mps = 0.2;
+        let events = detector.update(&registry, 4, 121.0, 120, 7, 1);
+
+        assert!(events.is_empty(), "stationary incident points must not alert");
+    }
+
+    #[test]
+    fn incident_points_on_track_normalize_severity() {
+        let mut registry = CarRegistry::new();
+        registry.insert(car(7, 3, false, 60.0), 0);
+
+        let mut detector = BasicIncidentDetector::new();
+        let _ = detector.update(&registry, 4, 120.0, 60, 7, 0);
+
+        // Two points gained while racing, without a surface or speed signature.
+        let events = detector.update(&registry, 4, 121.0, 120, 7, 2);
+
+        let alert = events
+            .iter()
+            .find(|event| matches!(event, RaceEvent::IncidentAlert { .. }))
+            .expect("on-track incident points should alert");
+        let RaceEvent::IncidentAlert {
+            severity,
+            severity_normalized,
+            incident_count_delta,
+            reason,
+            ..
+        } = alert
+        else {
+            unreachable!("filtered to IncidentAlert above");
+        };
+
+        assert_eq!(reason, "incident_count_increase");
+        // Raw severity keeps the iRacing point delta; the normalized score is
+        // always inside 0.0–1.0.
+        assert_eq!(*severity, 2.0);
+        assert_eq!(*incident_count_delta, Some(2));
+        assert_eq!(*severity_normalized, 0.5);
+    }
+
+    #[test]
+    fn surface_alerts_normalize_severity_into_zero_to_one() {
+        let mut registry = CarRegistry::new();
+        registry.insert(car(9, 3, false, 60.0), 0);
+
+        let mut detector = BasicIncidentDetector::new();
+        let _ = detector.update(&registry, 4, 120.0, 60, 0, 0);
+
+        registry.get_mut(9).unwrap().track_surface = 0;
+        registry.get_mut(9).unwrap().speed_ema_mps = 20.0;
+        let events = detector.update(&registry, 4, 121.0, 120, 0, 0);
+
+        let alert = events
+            .iter()
+            .find(|event| matches!(event, RaceEvent::IncidentAlert { .. }))
+            .expect("off-track with speed loss should alert");
+        let RaceEvent::IncidentAlert { severity_normalized, incident_count_delta, .. } = alert
+        else {
+            unreachable!("filtered to IncidentAlert above");
+        };
+
+        assert!(
+            (0.0..=1.0).contains(severity_normalized),
+            "expected 0-1, got {severity_normalized}"
+        );
+        assert!(incident_count_delta.is_none());
     }
 }
