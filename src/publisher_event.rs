@@ -5,6 +5,7 @@
 //! identity, timing, and session-context metadata that the engine itself does
 //! not need.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -14,6 +15,21 @@ use uuid::Uuid;
 use crate::race_event::{EventScope, FlagScope, RaceEvent};
 use crate::session_info::{CarRef, SessionMetadata, SessionRoster};
 use crate::telemetry_frame::TelemetryFrame;
+
+/// Revision of the payload contract this publisher writes. Emitted on every
+/// envelope as `contractVersion` so a consumer can gate on the identity,
+/// subject, and severity fields introduced by a revision instead of sniffing
+/// for individual keys.
+///
+/// * `1` — implicit; envelope identity only (`rigId`, `car`).
+/// * `2` — publisher and subject identity on every event, canonical camelCase
+///   payload keys, unique `eventKey`/`sequence`, normalised incident severity.
+pub const PAYLOAD_CONTRACT_VERSION: u32 = 2;
+
+/// Monotonic counter over every event this process builds. Ticks repeat and
+/// several events can share one, so the counter — not the tick — is what makes
+/// [`PublisherEvent::event_key`] unique.
+static EVENT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 // ── Envelope types ────────────────────────────────────────────────────────────
 
@@ -34,8 +50,25 @@ pub struct PublisherEvent {
     pub session_time: f64,
     /// iRacing `SessionTick` counter.
     pub session_tick: i64,
+    /// Revision of the payload contract — see [`PAYLOAD_CONTRACT_VERSION`].
+    pub contract_version: u32,
+    /// Monotonic per-process counter, ordering events published on one tick.
+    pub sequence: u64,
+    /// Unique idempotency key, stable across transport retries of the same
+    /// event: `v2-<subSessionId>-<sessionTick>-<TYPE>-<sequence>`. Unlike a
+    /// key derived from the tick alone, a burst published on one tick does
+    /// not collide.
+    pub event_key: String,
     /// High-level ownership of the event.
     pub scope: EventScope,
+    /// Identity of the *publishing rig* — who is sending this event, never
+    /// who the event is about. Re-resolved per event so a mid-session car
+    /// index reassignment cannot leave a stale identity on the wire.
+    pub publisher: PublisherIdentity,
+    /// Identity of the car the event is *about*, with its canonical role.
+    /// `None` only for session-wide events, which have no subject car.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<SubjectRef>,
     /// Car identity resolved from the session roster for car-scoped events.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub car: Option<CarRef>,
@@ -44,6 +77,62 @@ pub struct PublisherEvent {
     pub payload: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<PublisherEventContext>,
+}
+
+/// Identity of the rig that published an event.
+///
+/// Deliberately separate from [`SubjectRef`]: the publishing rig and the car
+/// an event is about are frequently different cars, and conflating them
+/// credits one driver's coverage to another.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublisherIdentity {
+    /// Same value as the envelope's `rigId` — the friendly rig label.
+    pub rig_id: String,
+    /// Alias of `rig_id`, named for how the label reads in a UI.
+    pub rig_label: String,
+    /// Car index the rig occupies *now*, not when the session started.
+    pub car_idx: u8,
+    pub car_number: String,
+    /// Durable driver identity — see [`CarRef::driver_id`].
+    pub driver_id: String,
+    pub driver_name: String,
+}
+
+/// Canonical role vocabulary for the car an event is about.
+///
+/// One vocabulary across every family, so a consumer never has to know that
+/// one family says `leader_car_idx` and another `battle_attacker_idx`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SubjectRole {
+    /// The car closing, catching, or passing.
+    Attacker,
+    /// The car being caught, held up, or passed.
+    Defender,
+    /// The publishing rig's own car; the event describes its driving.
+    Driver,
+    /// A car involved in an incident.
+    Incident,
+    /// The car that triggered a flag condition.
+    Trigger,
+    /// The publishing rig itself — publisher lifecycle and control events.
+    Rig,
+    /// The session as a whole; there is no subject car.
+    Session,
+}
+
+/// Identity of the car an event is about.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubjectRef {
+    pub role: SubjectRole,
+    pub car_idx: u8,
+    pub car_number: String,
+    pub driver_id: String,
+    pub driver_name: String,
+    /// Full roster entry for the subject car.
+    pub car: CarRef,
 }
 
 /// Supplementary session context attached to every envelope.
@@ -78,6 +167,7 @@ pub fn build_event(
     sub_session_id: Option<i64>,
 ) -> PublisherEvent {
     let id = Uuid::new_v4().to_string();
+    let sequence = EVENT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -93,8 +183,24 @@ pub fn build_event(
     // `type` and `contracts/publisher-event-catalog.json` cannot drift apart.
     let event_type = race_event.kind().event_type();
     let scope = race_event.event_scope();
+    let event_key = format!(
+        "v2-{}-{}-{}-{}",
+        sub_session_id.unwrap_or(0),
+        frame.session_tick,
+        event_type,
+        sequence,
+    );
+
+    let publisher = publisher_identity(rig_id, frame.player_car_idx, roster);
+    let roles = event_roles(race_event, frame);
+    let subject = roles.subject.map(|idx| subject_ref(roles.role, idx, roster));
+
     let mut payload = event_value;
     enrich_payload(&mut payload, race_event, frame, roster);
+    // camelCase is canonical, so every snake_case key from `RaceEvent` gains a
+    // camelCase twin before identity is written in camelCase only.
+    add_camel_case_twins(&mut payload);
+    insert_identity(&mut payload, &publisher, &roles, subject.as_ref(), roster);
 
     let car = event_car(race_event, frame.player_car_idx, roster);
 
@@ -117,7 +223,12 @@ pub fn build_event(
         timestamp,
         session_time: frame.session_time as f64,
         session_tick: frame.session_tick,
+        contract_version: PAYLOAD_CONTRACT_VERSION,
+        sequence,
+        event_key,
         scope,
+        publisher,
+        subject,
         car,
         payload,
         context,
@@ -180,6 +291,254 @@ fn resolve_car(car_idx: u8, roster: Option<&SessionRoster>) -> CarRef {
             lic_string: None,
             flair_name: None,
         })
+}
+
+/// Resolve the publishing rig's identity for the car it currently occupies.
+fn publisher_identity(
+    rig_id: &str,
+    player_car_idx: u8,
+    roster: Option<&SessionRoster>,
+) -> PublisherIdentity {
+    let car = resolve_car(player_car_idx, roster);
+    PublisherIdentity {
+        rig_id: rig_id.to_owned(),
+        rig_label: rig_id.to_owned(),
+        car_idx: player_car_idx,
+        car_number: car.car_number.clone(),
+        driver_id: car.driver_id(),
+        driver_name: car.driver_name.clone(),
+    }
+}
+
+fn subject_ref(role: SubjectRole, car_idx: u8, roster: Option<&SessionRoster>) -> SubjectRef {
+    let car = resolve_car(car_idx, roster);
+    SubjectRef {
+        role,
+        car_idx,
+        car_number: car.car_number.clone(),
+        driver_id: car.driver_id(),
+        driver_name: car.driver_name.clone(),
+        car,
+    }
+}
+
+/// Canonical roles for one event: the car it is about, plus the two sides of a
+/// duel where the family has them.
+struct EventRoles {
+    subject: Option<u8>,
+    role: SubjectRole,
+    attacker: Option<u8>,
+    defender: Option<u8>,
+}
+
+impl EventRoles {
+    /// A duel: the attacker is the subject, since it is the car creating the
+    /// moment.
+    fn duel(attacker: u8, defender: Option<u8>) -> Self {
+        Self {
+            subject: Some(attacker),
+            role: SubjectRole::Attacker,
+            attacker: Some(attacker),
+            defender,
+        }
+    }
+
+    /// A duel told from the defender's side (vulnerability).
+    fn defence(defender: u8, attacker: u8) -> Self {
+        Self {
+            subject: Some(defender),
+            role: SubjectRole::Defender,
+            attacker: Some(attacker),
+            defender: Some(defender),
+        }
+    }
+
+    fn solo(car_idx: u8, role: SubjectRole) -> Self {
+        Self { subject: Some(car_idx), role, attacker: None, defender: None }
+    }
+
+    fn session(role: SubjectRole) -> Self {
+        Self { subject: None, role, attacker: None, defender: None }
+    }
+}
+
+/// Map an event onto the canonical role vocabulary.
+///
+/// This is the single place that knows a family's own field names
+/// (`leader_car_idx`, `battle_attacker_idx`, `attacker_idx`, …); everything
+/// downstream reads `subject`/`attacker`/`defender`.
+fn event_roles(event: &RaceEvent, frame: &TelemetryFrame) -> EventRoles {
+    let me = frame.player_car_idx;
+    match event {
+        // The car behind is attacking, whichever side the rig is on.
+        RaceEvent::BattleEngaged { player_car_idx, opponent_car_idx, .. }
+        | RaceEvent::BattleBroken { player_car_idx, opponent_car_idx, .. }
+        | RaceEvent::BattleClosing { player_car_idx, opponent_car_idx, .. } => {
+            let (leader_idx, follower_idx) =
+                leader_follower_indices(frame, *player_car_idx, *opponent_car_idx);
+            EventRoles::duel(follower_idx, Some(leader_idx))
+        }
+        RaceEvent::HorizonClosing { attacker_car_idx, defender_car_idx, .. }
+        | RaceEvent::HorizonClosingResolved { attacker_car_idx, defender_car_idx, .. } => {
+            EventRoles::duel(*attacker_car_idx, Some(*defender_car_idx))
+        }
+        RaceEvent::VulnerabilityAlert { attacker_idx, defender_idx, .. }
+        | RaceEvent::VulnerabilityResolved { attacker_idx, defender_idx, .. } => {
+            EventRoles::defence(*defender_idx, *attacker_idx)
+        }
+        // The lapping/faster car is closing on the traffic car ahead.
+        RaceEvent::TrafficIntercept { leader_car_idx, traffic_car_idx, .. } => {
+            EventRoles::duel(*leader_car_idx, Some(*traffic_car_idx))
+        }
+        RaceEvent::TrafficCompressionZone { battle_attacker_idx, battle_defender_idx, .. } => {
+            EventRoles::duel(*battle_attacker_idx, Some(*battle_defender_idx))
+        }
+        RaceEvent::Overtake { car_idx, overtaken_car_idx, .. }
+        | RaceEvent::OvertakeForLead { car_idx, overtaken_car_idx, .. } => {
+            EventRoles::duel(*car_idx, *overtaken_car_idx)
+        }
+        RaceEvent::IncidentAlert { car_idx, .. } => {
+            EventRoles::solo(*car_idx, SubjectRole::Incident)
+        }
+        RaceEvent::IncidentCluster { primary_car_idx, car_idxs, .. } => {
+            match primary_car_idx.or_else(|| car_idxs.first().copied()) {
+                Some(idx) => EventRoles::solo(idx, SubjectRole::Incident),
+                // A cluster with no cars left in it has no subject to name.
+                None => EventRoles::session(SubjectRole::Incident),
+            }
+        }
+        // Resolution of a cluster is about the cluster, not a car.
+        RaceEvent::IncidentClusterResolved { .. } => EventRoles::session(SubjectRole::Incident),
+        RaceEvent::FlagYellowLocal { trigger_car_idx, .. } => match trigger_car_idx {
+            Some(idx) => EventRoles::solo(*idx, SubjectRole::Trigger),
+            None => EventRoles::session(SubjectRole::Trigger),
+        },
+        RaceEvent::RaceGreen { .. }
+        | RaceEvent::RaceCheckered { .. }
+        | RaceEvent::FlagYellowFullCourse { .. } => EventRoles::session(SubjectRole::Session),
+        // System events are about the rig, but still name its car so the
+        // consumer can bind the rig to a car without a separate lookup.
+        RaceEvent::PublisherHello { .. }
+        | RaceEvent::PublisherGoodbye { .. }
+        | RaceEvent::PublisherHeartbeat { .. }
+        | RaceEvent::IracingConnected { .. }
+        | RaceEvent::IracingDisconnected { .. }
+        | RaceEvent::BroadcastControlRequested { .. } => EventRoles::solo(me, SubjectRole::Rig),
+        RaceEvent::FocusMeRequested { player_car_idx, .. } => {
+            EventRoles::solo(*player_car_idx, SubjectRole::Driver)
+        }
+        // Everything else describes the rig's own driving: laps, pit, tires,
+        // fuel, braking, micro-sectors, driver swaps.
+        _ => EventRoles::solo(primary_car_idx(event, me), SubjectRole::Driver),
+    }
+}
+
+/// Write publisher and subject identity into a payload.
+///
+/// Both go on *every* event, race and system alike, and stay separate: a
+/// consumer reads `publisherCarIdx` to learn which car the rig is in and
+/// `subjectCarIdx` to learn which car the event is about.
+fn insert_identity(
+    payload: &mut Value,
+    publisher: &PublisherIdentity,
+    roles: &EventRoles,
+    subject: Option<&SubjectRef>,
+    roster: Option<&SessionRoster>,
+) {
+    let Some(obj) = payload.as_object_mut() else {
+        return;
+    };
+
+    obj.insert("publisher".to_owned(), serde_json::to_value(publisher).unwrap_or(Value::Null));
+    obj.insert("rigId".to_owned(), Value::String(publisher.rig_id.clone()));
+    obj.insert("rigLabel".to_owned(), Value::String(publisher.rig_label.clone()));
+    obj.insert("publisherCarIdx".to_owned(), json!(publisher.car_idx));
+    obj.insert("publisherCarNumber".to_owned(), Value::String(publisher.car_number.clone()));
+    obj.insert("publisherDriverId".to_owned(), Value::String(publisher.driver_id.clone()));
+    obj.insert("publisherDriverName".to_owned(), Value::String(publisher.driver_name.clone()));
+
+    obj.insert("subjectRole".to_owned(), serde_json::to_value(roles.role).unwrap_or(Value::Null));
+    obj.insert("subject".to_owned(), serde_json::to_value(subject).unwrap_or(Value::Null));
+    obj.insert("subjectCarIdx".to_owned(), option_u8_json(subject.map(|s| s.car_idx)));
+    obj.insert(
+        "subjectCarNumber".to_owned(),
+        subject.map_or(Value::Null, |s| Value::String(s.car_number.clone())),
+    );
+    obj.insert(
+        "subjectDriverId".to_owned(),
+        subject.map_or(Value::Null, |s| Value::String(s.driver_id.clone())),
+    );
+
+    for (prefix, car_idx) in [("attacker", roles.attacker), ("defender", roles.defender)] {
+        let car = car_idx.map(|idx| resolve_car(idx, roster));
+        obj.insert(format!("{prefix}CarIdx"), option_u8_json(car_idx));
+        obj.insert(
+            format!("{prefix}CarNumber"),
+            car.as_ref().map_or(Value::Null, |c| Value::String(c.car_number.clone())),
+        );
+        obj.insert(
+            format!("{prefix}Car"),
+            car.as_ref().map_or(Value::Null, |c| serde_json::to_value(c).unwrap_or(Value::Null)),
+        );
+        obj.insert(
+            format!("{prefix}DriverId"),
+            car.as_ref().map_or(Value::Null, |c| Value::String(c.driver_id())),
+        );
+    }
+}
+
+/// Give every `snake_case` payload key a `camelCase` twin, recursively.
+///
+/// camelCase is the canonical scheme for payload keys, but `RaceEvent`
+/// serialises its fields in snake_case. Rather than rename variant fields —
+/// which would break the production consumer — the canonical key is added
+/// alongside and the snake_case original is left in place for the transition
+/// window. Existing keys are never overwritten, so hand-written aliases such
+/// as `lapTime` win over a mechanical twin.
+fn add_camel_case_twins(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (_, nested) in map.iter_mut() {
+                add_camel_case_twins(nested);
+            }
+            let twins: Vec<(String, Value)> = map
+                .iter()
+                .filter_map(|(key, nested)| {
+                    let camel = to_camel_case(key);
+                    if camel == *key || map.contains_key(&camel) {
+                        None
+                    } else {
+                        Some((camel, nested.clone()))
+                    }
+                })
+                .collect();
+            for (key, nested) in twins {
+                map.insert(key, nested);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                add_camel_case_twins(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn to_camel_case(key: &str) -> String {
+    let mut out = String::with_capacity(key.len());
+    let mut upper_next = false;
+    for ch in key.chars() {
+        if ch == '_' {
+            upper_next = !out.is_empty();
+        } else if upper_next {
+            out.extend(ch.to_uppercase());
+            upper_next = false;
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 fn enrich_payload(
@@ -332,17 +691,28 @@ fn enrich_payload(
             // Cluster centroid lap distance percentage
             obj.insert("lapDistPct".to_owned(), json!((lap_dist_pct_from + lap_dist_pct_to) / 2.0));
         }
-        RaceEvent::IncidentAlert { driver_incident_count, previous_track_surface, current_track_surface, previous_speed_mps, current_speed_mps, speed_drop_mps, severity, reason, .. } => {
+        RaceEvent::IncidentAlert { driver_incident_count, previous_track_surface, current_track_surface, previous_speed_mps, current_speed_mps, speed_drop_mps, severity, severity_normalized, incident_count_delta, reason, .. } => {
             obj.insert(
                 "driverIncidentCount".to_owned(),
                 driver_incident_count.map(Value::from).unwrap_or(Value::Null),
             );
             obj.insert("previousTrackSurface".to_owned(), json!(previous_track_surface));
             obj.insert("currentTrackSurface".to_owned(), json!(current_track_surface));
+            // Documented name for the surface a car is on *now*; the
+            // `current`-prefixed keys stay for the transition window.
+            obj.insert("trackSurface".to_owned(), json!(current_track_surface));
             obj.insert("previousSpeedMps".to_owned(), json!(previous_speed_mps));
             obj.insert("currentSpeedMps".to_owned(), json!(current_speed_mps));
             obj.insert("speedDropMps".to_owned(), json!(speed_drop_mps));
+            // `severityScore`/`severity` are the raw magnitude, whose units
+            // depend on `reason`; `severityNormalized` is always 0.0–1.0 and
+            // is what a quality floor should compare against.
             obj.insert("severityScore".to_owned(), json!(severity));
+            obj.insert("severityNormalized".to_owned(), json!(severity_normalized));
+            obj.insert(
+                "incidentCountDelta".to_owned(),
+                incident_count_delta.map(Value::from).unwrap_or(Value::Null),
+            );
             obj.insert("reason".to_owned(), Value::String(reason.clone()));
         }
         RaceEvent::FlagYellowLocal { trigger_car_idx, lap_dist_pct, scope, .. } => {

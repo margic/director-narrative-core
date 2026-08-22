@@ -534,7 +534,8 @@ Trigger (`src/basic_incident.rs`):
 - Per-car edge-triggered incident condition when not in pit transition and either:
   - track surface changed, or
   - severe speed drop (`drop >= 8.0 m/s` and speed ratio <= 0.80).
-- Additional player-only alert when `player_incident_count` increases and no player alert already emitted that frame.
+- Additional player-only alert when `player_incident_count` increases and no player alert already emitted that frame, and the car is in the world, off pit road, and was moving (>= 5 m/s).
+- `severity` is a raw magnitude whose units depend on `reason`; `severity_normalized` is always 0.0-1.0. See `docs/publisher-event-contract.md`.
 
 Example:
 
@@ -551,6 +552,8 @@ Example:
   "current_speed_mps": 49.7,
   "speed_drop_mps": 21.5,
   "severity": 0.30,
+  "severity_normalized": 0.30,
+  "incident_count_delta": null,
   "reason": "surface_change_and_speed_drop"
 }
 ```

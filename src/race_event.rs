@@ -198,7 +198,15 @@ pub enum RaceEvent {
         previous_speed_mps:     f32,
         current_speed_mps:      f32,
         speed_drop_mps:         f32,
+        /// Raw, unnormalised magnitude: the speed loss as a fraction of the
+        /// prior speed for surface/speed signatures, or the iRacing incident
+        /// count delta (1, 2, 4, …) for `incident_count_increase`.
         severity:               f32,
+        /// Same magnitude mapped onto 0.0–1.0 regardless of `reason`, so a
+        /// quality floor can be applied without knowing the signature.
+        severity_normalized:    f32,
+        /// iRacing incident points gained, for `incident_count_increase` only.
+        incident_count_delta:   Option<i32>,
         reason:                 String,
     },
     MicroSectorGain {
