@@ -37,6 +37,16 @@ impl MicroSectorTracker {
         self.last_anchor_bucket = Some(bucket);
     }
 
+    /// Time in the most recently completed anchor sector against the driver's
+    /// own best for that sector, negative when quicker. `None` until the sector
+    /// has been driven at least twice.
+    pub fn last_segment_delta_vs_best(&self) -> Option<(u8, f32)> {
+        let bucket = self.last_anchor_bucket?;
+        let current = (*self.current_lap_times.get(bucket as usize)?)?;
+        let best = (*self.best_seg.get(bucket as usize)?)?;
+        Some((bucket, current - best))
+    }
+
     pub fn on_lap_end(&mut self, lap: u8, session_time: f32, clean_lap: bool) -> Vec<RaceEvent> {
         let mut events = Vec::new();
         if clean_lap && self.clean_laps_completed > 0 {

@@ -645,11 +645,18 @@ fn enrich_payload(
             car_ahead_idx,
             gap_behind_s,
             car_behind_idx,
+            delta_to_best_s,
+            sector_delta_to_best_s,
             track_surface,
             ..
         } => {
             obj.insert("lastLapTime".to_owned(), option_f32_json(*last_lap_time_s));
             obj.insert("bestLapTime".to_owned(), option_f32_json(*best_lap_time_s));
+            obj.insert("deltaToBest".to_owned(), option_f32_json(*delta_to_best_s));
+            obj.insert(
+                "sectorDeltaToBest".to_owned(),
+                option_f32_json(*sector_delta_to_best_s),
+            );
             obj.insert("gapAhead".to_owned(), option_f32_json(*gap_ahead_s));
             obj.insert("gapBehind".to_owned(), option_f32_json(*gap_behind_s));
             obj.insert("trackSurface".to_owned(), json!(track_surface));
@@ -841,7 +848,7 @@ fn car_race_position(frame: &TelemetryFrame, car_idx: u8) -> Option<u8> {
 mod tests {
     use super::*;
     use crate::battle_state::SlopeInfo;
-    use crate::race_event::RaceEvent;
+    use crate::race_event::{LifecycleOrigin, RaceEvent};
     use crate::session_info::{CarRef, SessionMetadata, SessionRoster};
     use crate::telemetry_frame::TelemetryFrame;
 
@@ -957,7 +964,7 @@ mod tests {
 
     #[test]
     fn uuid_is_unique_across_calls() {
-        let event = RaceEvent::RaceGreen { lap: 1, session_time: 0.0 };
+        let event = RaceEvent::RaceGreen { lap: 1, session_time: 0.0, synthetic: false, origin: LifecycleOrigin::SessionStateTransition };
         let frame = minimal_frame();
         let e1 = build_event(&event, &frame, None, "s", "r", None, None);
         let e2 = build_event(&event, &frame, None, "s", "r", None, None);
@@ -966,7 +973,7 @@ mod tests {
 
     #[test]
     fn session_events_omit_car_and_use_session_scope() {
-        let event = RaceEvent::RaceGreen { lap: 1, session_time: 0.0 };
+        let event = RaceEvent::RaceGreen { lap: 1, session_time: 0.0, synthetic: false, origin: LifecycleOrigin::SessionStateTransition };
         let frame = minimal_frame(); // player_car_idx = 0
         let env = build_event(&event, &frame, None, "s", "r", None, None);
         let json: Value = serde_json::to_value(&env).unwrap();
@@ -1159,7 +1166,7 @@ mod tests {
 
     #[test]
     fn context_includes_session_metadata_when_provided() {
-        let event = RaceEvent::RaceGreen { lap: 1, session_time: 1.0 };
+        let event = RaceEvent::RaceGreen { lap: 1, session_time: 1.0, synthetic: false, origin: LifecycleOrigin::SessionStateTransition };
         let frame = minimal_frame();
         let meta = SessionMetadata {
             track_name: Some("Winton National".to_owned()),

@@ -15,7 +15,7 @@ use crate::incident_cluster::IncidentClusterDetector;
 use crate::lap_timer::LapTimer;
 use crate::lift_coast::LiftCoastDetector;
 use crate::micro_sector::MicroSectorTracker;
-use crate::race_event::{FlagScope, RaceEvent};
+use crate::race_event::{DriverEffort, FlagScope, GapTrend, LifecycleOrigin, RaceEvent};
 use crate::regression_store::RegressionStore;
 use crate::session_info::SessionRoster;
 use crate::telemetry_frame::TelemetryFrame;
@@ -33,6 +33,14 @@ const SESSION_STATE_RACING: i32 = 4;
 const SESSION_STATE_CHECKERED: i32 = 5;
 const SESSION_STATE_COOLDOWN: i32 = 6;
 const YELLOW_ZONES: &[(u8, f32, f32)] = &[(1, 0.625, 0.646), (2, 0.616, 0.623)];
+/// Gap movement over one cadence window below this is reported as `STABLE`;
+/// gap readings themselves jitter by a few hundredths between frames.
+const GAP_TREND_DELTA_S: f32 = 0.15;
+/// A sector at most this much slower than the driver's own best still counts as
+/// pushing — sector times carry more noise than a full lap.
+const PUSH_SECTOR_DELTA_S: f32 = 0.05;
+/// A lap within this much of the driver's own best counts as pushing.
+const PUSH_LAP_DELTA_S: f32 = 0.35;
 /// Upper bound for a credible race gap. Real battle gaps are bounded by
 /// `MAX_BATTLE_GAP_S` (~5 s); anything at or above this value is a sentinel.
 const MAX_VALID_GAP_S: f32 = 100.0;
@@ -68,7 +76,12 @@ pub struct NarrativeEngine {
     engagement_start_beh_t: Option<f32>,
     prev_session_state: i32,
     prev_session_flags: u32,
+    /// `false` until the first frame has been processed, so a session already
+    /// under way at connect can be reported as inherited state.
+    session_state_sampled: bool,
     checkered_emitted: bool,
+    /// Gaps reported by the previous `DRIVER_MATERIAL`, for the gap trends.
+    last_material_gaps: Option<MaterialGaps>,
     prev_in_car: bool,
     prev_lap: Option<u8>,
     prev_on_pit: bool,
@@ -123,7 +136,9 @@ impl NarrativeEngine {
             engagement_start_beh_t: None,
             prev_session_state: 0,
             prev_session_flags: 0,
+            session_state_sampled: false,
             checkered_emitted: false,
+            last_material_gaps: None,
             prev_in_car: false,
             prev_lap: None,
             prev_on_pit: false,
@@ -160,14 +175,50 @@ impl NarrativeEngine {
     /// Snapshot of the driver at the wheel of this rig, for the periodic
     /// `DRIVER_MATERIAL` event. The publisher owns the cadence and passes the
     /// wall-clock `interval_s` since the previous one.
-    pub fn driver_material(&self, frame: &TelemetryFrame, interval_s: f32) -> RaceEvent {
+    ///
+    /// `None` while there is nothing to say about the driver: sitting on pit
+    /// road (the stall included) or out of the world entirely. Proximity to
+    /// other cars is deliberately not a condition — a driver alone in clean air
+    /// is exactly the case this event exists for.
+    pub fn driver_material(&mut self, frame: &TelemetryFrame, interval_s: f32) -> Option<RaceEvent> {
+        let me_idx = frame.player_car_idx as usize;
+        let surface = frame.car_idx_track_surface.get(me_idx).copied();
+        if frame.on_pit_road || surface.is_some_and(|s| s < 0) {
+            self.last_material_gaps = None;
+            return None;
+        }
+
         let lap_t = self.lap_timer.best_estimate();
         let ahead = find_cars_ahead(frame, lap_t, 1).first().copied();
         let behind = find_cars_behind(frame, lap_t, 1).first().copied();
-        let me_idx = frame.player_car_idx as usize;
         let me = self.car_registry.get(frame.player_car_idx);
 
-        RaceEvent::DriverMaterial {
+        let last_lap_time_s = me.map(|c| c.last_lap_time_s).filter(|t| *t > 0.0);
+        let best_lap_time_s = self
+            .best_lap_time_s
+            .or_else(|| me.map(|c| c.best_lap_time_s))
+            .filter(|t| *t > 0.0);
+        let delta_to_best_s = match (last_lap_time_s, best_lap_time_s) {
+            (Some(last), Some(best)) => Some(last - best),
+            _ => None,
+        };
+        let sector = self.micro_sector.last_segment_delta_vs_best();
+
+        let previous = self.last_material_gaps.take();
+        let gap_ahead_trend = gap_trend(previous.as_ref().and_then(|p| p.ahead), ahead);
+        let gap_behind_trend = gap_trend(previous.as_ref().and_then(|p| p.behind), behind);
+        self.last_material_gaps = Some(MaterialGaps { ahead, behind });
+
+        let effort = if sector.is_some_and(|(_, delta)| delta <= PUSH_SECTOR_DELTA_S)
+            || delta_to_best_s.is_some_and(|delta| delta <= PUSH_LAP_DELTA_S)
+            || gap_ahead_trend == GapTrend::Closing
+        {
+            DriverEffort::Pushing
+        } else {
+            DriverEffort::Holding
+        };
+
+        Some(RaceEvent::DriverMaterial {
             lap: frame.lap,
             session_time: frame.session_time,
             player_car_idx: frame.player_car_idx,
@@ -178,21 +229,20 @@ impl NarrativeEngine {
                 .copied()
                 .unwrap_or(-1),
             lap_dist_pct: frame.lap_dist_pct,
-            last_lap_time_s: me.map(|c| c.last_lap_time_s).filter(|t| *t > 0.0),
-            best_lap_time_s: self
-                .best_lap_time_s
-                .or_else(|| me.map(|c| c.best_lap_time_s))
-                .filter(|t| *t > 0.0),
+            last_lap_time_s,
+            best_lap_time_s,
             gap_ahead_s: ahead.map(|(_, gap)| gap),
             car_ahead_idx: ahead.map(|(idx, _)| idx),
             gap_behind_s: behind.map(|(_, gap)| gap),
             car_behind_idx: behind.map(|(idx, _)| idx),
+            delta_to_best_s,
+            sector_bucket: sector.map(|(bucket, _)| bucket),
+            sector_delta_to_best_s: sector.map(|(_, delta)| delta),
+            gap_ahead_trend,
+            gap_behind_trend,
+            effort,
             on_pit_road: frame.on_pit_road,
-            track_surface: frame
-                .car_idx_track_surface
-                .get(me_idx)
-                .copied()
-                .unwrap_or(-1),
+            track_surface: surface.unwrap_or(-1),
             speed_mps: if frame.speed > 0.0 {
                 frame.speed
             } else {
@@ -202,7 +252,7 @@ impl NarrativeEngine {
             incident_count: frame.player_incident_count,
             session_state: frame.session_state,
             interval_s,
-        }
+        })
     }
 
     pub fn process_frame(&mut self, frame: &TelemetryFrame) -> Vec<RaceEvent> {
@@ -243,10 +293,23 @@ impl NarrativeEngine {
         let session_state = frame.session_state;
         let session_flags = frame.session_flags;
 
+        // A publisher that joins a session already racing sees its first sample
+        // as a transition; say so rather than reporting a green flag that never
+        // fell — a Practice session at connect produced one of these per rig.
+        let origin = if self.session_state_sampled {
+            LifecycleOrigin::SessionStateTransition
+        } else {
+            LifecycleOrigin::ConnectSnapshot
+        };
         if session_state == SESSION_STATE_RACING
             && self.prev_session_state != SESSION_STATE_RACING
         {
-            events.push(RaceEvent::RaceGreen { lap, session_time: t });
+            events.push(RaceEvent::RaceGreen {
+                lap,
+                session_time: t,
+                synthetic: origin.is_synthetic(),
+                origin,
+            });
         }
         // The checkered flag is signalled two ways and neither is reliable on
         // its own: `SessionState` can step straight from Racing to CoolDown
@@ -258,7 +321,12 @@ impl NarrativeEngine {
                 && self.prev_session_state == SESSION_STATE_RACING);
         if checkered_now && !self.checkered_emitted {
             self.checkered_emitted = true;
-            events.push(RaceEvent::RaceCheckered { lap, session_time: t });
+            events.push(RaceEvent::RaceCheckered {
+                lap,
+                session_time: t,
+                synthetic: origin.is_synthetic(),
+                origin,
+            });
         }
         let in_car = session_state != 0;
         if in_car && !self.prev_in_car {
@@ -315,6 +383,7 @@ impl NarrativeEngine {
             });
         }
         self.prev_in_car = in_car;
+        self.session_state_sampled = true;
         self.prev_session_state = session_state;
         self.prev_session_flags = session_flags;
 
@@ -745,6 +814,32 @@ impl NarrativeEngine {
     }
 }
 
+/// Gap readings carried between `DRIVER_MATERIAL` emissions so each one can
+/// state which way its gaps are moving.
+struct MaterialGaps {
+    ahead:  Option<(u8, f32)>,
+    behind: Option<(u8, f32)>,
+}
+
+/// Direction of a gap between two cadence samples. Only comparable while the
+/// neighbouring car is the same one.
+fn gap_trend(previous: Option<(u8, f32)>, current: Option<(u8, f32)>) -> GapTrend {
+    let (Some((prev_idx, prev_gap)), Some((idx, gap))) = (previous, current) else {
+        return GapTrend::Unknown;
+    };
+    if prev_idx != idx {
+        return GapTrend::Unknown;
+    }
+    let delta = gap - prev_gap;
+    if delta <= -GAP_TREND_DELTA_S {
+        GapTrend::Closing
+    } else if delta >= GAP_TREND_DELTA_S {
+        GapTrend::Opening
+    } else {
+        GapTrend::Stable
+    }
+}
+
 fn synthesize_flags(lap: u8, ldp: f32) -> u32 {
     for &(ylap, p0, p1) in YELLOW_ZONES {
         if lap == ylap && ldp >= p0 && ldp <= p1 {
@@ -931,7 +1026,9 @@ mod tests {
             let _ = engine.process_frame(&f);
         }
 
-        let material = engine.driver_material(&frame, 25.0);
+        let material = engine
+            .driver_material(&frame, 25.0)
+            .expect("material for a car on track");
         let RaceEvent::DriverMaterial {
             player_car_idx,
             position,
@@ -958,14 +1055,180 @@ mod tests {
 
     #[test]
     fn driver_material_is_emitted_even_with_an_empty_field() {
-        let engine = NarrativeEngine::new(10);
-        let material = engine.driver_material(&frame_no_opponent(1, 60.0), 20.0);
+        let mut engine = NarrativeEngine::new(10);
+        let material = engine
+            .driver_material(&frame_no_opponent(1, 60.0), 20.0)
+            .expect("a driver alone in clean air is exactly the case this exists for");
         assert!(matches!(
             material,
             RaceEvent::DriverMaterial {
                 car_ahead_idx: None,
                 gap_ahead_s: None,
                 car_behind_idx: None,
+                gap_ahead_trend: GapTrend::Unknown,
+                gap_behind_trend: GapTrend::Unknown,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn driver_material_is_suppressed_in_the_pit_box() {
+        let mut engine = NarrativeEngine::new(10);
+        let mut in_pits = frame_no_opponent(1, 60.0);
+        in_pits.on_pit_road = true;
+        assert!(engine.driver_material(&in_pits, 25.0).is_none());
+    }
+
+    #[test]
+    fn driver_material_is_suppressed_when_the_car_is_not_in_the_world() {
+        let mut engine = NarrativeEngine::new(10);
+        let mut not_in_world = frame_no_opponent(1, 60.0);
+        not_in_world.car_idx_track_surface[0] = -1;
+        assert!(engine.driver_material(&not_in_world, 25.0).is_none());
+    }
+
+    #[test]
+    fn driver_material_reports_a_closing_gap_between_cadence_ticks() {
+        let mut engine = NarrativeEngine::new(10);
+        let far = frame_with_gap(3, 300.0, 4, 0.508);
+        let near = frame_with_gap(3, 325.0, 4, 0.502);
+
+        let first = engine
+            .driver_material(&far, 25.0)
+            .expect("material for a car on track");
+        assert!(matches!(
+            first,
+            RaceEvent::DriverMaterial { gap_ahead_trend: GapTrend::Unknown, .. }
+        ));
+
+        let second = engine
+            .driver_material(&near, 25.0)
+            .expect("material for a car on track");
+        let RaceEvent::DriverMaterial { gap_ahead_trend, effort, .. } = second else {
+            panic!("expected DRIVER_MATERIAL");
+        };
+        assert_eq!(gap_ahead_trend, GapTrend::Closing);
+        assert_eq!(effort, DriverEffort::Pushing);
+    }
+
+    #[test]
+    fn a_pit_stop_breaks_the_gap_trend_rather_than_comparing_across_it() {
+        let mut engine = NarrativeEngine::new(10);
+        let on_track = frame_with_gap(3, 300.0, 4, 0.508);
+        let mut in_pits = on_track.clone();
+        in_pits.on_pit_road = true;
+
+        let _ = engine.driver_material(&on_track, 25.0);
+        assert!(engine.driver_material(&in_pits, 25.0).is_none());
+        let after = engine
+            .driver_material(&frame_with_gap(3, 350.0, 4, 0.505), 25.0)
+            .expect("material for a car back on track");
+        assert!(matches!(
+            after,
+            RaceEvent::DriverMaterial { gap_ahead_trend: GapTrend::Unknown, .. }
+        ));
+    }
+
+    #[test]
+    fn driver_material_cadence_fires_once_per_window_and_never_in_the_pits() {
+        use crate::lifecycle::IntervalScheduler;
+        use std::time::{Duration, Instant};
+
+        let mut engine = NarrativeEngine::new(10);
+        let mut sched = IntervalScheduler::new(25_000);
+        let t0 = Instant::now();
+        let on_track = frame_with_gap(3, 300.0, 4, 0.508);
+        let mut in_pits = on_track.clone();
+        in_pits.on_pit_road = true;
+
+        let emit = |sched: &mut IntervalScheduler,
+                    engine: &mut NarrativeEngine,
+                    now: Instant,
+                    frame: &TelemetryFrame| {
+            sched
+                .due_elapsed(now)
+                .and_then(|elapsed| engine.driver_material(frame, elapsed.as_secs_f32()))
+        };
+
+        // Cadence tick zero only arms the timer.
+        assert!(emit(&mut sched, &mut engine, t0, &on_track).is_none());
+        // Nothing inside the first cadence window.
+        assert!(emit(
+            &mut sched,
+            &mut engine,
+            t0 + Duration::from_secs(10),
+            &on_track
+        )
+        .is_none());
+        assert!(emit(
+            &mut sched,
+            &mut engine,
+            t0 + Duration::from_secs(24),
+            &on_track
+        )
+        .is_none());
+        // Fires on schedule.
+        assert!(emit(
+            &mut sched,
+            &mut engine,
+            t0 + Duration::from_secs(25),
+            &on_track
+        )
+        .is_some());
+        // ...and does not fire twice in the same window.
+        assert!(emit(
+            &mut sched,
+            &mut engine,
+            t0 + Duration::from_secs(26),
+            &on_track
+        )
+        .is_none());
+        // A due tick with the car in the box publishes nothing.
+        assert!(emit(
+            &mut sched,
+            &mut engine,
+            t0 + Duration::from_secs(50),
+            &in_pits
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn race_green_at_connect_is_marked_synthetic() {
+        // A publisher joining a session already racing must not claim it saw a
+        // green flag fall: the capture that motivated this had one per rig in a
+        // Practice session.
+        let mut engine = NarrativeEngine::new(10);
+        let evs = engine.process_frame(&frame_with_gap(1, 0.0, 4, 0.501));
+        let green = evs
+            .iter()
+            .find(|e| matches!(e, RaceEvent::RaceGreen { .. }))
+            .expect("first sample of a racing session");
+        assert!(matches!(
+            green,
+            RaceEvent::RaceGreen {
+                synthetic: true,
+                origin: LifecycleOrigin::ConnectSnapshot,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn an_observed_green_flag_is_not_marked_synthetic() {
+        let mut engine = NarrativeEngine::new(10);
+        let _ = engine.process_frame(&frame_with_gap(1, 0.0, 3, 0.501));
+        let evs = engine.process_frame(&frame_with_gap(1, 1.0, 4, 0.501));
+        let green = evs
+            .iter()
+            .find(|e| matches!(e, RaceEvent::RaceGreen { .. }))
+            .expect("green on the observed transition");
+        assert!(matches!(
+            green,
+            RaceEvent::RaceGreen {
+                synthetic: false,
+                origin: LifecycleOrigin::SessionStateTransition,
                 ..
             }
         ));

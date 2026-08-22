@@ -12,6 +12,48 @@ pub enum EventScope {
     SessionScoped,
 }
 
+/// Where a session-lifecycle event came from.
+///
+/// A publisher that connects to a session already under way sees its first
+/// `SessionState` sample as a transition and would otherwise report it as a
+/// flag that just fell. `ConnectSnapshot` marks that case so a consumer can
+/// tell a real green from the state the session was already in.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum LifecycleOrigin {
+    /// The session state changed while the publisher was watching.
+    SessionStateTransition,
+    /// First state the publisher ever sampled for this session.
+    ConnectSnapshot,
+}
+
+impl LifecycleOrigin {
+    /// `true` when the event describes state the publisher inherited rather
+    /// than a flag it observed falling.
+    pub fn is_synthetic(self) -> bool {
+        matches!(self, Self::ConnectSnapshot)
+    }
+}
+
+/// Direction a gap to a neighbouring car is moving over one cadence window.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum GapTrend {
+    Closing,
+    Stable,
+    Opening,
+    /// No comparable previous reading — first cadence tick, or a different car.
+    Unknown,
+}
+
+/// Whether the driver is extracting time or settling into a rhythm.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DriverEffort {
+    Pushing,
+    Holding,
+}
+
 /// Classification of a yellow flag's scope relative to the player.
 #[derive(Debug, Serialize)]
 pub enum FlagScope {
@@ -80,6 +122,10 @@ pub enum RaceEvent {
     RaceGreen {
         lap:          u8,
         session_time: f32,
+        /// `true` when this is the state the publisher found on connect rather
+        /// than a green flag it saw fall.
+        synthetic:    bool,
+        origin:       LifecycleOrigin,
     },
     FlagYellowFullCourse {
         lap:          u8,
@@ -103,6 +149,9 @@ pub enum RaceEvent {
     RaceCheckered {
         lap:          u8,
         session_time: f32,
+        /// `true` when the session was already flagged as the publisher connected.
+        synthetic:    bool,
+        origin:       LifecycleOrigin,
     },
     IracingConnected {
         lap:          u8,
@@ -364,6 +413,18 @@ pub enum RaceEvent {
         car_ahead_idx:     Option<u8>,
         gap_behind_s:      Option<f32>,
         car_behind_idx:    Option<u8>,
+        /// `last_lap_time_s - best_lap_time_s`; negative on the driver's best lap.
+        delta_to_best_s:   Option<f32>,
+        /// Anchor bucket whose time `sector_delta_to_best_s` describes.
+        sector_bucket:     Option<u8>,
+        /// Time in the most recently completed anchor sector against the
+        /// driver's own best for that sector. Negative means quicker.
+        sector_delta_to_best_s: Option<f32>,
+        /// Movement of `gap_ahead_s` since the previous `DRIVER_MATERIAL`.
+        gap_ahead_trend:   GapTrend,
+        gap_behind_trend:  GapTrend,
+        /// Whether the driver is taking time out of their own reference.
+        effort:            DriverEffort,
         on_pit_road:       bool,
         track_surface:     i32,
         speed_mps:         f32,
@@ -383,7 +444,11 @@ pub enum RaceEvent {
         sub_session_id:          i64,
         previous_session_num:    Option<i32>,
         session_num:             i32,
-        /// Machine-readable cause, e.g. `sub_session_changed`.
+        /// Session clock the publisher last saw before the reset, when the reset
+        /// was a clock restart inside one sub-session.
+        previous_session_time:   Option<f32>,
+        /// Machine-readable cause: `sub_session_changed` or
+        /// `session_clock_restarted`.
         reason:                  String,
     },
     /// Driver pressed their bound pause/resume button. Rig-scoped: it acts on
