@@ -44,6 +44,15 @@ pub struct TelemetryFrame {
     /// Absent from JSONL fixtures; defaults to 0.
     #[serde(default)]
     pub session_num:          i32,
+    /// iRacing `SessionTimeRemain` — seconds left in the current session.
+    /// `None` when the variable is absent or the session is untimed
+    /// (iRacing reports a sentinel of one week for unlimited sessions).
+    #[serde(default)]
+    pub session_time_remain:  Option<f64>,
+    /// iRacing `SessionLapsRemainEx` — laps left in the current session.
+    /// `None` when the variable is absent or the session is not lap-limited.
+    #[serde(default)]
+    pub session_laps_remain:  Option<i32>,
     /// Player incident count from iRacing (`PlayerCarMyIncidentCount`).
     /// Absent from some fixtures/mocks; defaults to 0.
     #[serde(default)]

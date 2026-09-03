@@ -6,6 +6,7 @@
 //! not need.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -31,6 +32,37 @@ pub const PAYLOAD_CONTRACT_VERSION: u32 = 2;
 /// [`PublisherEvent::event_key`] unique.
 static EVENT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Identity of this publisher process, minted once at first use. Together
+/// with [`PublisherEvent::sequence`] it lets a consumer tell a restart (new
+/// run id, sequence back to zero) from a gap or reordering inside one run.
+static PUBLISHER_RUN_ID: OnceLock<String> = OnceLock::new();
+
+/// Stable id of the running publisher process.
+pub fn publisher_run_id() -> &'static str {
+    PUBLISHER_RUN_ID.get_or_init(|| Uuid::new_v4().to_string())
+}
+
+/// Format wall-clock milliseconds since the Unix epoch as RFC 3339 UTC with
+/// millisecond precision, e.g. `2026-09-03T01:37:00.123Z`.
+pub fn format_rfc3339_ms(epoch_ms: i64) -> String {
+    let secs = epoch_ms.div_euclid(1000);
+    let millis = epoch_ms.rem_euclid(1000);
+    let days = secs.div_euclid(86_400);
+    let sod = secs.rem_euclid(86_400);
+    let (hour, minute, second) = (sod / 3600, (sod % 3600) / 60, sod % 60);
+    // Howard Hinnant's civil-from-days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
+}
+
 // ── Envelope types ────────────────────────────────────────────────────────────
 
 /// Wire envelope — serialises to the Race Control API schema exactly.
@@ -46,6 +78,13 @@ pub struct PublisherEvent {
     pub event_type: String,
     /// Wall-clock milliseconds since Unix epoch at the moment of construction.
     pub timestamp: i64,
+    /// The same instant as `timestamp`, as RFC 3339 UTC (`...Z`, millisecond
+    /// precision). Consumers that compare against an ISO `receivedAt` can
+    /// measure delivery lag from this without parsing an integer epoch.
+    pub emitted_at: String,
+    /// Identity of the publisher process that built this event. Changes on
+    /// every restart; `sequence` is monotonic within one run id.
+    pub publisher_run_id: String,
     /// iRacing `SessionTime` in seconds.
     pub session_time: f64,
     /// iRacing `SessionTick` counter.
@@ -172,6 +211,7 @@ pub fn build_event(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64;
+    let emitted_at = format_rfc3339_ms(timestamp);
 
     // Serialise the event, hoist the discriminator tag, use remainder as payload.
     let mut event_value =
@@ -221,6 +261,8 @@ pub fn build_event(
         rig_id: rig_id.to_owned(),
         event_type,
         timestamp,
+        emitted_at,
+        publisher_run_id: publisher_run_id().to_owned(),
         session_time: frame.session_time as f64,
         session_tick: frame.session_tick,
         contract_version: PAYLOAD_CONTRACT_VERSION,
@@ -416,7 +458,8 @@ fn event_roles(event: &RaceEvent, frame: &TelemetryFrame) -> EventRoles {
         RaceEvent::RaceGreen { .. }
         | RaceEvent::RaceCheckered { .. }
         | RaceEvent::FlagYellowFullCourse { .. }
-        | RaceEvent::SessionReset { .. } => EventRoles::session(SubjectRole::Session),
+        | RaceEvent::SessionReset { .. }
+        | RaceEvent::SessionState { .. } => EventRoles::session(SubjectRole::Session),
         // System events are about the rig, but still name its car so the
         // consumer can bind the rig to a car without a separate lookup.
         RaceEvent::PublisherHello { .. }
@@ -870,6 +913,8 @@ mod tests {
             session_tick: 9876,
             session_state: 4,
             session_num: 0,
+            session_time_remain: None,
+            session_laps_remain: None,
             player_incident_count: 0,
             car_idx_lap_completed: vec![3, 3],
             lf_temp_m: 0.0,

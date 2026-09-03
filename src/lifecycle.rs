@@ -9,6 +9,12 @@ use std::time::{Duration, Instant};
 
 use crate::race_event::RaceEvent;
 
+/// `PUBLISHER_GOODBYE.reason` when the process is shutting down.
+pub const GOODBYE_SHUTDOWN: &str = "shutdown";
+/// `PUBLISHER_GOODBYE.reason` when iRacing moved to another sub-session and
+/// this publisher instance is being re-created for it.
+pub const GOODBYE_SESSION_TRANSITION: &str = "session_transition";
+
 /// Manages publisher lifecycle events.
 ///
 /// Create one instance at startup, call [`on_activate`] after successful
@@ -48,7 +54,30 @@ impl LifecyclePublisher {
 
     /// Emit `PUBLISHER_GOODBYE` — call on clean shutdown.
     pub fn on_deactivate(&self, lap: u8, session_time: f32) -> RaceEvent {
-        RaceEvent::PublisherGoodbye { lap, session_time }
+        RaceEvent::PublisherGoodbye {
+            lap,
+            session_time,
+            reason: GOODBYE_SHUTDOWN.to_owned(),
+            previous_sub_session_id: None,
+        }
+    }
+
+    /// Emit `PUBLISHER_GOODBYE` for a sub-session the publisher is leaving
+    /// because iRacing advanced to another one. The caller stamps the
+    /// envelope with the *live* sub-session so the consumer does not discard
+    /// the one transition signal it needs; the departed id rides in the payload.
+    pub fn on_session_transition(
+        &self,
+        lap: u8,
+        session_time: f32,
+        previous_sub_session_id: i64,
+    ) -> RaceEvent {
+        RaceEvent::PublisherGoodbye {
+            lap,
+            session_time,
+            reason: GOODBYE_SESSION_TRANSITION.to_owned(),
+            previous_sub_session_id: Some(previous_sub_session_id),
+        }
     }
 
     /// Emit `PUBLISHER_HEARTBEAT` — call on the heartbeat timer while connected.
@@ -133,7 +162,22 @@ mod tests {
     fn on_deactivate_emits_goodbye() {
         let lc = LifecyclePublisher::new("0.1.0");
         let event = lc.on_deactivate(5, 250.0);
-        assert!(matches!(event, RaceEvent::PublisherGoodbye { lap: 5, .. }));
+        assert!(matches!(
+            event,
+            RaceEvent::PublisherGoodbye { lap: 5, reason, previous_sub_session_id: None, .. }
+                if reason == GOODBYE_SHUTDOWN
+        ));
+    }
+
+    #[test]
+    fn session_transition_goodbye_names_the_departed_sub_session() {
+        let lc = LifecyclePublisher::new("0.1.0");
+        let event = lc.on_session_transition(5, 250.0, 88_429_240);
+        assert!(matches!(
+            event,
+            RaceEvent::PublisherGoodbye { reason, previous_sub_session_id: Some(88_429_240), .. }
+                if reason == GOODBYE_SESSION_TRANSITION
+        ));
     }
 
     #[test]

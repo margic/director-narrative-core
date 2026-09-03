@@ -1,8 +1,10 @@
 use director_narrative_core::battle_state::SlopeInfo;
-use director_narrative_core::publisher_event::{build_event, PublisherEvent};
+use director_narrative_core::publisher_event::{
+    build_event, format_rfc3339_ms, publisher_run_id, PublisherEvent,
+};
 use director_narrative_core::race_event::{
     BattleBreakReason, BattleIdentity, BattlePhase, DriverEffort, FlagScope, GapTrend, LifecycleOrigin,
-    RaceEvent,
+    RaceEvent, SessionKind, SessionPhase, SessionStateName, SessionStateReason,
 };
 use director_narrative_core::telemetry_frame::TelemetryFrame;
 use serde_json::Value;
@@ -25,6 +27,8 @@ fn minimal_frame() -> TelemetryFrame {
         session_tick: 9876,
         session_state: 4,
         session_num: 0,
+        session_time_remain: None,
+        session_laps_remain: None,
         player_incident_count: 0,
         car_idx_lap_completed: vec![3, 3],
         lf_temp_m: 0.0,
@@ -1315,4 +1319,140 @@ fn battle_events_without_identity_omit_the_new_fields() {
     }
     assert_eq!(payload["leaderCarNumber"], "1");
     assert_eq!(payload["followerCarNumber"], "0");
+}
+
+#[test]
+fn session_state_describes_the_session_kind_phase_and_imminent_change() {
+    let event = RaceEvent::SessionState {
+        lap: 0,
+        session_time: 12.0,
+        session_num: 2,
+        previous_session_num: Some(1),
+        session_type: Some("Race".to_owned()),
+        session_kind: SessionKind::Race,
+        session_state: 3,
+        session_state_name: SessionStateName::ParadeLaps,
+        previous_session_state: Some(2),
+        phase: SessionPhase::RaceFormation,
+        previous_phase: Some(SessionPhase::RaceGridding),
+        reason: SessionStateReason::SessionStateChanged,
+        synthetic: false,
+        session_time_remain_s: Some(2700.5),
+        session_laps_remain: Some(20),
+        session_change_imminent: false,
+    };
+
+    let env = build_event(&event, &minimal_frame(), None, "88087411", "rig-001", None, Some(88_087_411));
+    let json = normalized_event_json(&env);
+
+    assert_envelope_contract(&json, "SESSION_STATE");
+    assert_eq!(json["scope"], "SESSION_SCOPED");
+    let payload = &json["payload"];
+    assert_eq!(payload["subjectRole"], "SESSION");
+    assert_eq!(payload["sessionNum"], 2);
+    assert_eq!(payload["previousSessionNum"], 1);
+    assert_eq!(payload["sessionType"], "Race");
+    assert_eq!(payload["sessionKind"], "RACE");
+    assert_eq!(payload["sessionState"], 3);
+    assert_eq!(payload["sessionStateName"], "PARADE_LAPS");
+    assert_eq!(payload["previousSessionState"], 2);
+    assert_eq!(payload["phase"], "RACE_FORMATION");
+    assert_eq!(payload["previousPhase"], "RACE_GRIDDING");
+    assert_eq!(payload["reason"], "SESSION_STATE_CHANGED");
+    assert_eq!(payload["synthetic"], false);
+    assert!((payload["sessionTimeRemainS"].as_f64().unwrap() - 2700.5).abs() < 1e-6);
+    assert_eq!(payload["sessionLapsRemain"], 20);
+    assert_eq!(payload["sessionChangeImminent"], false);
+    // Snake-case originals stay for the transition window.
+    assert_eq!(payload["session_kind"], "RACE");
+    assert_eq!(payload["session_change_imminent"], false);
+}
+
+#[test]
+fn session_state_ending_signal_carries_the_clock() {
+    let event = RaceEvent::SessionState {
+        lap: 5,
+        session_time: 1140.0,
+        session_num: 1,
+        previous_session_num: Some(1),
+        session_type: Some("Lone Qualify".to_owned()),
+        session_kind: SessionKind::Qualifying,
+        session_state: 4,
+        session_state_name: SessionStateName::Racing,
+        previous_session_state: Some(4),
+        phase: SessionPhase::QualifyingHotlaps,
+        previous_phase: Some(SessionPhase::QualifyingHotlaps),
+        reason: SessionStateReason::SessionEnding,
+        synthetic: false,
+        session_time_remain_s: Some(59.0),
+        session_laps_remain: None,
+        session_change_imminent: true,
+    };
+
+    let env = build_event(&event, &minimal_frame(), None, "88087411", "rig-001", None, Some(88_087_411));
+    let json = normalized_event_json(&env);
+
+    assert_envelope_contract(&json, "SESSION_STATE");
+    let payload = &json["payload"];
+    assert_eq!(payload["reason"], "SESSION_ENDING");
+    assert_eq!(payload["sessionChangeImminent"], true);
+    assert_eq!(payload["phase"], "QUALIFYING_HOTLAPS");
+    assert!(payload["sessionLapsRemain"].is_null());
+}
+
+#[test]
+fn transition_goodbye_is_stamped_with_the_live_sub_session_and_names_the_old_one() {
+    let event = RaceEvent::PublisherGoodbye {
+        lap: 0,
+        session_time: 103.0,
+        reason: "session_transition".to_owned(),
+        previous_sub_session_id: Some(88_429_240),
+    };
+
+    let env = build_event(&event, &minimal_frame(), None, "88430365", "rig-001", None, Some(88_430_365));
+    let json = normalized_event_json(&env);
+
+    assert_envelope_contract(&json, "PUBLISHER_GOODBYE");
+    assert_eq!(json["raceSessionId"], "88430365");
+    assert_eq!(json["context"]["subSessionId"], 88_430_365i64);
+    assert_eq!(json["payload"]["reason"], "session_transition");
+    assert_eq!(json["payload"]["previousSubSessionId"], 88_429_240i64);
+    // Legacy fields are untouched.
+    assert_eq!(json["payload"]["lap"], 0);
+    assert!((json["payload"]["sessionTime"].as_f64().unwrap() - 103.0).abs() < 1e-6);
+}
+
+#[test]
+fn every_envelope_carries_emitted_at_and_a_run_scoped_monotonic_sequence() {
+    let event = RaceEvent::RaceGreen {
+        lap: 1,
+        session_time: 5.0,
+        synthetic: false,
+        origin: LifecycleOrigin::SessionStateTransition,
+    };
+    let first = build_event(&event, &minimal_frame(), None, "s", "rig-001", None, Some(1));
+    let second = build_event(&event, &minimal_frame(), None, "s", "rig-001", None, Some(1));
+
+    let a = serde_json::to_value(&first).unwrap();
+    let b = serde_json::to_value(&second).unwrap();
+
+    // emittedAt is the RFC 3339 rendering of the same instant as `timestamp`.
+    let emitted = a["emittedAt"].as_str().expect("emittedAt string");
+    assert!(emitted.ends_with('Z') && emitted.len() == 24, "{emitted}");
+    assert_eq!(emitted, format_rfc3339_ms(a["timestamp"].as_i64().unwrap()));
+    // One run id per process; sequence strictly increases inside it.
+    assert_eq!(a["publisherRunId"], b["publisherRunId"]);
+    assert_eq!(a["publisherRunId"], publisher_run_id());
+    assert!(b["sequence"].as_u64().unwrap() > a["sequence"].as_u64().unwrap());
+    assert!(b["timestamp"].as_i64().unwrap() >= a["timestamp"].as_i64().unwrap());
+    // Existing envelope fields are unchanged in type.
+    assert!(a["timestamp"].is_i64());
+    assert!(a["sequence"].is_u64());
+}
+
+#[test]
+fn rfc3339_formatting_matches_known_instants() {
+    assert_eq!(format_rfc3339_ms(0), "1970-01-01T00:00:00.000Z");
+    assert_eq!(format_rfc3339_ms(951_782_400_000), "2000-02-29T00:00:00.000Z");
+    assert_eq!(format_rfc3339_ms(1_788_391_719_745), "2026-09-02T23:28:39.745Z");
 }

@@ -200,6 +200,7 @@ fn pipeline_main(
         publisher_event::{build_event, PublisherEvent},
         race_event::{EventScope, RaceEvent},
         session_info::{is_ai_session, parse_sub_session_id, synthetic_sub_session_id, RosterCache, SessionMetadata},
+        session_lifecycle::SessionLifecycleTracker,
         telemetry_frame::TelemetryFrame,
         transport::PublisherTransport,
     };
@@ -255,6 +256,7 @@ fn pipeline_main(
     let mut heartbeat       = HeartbeatScheduler::new(cfg.publisher.heartbeat_interval_ms);
     let mut driver_material = IntervalScheduler::new(cfg.publisher.driver_material_interval_ms);
     let mut roster_cache    = RosterCache::new();
+    let mut session_lifecycle = SessionLifecycleTracker::new();
     let mut race_session_id = String::from("0");
     let mut sub_session_id: i64 = 0;
     let mut last_session_num: Option<i32> = None;
@@ -354,6 +356,7 @@ fn pipeline_main(
             engine         = NarrativeEngine::new(10);
             lifecycle      = LifecyclePublisher::new(env!("CARGO_PKG_VERSION"));
             roster_cache   = RosterCache::new();
+            session_lifecycle = SessionLifecycleTracker::new();
             pending_events.clear();
             sub_session_id  = 0;
             last_session_num = None;
@@ -370,11 +373,24 @@ fn pipeline_main(
             Ok(true) => {
                 let Some(frame) = reader.read_frame() else { continue };
                 let session_num_changed = last_session_num != Some(frame.session_num);
+                // A session clock running backwards inside what still looks
+                // like the same sub-session usually means iRacing has moved on
+                // and the SessionInfo carrying the new SubSessionID has not been
+                // parsed yet. Re-read it now so nothing below is stamped with
+                // the departed id.
+                let clock_rolled_back = last_session_clock.is_some_and(|(prev_sid, prev_num, prev_t)| {
+                    prev_sid == sub_session_id
+                        && prev_num == frame.session_num
+                        && frame.session_time + SESSION_CLOCK_ROLLBACK_S < prev_t
+                });
 
                 // Refresh roster + session metadata when SessionInfo changes.
                 // Also force a refresh when SessionNum changes so practice/qualify/race
                 // transitions are not missed if the SessionInfoUpdate var is absent.
-                if session_num_changed || roster_cache.needs_update(frame.session_info_update) {
+                if session_num_changed
+                    || clock_rolled_back
+                    || roster_cache.needs_update(frame.session_info_update)
+                {
                     if let Some(yaml) = reader.read_session_info() {
                         session_info_read_failures = 0;
                         // For AI/offline sessions iRacing never assigns a real
@@ -402,27 +418,30 @@ fn pipeline_main(
                                     println!(
                                         "[publisher] session transition {sub_session_id} → {sid} — resetting engine"
                                     );
-                                    let (bye_lap, bye_t) = last_frame
-                                        .as_ref()
-                                        .map(|f| (f.lap, f.session_time))
-                                        .unwrap_or((0, 0.0));
-                                    let goodbye = lifecycle.on_deactivate(bye_lap, bye_t);
-                                    if let Some(lf) = &last_frame {
-                                        let pe = build_event(
-                                            &goodbye,
-                                            lf,
-                                            roster_cache.roster(),
-                                            &race_session_id,
-                                            &rig_id,
-                                            current_session_meta.as_ref(),
-                                            (sub_session_id > 0).then_some(sub_session_id),
-                                        );
-                                        transport.enqueue(pe);
-                                    }
-                                    let _ = transport.flush(
-                                        bye_t as f64,
-                                        last_frame.as_ref().map(|f| f.session_tick).unwrap_or(0),
+                                    // Stamped with the *live* sub-session: a
+                                    // consumer already tracking `sid` drops
+                                    // anything carrying the departed id, and
+                                    // this is the one moment it must not.
+                                    let goodbye = lifecycle.on_session_transition(
+                                        frame.lap,
+                                        frame.session_time,
                                         sub_session_id,
+                                    );
+                                    let pe = build_event(
+                                        &goodbye,
+                                        &frame,
+                                        None,
+                                        &sid.to_string(),
+                                        &rig_id,
+                                        None,
+                                        Some(sid),
+                                    );
+                                    transport.enqueue(pe);
+                                    status.lock().unwrap().events_enqueued_total += 1;
+                                    let _ = transport.flush(
+                                        frame.session_time as f64,
+                                        frame.session_tick,
+                                        sid,
                                     );
                                 }
                                 // Reset session-scoped state.
@@ -430,6 +449,7 @@ fn pipeline_main(
                                 engine        = NarrativeEngine::new(10);
                                 lifecycle     = LifecyclePublisher::new(env!("CARGO_PKG_VERSION"));
                                 roster_cache  = RosterCache::new();
+                                session_lifecycle = SessionLifecycleTracker::new();
                                 pending_events.clear();
                                 driver_material = IntervalScheduler::new(
                                     cfg.publisher.driver_material_interval_ms,
@@ -612,6 +632,31 @@ fn pipeline_main(
                 }
                 last_session_clock = (sub_session_id > 0)
                     .then_some((sub_session_id, frame.session_num, frame.session_time));
+
+                // Session type / phase / imminent-change signal. Runs after the
+                // SessionInfo refresh so the type and sub-session are current.
+                if sub_session_id > 0 {
+                    let session_type = current_session_meta
+                        .as_ref()
+                        .and_then(|m| m.session_type.as_deref());
+                    if let Some(event) = session_lifecycle.update(&frame, session_type) {
+                        log_event(&event, roster_cache.roster(), &frame);
+                        let log_entry = make_log_entry(&event, &frame, roster_cache.roster());
+                        let pe = build_event(
+                            &event,
+                            &frame,
+                            roster_cache.roster(),
+                            &race_session_id,
+                            &rig_id,
+                            current_session_meta.as_ref(),
+                            Some(sub_session_id),
+                        );
+                        transport.enqueue(pe);
+                        let mut s = status.lock().unwrap();
+                        s.events_enqueued_total += 1;
+                        s.push_event_log(log_entry);
+                    }
+                }
 
                 let roster = roster_cache.roster();
                 let events = engine.process_frame(&frame);

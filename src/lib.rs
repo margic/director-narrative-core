@@ -27,6 +27,7 @@ pub mod race_event;
 pub mod regression_store;
 pub mod replay;
 pub mod session_info;
+pub mod session_lifecycle;
 pub mod telemetry_frame;
 pub mod tire_degradation;
 pub mod traffic_intercept;

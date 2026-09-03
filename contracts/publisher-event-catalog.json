@@ -152,6 +152,10 @@
     {
       "scope": "RIG_SCOPED",
       "type": "BROADCAST_CONTROL_REQUESTED"
+    },
+    {
+      "scope": "SESSION_SCOPED",
+      "type": "SESSION_STATE"
     }
   ],
   "schemaVersion": 1,
