@@ -112,9 +112,9 @@ pub fn parse_header(mmap: &[u8]) -> Option<IrsdkHeader> {
     let buf_len             = read_i32_at(mmap, HDR_BUF_LEN);
 
     let mut var_bufs = [VarBuf::default(); 4];
-    for i in 0..4 {
+    for (i, var_buf) in var_bufs.iter_mut().enumerate() {
         let base    = HDR_VAR_BUF_ARRAY + i * VAR_BUF_STRIDE;
-        var_bufs[i] = VarBuf {
+        *var_buf = VarBuf {
             tick_count: read_i32_at(mmap, base),
             buf_offset: read_i32_at(mmap, base + 4),
         };
@@ -161,7 +161,7 @@ pub fn build_var_index(mmap: &[u8], hdr: &IrsdkHeader, wanted: &[&str]) -> Optio
             continue;
         }
 
-        let type_code = read_i32_at(mmap, entry_base) as i32;
+        let type_code = read_i32_at(mmap, entry_base);
         let offset    = read_i32_at(mmap, entry_base + 4) as usize;
         let count     = read_i32_at(mmap, entry_base + 8) as usize;
 

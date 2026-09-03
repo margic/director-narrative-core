@@ -42,7 +42,7 @@ impl CompressionZoneDetector {
                     let best = [p1, p2].into_iter().flatten().min_by(|a, b| a.time_to_intercept_s.partial_cmp(&b.time_to_intercept_s).unwrap());
                     if let Some(prediction) = best.filter(|p| p.time_to_intercept_s < 30.0) {
                         traffic.push(car.car_idx);
-                        if first.map_or(true, |(_, t, _)| prediction.time_to_intercept_s < t) {
+                        if first.is_none_or(|(_, t, _)| prediction.time_to_intercept_s < t) {
                             first = Some((car.car_idx, prediction.time_to_intercept_s, prediction.intercept_bucket));
                         }
                     }

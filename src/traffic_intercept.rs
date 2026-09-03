@@ -56,7 +56,7 @@ impl TrafficInterceptDetector {
                 }
                 let key = (leader.car_idx, traffic.car_idx);
                 let previous_bucket = self.last_bucket.get(&key).copied();
-                if previous_bucket.map_or(false, |prev| (prediction.intercept_bucket as i16 - prev as i16).abs() < 2) {
+                if previous_bucket.is_some_and(|prev| (prediction.intercept_bucket as i16 - prev as i16).abs() < 2) {
                     continue;
                 }
                 self.last_bucket.insert(key, prediction.intercept_bucket);

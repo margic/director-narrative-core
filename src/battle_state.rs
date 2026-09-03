@@ -93,7 +93,7 @@ pub fn classify(
     // ATTACK_SETUP: slope is accelerating (more negative than last lap).
     let state = if threat_slope <= ATTACK_SLOPE_THRESHOLD
         && n_buckets >= MIN_ATTACK_READINGS
-        && prev_slope.map_or(false, |p| threat_slope < p)
+        && prev_slope.is_some_and(|p| threat_slope < p)
     {
         BattleState::AttackSetup
     } else if threat_slope <= PUSH_SLOPE_THRESHOLD && n_buckets >= MIN_PUSH_READINGS {

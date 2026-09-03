@@ -454,7 +454,7 @@ pub fn synthetic_sub_session_id(yaml: &str) -> i64 {
 
 /// Normalise iRacing's empty-string sentinels to `None`.
 fn non_empty(s: Option<String>) -> Option<String> {
-    s.and_then(|v| if v.trim().is_empty() { None } else { Some(v) })
+    s.filter(|v| !v.trim().is_empty())
 }
 
 // ── Roster-only YAML types (existing parser) ──────────────────────────────────

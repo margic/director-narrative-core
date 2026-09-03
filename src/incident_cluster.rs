@@ -1,3 +1,4 @@
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 
 use crate::car_registry::CarRegistry;
@@ -54,10 +55,10 @@ impl IncidentClusterDetector {
         let mut events = Vec::new();
         for (bucket, cars) in slowed_by_bucket {
             if cars.len() >= 3 {
-                if !self.active_clusters.contains_key(&bucket) {
+                if let Entry::Vacant(slot) = self.active_clusters.entry(bucket) {
                     let severity = cars.len() as f32;
                     let primary_car_idx = cars.iter().copied().min();
-                    self.active_clusters.insert(bucket, (lap, cars.clone()));
+                    slot.insert((lap, cars.clone()));
                     events.push(RaceEvent::IncidentCluster {
                         lap,
                         session_time,

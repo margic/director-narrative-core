@@ -54,6 +54,65 @@ pub enum DriverEffort {
     Holding,
 }
 
+/// Where a battle sits in its lifecycle. Every battle event names its phase so
+/// a consumer correlating on `battle_id` can order the story without
+/// consulting the event type.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BattlePhase {
+    Engaged,
+    Closing,
+    Broken,
+}
+
+/// Why a tracked battle ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BattleBreakReason {
+    /// The gap opened past the break threshold and stayed there.
+    GapOpened,
+    /// One of the cars entered pit road.
+    CarPitted,
+    /// One of the cars lost its race position or left the world.
+    CarLeftWorld,
+}
+
+/// Durable identity of one fight between two cars, attached to every battle
+/// event the pair tracker emits and to the legacy player-threat battle events
+/// when the pair is also being tracked.
+///
+/// `battle_id` is stable from `ENGAGED` through `BROKEN`; a pair that breaks
+/// and re-forms gets a new id. Roles are explicit: `ahead_car_idx` leads in
+/// race order, `behind_car_idx` attacks. Roles may swap during a battle (an
+/// overtake) without changing the id. All fields are additive to the wire
+/// contract; a consumer that does not know them keeps parsing the event.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct BattleIdentity {
+    pub battle_id: String,
+    pub battle_phase: BattlePhase,
+    pub ahead_car_idx: u8,
+    pub behind_car_idx: u8,
+    /// Session time at which the pair first qualified as engaged.
+    pub engaged_at: f32,
+    /// Seconds since `engaged_at`, at the time of this event.
+    pub battle_age_s: f32,
+    /// Gap between the two cars in seconds; `None` when the gap is unknown
+    /// (one car no longer visible).
+    pub current_gap_s: Option<f32>,
+    /// Rate the behind car is closing, in seconds per lap. Positive means
+    /// closing; negative means the gap is opening. `None` until enough
+    /// history has accumulated.
+    pub closing_rate_s_per_lap: Option<f32>,
+    /// 0–1 confidence in the classification: grows with the number of
+    /// samples seen and is discounted while no lap time is known to scale
+    /// track-distance gaps into seconds.
+    pub battle_confidence: f32,
+    /// `true` when one side of the battle is the publishing rig's own car.
+    pub battle_involves_publisher: bool,
+    /// Set on `BROKEN` only.
+    pub battle_break_reason: Option<BattleBreakReason>,
+}
+
 /// Classification of a yellow flag's scope relative to the player.
 #[derive(Debug, Serialize)]
 pub enum FlagScope {
@@ -81,6 +140,8 @@ pub enum RaceEvent {
         prior_skirmishes:                  u32,
         prior_attack_time_s:               f32,
         engagement_started_at_session_time_s: f32,
+        #[serde(flatten)]
+        battle: Option<BattleIdentity>,
     },
     BattleBroken {
         lap:                               u8,
@@ -90,6 +151,8 @@ pub enum RaceEvent {
         final_gap_sec:                     Option<f32>,
         car_race_position:                 u8,
         engagement_started_at_session_time_s: f32,
+        #[serde(flatten)]
+        battle: Option<BattleIdentity>,
     },
     BattleClosing {
         lap:                      u8,
@@ -101,6 +164,8 @@ pub enum RaceEvent {
         slope_info:               SlopeInfo,
         prior_skirmishes:         u32,
         prior_attack_time_s:      f32,
+        #[serde(flatten)]
+        battle: Option<BattleIdentity>,
     },
     HorizonClosing {
         lap:                       u8,
