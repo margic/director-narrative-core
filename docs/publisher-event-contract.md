@@ -17,7 +17,9 @@ was removed or repurposed.
 | --- | --- |
 | `id` | UUID v4, generated per built event. |
 | `eventKey` | `v2-<subSessionId>-<sessionTick>-<TYPE>-<sequence>`. Stable idempotency key, unique even for a burst published on one tick. |
-| `sequence` | Monotonic per-process counter; orders events sharing a tick. |
+| `sequence` | Monotonic per-process counter; orders events sharing a tick. Strictly increasing within one `publisherRunId`; a gap is a lost or reordered event, a reset to a low value with a new `publisherRunId` is a publisher restart. |
+| `emittedAt` | Same instant as `timestamp`, rendered RFC 3339 UTC with millisecond precision (`2026-09-02T23:28:39.745Z`). Compare against an ISO `receivedAt` to measure delivery lag. Additive. |
+| `publisherRunId` | UUID minted once per publisher process. Additive. |
 | `contractVersion` | Payload contract revision (currently `2`). |
 | `raceSessionId`, `rigId`, `type`, `timestamp`, `sessionTime`, `sessionTick`, `scope` | Unchanged from version 1. |
 | `publisher` | Identity of the rig that sent the event (§2). |
@@ -185,3 +187,50 @@ today's payload unchanged):
 Lifecycle: one `ENGAGED` after five consecutive close frames, `CLOSING`
 updates rate-limited to one per 10 s while the behind car is measurably
 closing, and exactly one `BROKEN` per `battleId`.
+
+## 8. Session lifecycle and sub-session stamping
+
+Additive; no existing field or type changed.
+
+### `SESSION_STATE` (new, session-scoped)
+
+Which session this is and what phase it is in, emitted once on connect
+(`synthetic: true`), on every iRacing `SessionNum` or `SessionState` change,
+when the `SessionType` string first resolves, and once when the session clock
+enters its final minute.
+
+| Field | Meaning |
+| --- | --- |
+| `sessionNum`, `previousSessionNum` | iRacing `SessionNum`. |
+| `sessionType` | Raw `SessionInfo` `SessionType` (`Practice`, `Lone Qualify`, `Open Qualify`, `Race`, ...); `null` until parsed. |
+| `sessionKind` | `PRACTICE`, `QUALIFYING`, `RACE` or `UNKNOWN`, classified from `sessionType`. |
+| `sessionState`, `sessionStateName`, `previousSessionState` | iRacing `SessionState` raw value and name (`INVALID`, `GET_IN_CAR`, `WARMUP`, `PARADE_LAPS`, `RACING`, `CHECKERED`, `COOL_DOWN`). |
+| `phase`, `previousPhase` | Broadcast phase derived from kind x state: `PENDING`, `PRACTICE_OPEN`, `QUALIFYING_HOTLAPS`, `QUALIFYING_CLOSED`, `RACE_GRIDDING`, `RACE_FORMATION`, `RACE_GREEN`, `RACE_CHECKERED`, `COOL_DOWN`. |
+| `reason` | `CONNECT_SNAPSHOT`, `SESSION_NUM_CHANGED`, `SESSION_STATE_CHANGED`, `SESSION_TYPE_RESOLVED`, `SESSION_ENDING`. |
+| `synthetic` | `true` for the connect snapshot only. |
+| `sessionTimeRemainS` | iRacing `SessionTimeRemain`; `null` when absent or untimed. |
+| `sessionLapsRemain` | iRacing `SessionLapsRemainEx`; `null` when absent or unlimited. |
+| `sessionChangeImminent` | `true` when the state is `CHECKERED`/`COOL_DOWN` or the clock is inside the final 60 s. |
+
+iRacing exposes no explicit "next session begins in N seconds" variable; the
+imminent-change signal is derived from the state machine and the session
+clock, and is the closest the SDK provides. Qualifying hotlap start/end for
+the rig's own car is already carried by `PIT_EXIT` / `LAP_COMPLETED` /
+`PIT_ENTRY`; read them under `phase == QUALIFYING_HOTLAPS`.
+
+### `PUBLISHER_GOODBYE` additions
+
+| Field | Meaning |
+| --- | --- |
+| `reason` | `shutdown` or `session_transition`. |
+| `previousSubSessionId` | The sub-session the publisher is leaving; only set for `session_transition`. |
+
+### Sub-session stamping rule
+
+Every event built after iRacing advances to a new sub-session carries the
+*live* `subSessionId` in `raceSessionId`, `eventKey` and `context`. This
+includes the transition `PUBLISHER_GOODBYE` and `SESSION_RESET`: the departed
+id lives in their payload (`previousSubSessionId`), never in the envelope. A
+session clock running backwards forces an immediate `SessionInfo` re-read so
+the `session_clock_restarted` reset cannot be stamped with an id that has
+already been superseded.

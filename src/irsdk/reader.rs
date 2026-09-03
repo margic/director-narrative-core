@@ -61,6 +61,12 @@ pub fn read_bool_array(buf: &[u8], offset: usize, count: usize) -> Vec<bool> {
 
 // ── Variable names we require ────────────────────────────────────────────
 
+/// `SessionTimeRemain` value iRacing reports for a session with no time
+/// limit (one week). Anything at or above it is treated as untimed.
+pub const UNTIMED_SESSION_REMAIN_S: f64 = 604_800.0;
+/// `SessionLapsRemainEx` sentinel for a session with no lap limit.
+pub const UNLIMITED_SESSION_LAPS: i32 = 32_767;
+
 /// All iRacing variable names the engine needs. Passed to `build_var_index`.
 pub const REQUIRED_VARS: &[&str] = &[
     "SessionTime",
@@ -79,6 +85,9 @@ pub const REQUIRED_VARS: &[&str] = &[
     "SessionTick",
     "SessionState",
     "SessionNum",
+    // Optional — session clock/lap budget; absent on some builds, `None` then.
+    "SessionTimeRemain",
+    "SessionLapsRemainEx",
     "PlayerCarMyIncidentCount",
     // Optional — absent in some sessions; defaults to empty vec.
     "CarIdxTrackSurface",
@@ -175,6 +184,20 @@ pub fn build_frame(buf: &[u8], vars: &VarIndex, header_session_info_update: u32)
         .map(|v| read_i32(buf, v.offset))
         .unwrap_or(0);
 
+    // iRacing reports one week (604800 s) when a session has no time limit
+    // and a large sentinel (32767) when it has no lap limit.
+    let session_time_remain = vars
+        .get("SessionTimeRemain")
+        .filter(|v| v.type_code == IR_DOUBLE)
+        .map(|v| read_f64(buf, v.offset))
+        .filter(|&s| (0.0..UNTIMED_SESSION_REMAIN_S).contains(&s));
+
+    let session_laps_remain = vars
+        .get("SessionLapsRemainEx")
+        .filter(|v| v.type_code == IR_INT)
+        .map(|v| read_i32(buf, v.offset))
+        .filter(|&l| (0..UNLIMITED_SESSION_LAPS).contains(&l));
+
     let player_incident_count = vars
         .get("PlayerCarMyIncidentCount")
         .map(|v| read_i32(buf, v.offset))
@@ -221,6 +244,8 @@ pub fn build_frame(buf: &[u8], vars: &VarIndex, header_session_info_update: u32)
         session_tick,
         session_state,
         session_num,
+        session_time_remain,
+        session_laps_remain,
         player_incident_count,
         car_idx_lap_completed,
         lf_temp_m,

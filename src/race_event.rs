@@ -35,6 +35,137 @@ impl LifecycleOrigin {
     }
 }
 
+/// Broad category of an iRacing session, derived from the `SessionType`
+/// string in `SessionInfo` (`Practice`, `Lone Qualify`, `Open Qualify`,
+/// `Race`, `Warmup`, ...).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SessionKind {
+    Practice,
+    Qualifying,
+    Race,
+    /// `SessionType` unavailable or not recognised.
+    Unknown,
+}
+
+impl SessionKind {
+    /// Classify an iRacing `SessionType` string. Matching is case-insensitive
+    /// and by keyword, so `Lone Qualify`, `Open Qualify` and `Qualifying` all
+    /// map to [`SessionKind::Qualifying`].
+    pub fn from_session_type(session_type: Option<&str>) -> Self {
+        let Some(raw) = session_type else { return Self::Unknown };
+        let lower = raw.to_ascii_lowercase();
+        if lower.contains("qual") {
+            Self::Qualifying
+        } else if lower.contains("race") {
+            Self::Race
+        } else if lower.contains("practice") || lower.contains("warmup") || lower.contains("testing") {
+            Self::Practice
+        } else {
+            Self::Unknown
+        }
+    }
+}
+
+/// Named form of the iRacing `SessionState` telemetry enum.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SessionStateName {
+    Invalid,
+    GetInCar,
+    Warmup,
+    ParadeLaps,
+    Racing,
+    Checkered,
+    CoolDown,
+    /// A value outside the documented 0..=6 range.
+    Unknown,
+}
+
+impl SessionStateName {
+    pub fn from_raw(state: i32) -> Self {
+        match state {
+            0 => Self::Invalid,
+            1 => Self::GetInCar,
+            2 => Self::Warmup,
+            3 => Self::ParadeLaps,
+            4 => Self::Racing,
+            5 => Self::Checkered,
+            6 => Self::CoolDown,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// Broadcast-facing phase of the session: what the director should be
+/// covering right now, derived from [`SessionKind`] × [`SessionStateName`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SessionPhase {
+    /// Session exists but cars are not yet on track (`GetInCar`/`Warmup`
+    /// outside a race, or an `Invalid` state).
+    Pending,
+    /// Practice is open and cars may lap.
+    PracticeOpen,
+    /// Qualifying is open: cover hotlaps.
+    QualifyingHotlaps,
+    /// Qualifying has gone checkered; last laps in progress, no new runs.
+    QualifyingClosed,
+    /// Race session, cars gridding (`GetInCar`/`Warmup`).
+    RaceGridding,
+    /// Race session on the formation / pace lap (`ParadeLaps`) — green is
+    /// imminent.
+    RaceFormation,
+    /// Race under way.
+    RaceGreen,
+    /// Race checkered flag shown.
+    RaceCheckered,
+    /// Session over, cool-down; the next session (if any) follows.
+    CoolDown,
+}
+
+impl SessionPhase {
+    pub fn derive(kind: SessionKind, state: SessionStateName) -> Self {
+        use SessionStateName as S;
+        match (kind, state) {
+            (_, S::Invalid | S::Unknown) => Self::Pending,
+            (_, S::CoolDown) => Self::CoolDown,
+            (SessionKind::Race, S::GetInCar | S::Warmup) => Self::RaceGridding,
+            (SessionKind::Race, S::ParadeLaps) => Self::RaceFormation,
+            (SessionKind::Race, S::Racing) => Self::RaceGreen,
+            (SessionKind::Race, S::Checkered) => Self::RaceCheckered,
+            (SessionKind::Qualifying, S::Racing | S::ParadeLaps) => Self::QualifyingHotlaps,
+            (SessionKind::Qualifying, S::Checkered) => Self::QualifyingClosed,
+            (SessionKind::Practice, S::Racing | S::ParadeLaps) => Self::PracticeOpen,
+            (SessionKind::Practice, S::Checkered) => Self::CoolDown,
+            // Unknown session type: fall back to the race vocabulary, which is
+            // the one a consumer most needs to act on.
+            (SessionKind::Unknown, S::ParadeLaps) => Self::RaceFormation,
+            (SessionKind::Unknown, S::Racing) => Self::RaceGreen,
+            (SessionKind::Unknown, S::Checkered) => Self::RaceCheckered,
+            (_, S::GetInCar | S::Warmup) => Self::Pending,
+        }
+    }
+}
+
+/// Why a `SESSION_STATE` event was emitted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SessionStateReason {
+    /// First sample the publisher took — describes inherited state.
+    ConnectSnapshot,
+    /// iRacing `SessionNum` advanced (practice → qualify → race).
+    SessionNumChanged,
+    /// iRacing `SessionState` changed inside one session.
+    SessionStateChanged,
+    /// `SessionType` became known (or changed) after the state was already
+    /// reported — the phase may have been re-derived.
+    SessionTypeResolved,
+    /// `SessionTimeRemain` crossed the imminent-change threshold; the
+    /// session is about to end and the next one to begin.
+    SessionEnding,
+}
+
 /// Direction a gap to a neighbouring car is moving over one cadence window.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -429,6 +560,11 @@ pub enum RaceEvent {
     PublisherGoodbye {
         lap:          u8,
         session_time: f32,
+        /// Machine-readable cause: `shutdown` or `session_transition`.
+        reason:       String,
+        /// Sub-session the publisher is leaving, when the goodbye announces
+        /// a transition. The envelope's `subSessionId` is always the live one.
+        previous_sub_session_id: Option<i64>,
     },
     PublisherHeartbeat {
         lap:                   u8,
@@ -516,6 +652,37 @@ pub enum RaceEvent {
         /// `session_clock_restarted`.
         reason:                  String,
     },
+    /// Session lifecycle beyond the flags: which session this is, what phase
+    /// it is in, and whether a change is imminent. Emitted on connect, on
+    /// every `SessionNum`/`SessionState` change, and once when the session
+    /// clock runs into its final stretch.
+    SessionState {
+        lap:                    u8,
+        session_time:           f32,
+        session_num:            i32,
+        previous_session_num:   Option<i32>,
+        /// Raw `SessionType` from `SessionInfo`, e.g. `Lone Qualify`.
+        session_type:           Option<String>,
+        session_kind:           SessionKind,
+        /// Raw iRacing `SessionState` value.
+        session_state:          i32,
+        session_state_name:     SessionStateName,
+        previous_session_state: Option<i32>,
+        phase:                  SessionPhase,
+        previous_phase:         Option<SessionPhase>,
+        reason:                 SessionStateReason,
+        /// `true` when this describes state the publisher inherited on
+        /// connect rather than a transition it observed.
+        synthetic:              bool,
+        /// iRacing `SessionTimeRemain`, seconds. `None` when the variable is
+        /// absent or the session is untimed.
+        session_time_remain_s:  Option<f64>,
+        /// iRacing `SessionLapsRemainEx`. `None` when absent or unlimited.
+        session_laps_remain:    Option<i32>,
+        /// The session is ending: checkered/cool-down, or the clock is inside
+        /// the imminent-change window.
+        session_change_imminent: bool,
+    },
     /// Driver pressed their bound pause/resume button. Rig-scoped: it acts on
     /// the broadcast agent, not on a car.
     BroadcastControlRequested {
@@ -587,6 +754,7 @@ pub enum RaceEventKind {
     DriverMaterial,
     SessionReset,
     BroadcastControlRequested,
+    SessionState,
 }
 
 impl RaceEventKind {
@@ -605,7 +773,8 @@ impl RaceEventKind {
             Self::RaceGreen
             | Self::RaceCheckered
             | Self::FlagYellowFullCourse
-            | Self::SessionReset => EventScope::SessionScoped,
+            | Self::SessionReset
+            | Self::SessionState => EventScope::SessionScoped,
             Self::PublisherHello
             | Self::PublisherGoodbye
             | Self::PublisherHeartbeat
@@ -684,11 +853,43 @@ impl RaceEvent {
             Self::FocusMeRequested { .. } => RaceEventKind::FocusMeRequested,
             Self::DriverMaterial { .. } => RaceEventKind::DriverMaterial,
             Self::SessionReset { .. } => RaceEventKind::SessionReset,
+            Self::SessionState { .. } => RaceEventKind::SessionState,
             Self::BroadcastControlRequested { .. } => RaceEventKind::BroadcastControlRequested,
         }
     }
 
     pub fn event_scope(&self) -> EventScope {
         self.kind().scope()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_kind_classifies_iracing_session_type_strings() {
+        assert_eq!(SessionKind::from_session_type(Some("Practice")), SessionKind::Practice);
+        assert_eq!(SessionKind::from_session_type(Some("Warmup")), SessionKind::Practice);
+        assert_eq!(SessionKind::from_session_type(Some("Lone Qualify")), SessionKind::Qualifying);
+        assert_eq!(SessionKind::from_session_type(Some("Open Qualify")), SessionKind::Qualifying);
+        assert_eq!(SessionKind::from_session_type(Some("Race")), SessionKind::Race);
+        assert_eq!(SessionKind::from_session_type(Some("Heat Race")), SessionKind::Race);
+        assert_eq!(SessionKind::from_session_type(None), SessionKind::Unknown);
+        assert_eq!(SessionKind::from_session_type(Some("")), SessionKind::Unknown);
+    }
+
+    #[test]
+    fn session_phase_uses_the_kind_to_read_the_state() {
+        use SessionStateName as S;
+        assert_eq!(SessionPhase::derive(SessionKind::Race, S::GetInCar), SessionPhase::RaceGridding);
+        assert_eq!(SessionPhase::derive(SessionKind::Race, S::ParadeLaps), SessionPhase::RaceFormation);
+        assert_eq!(SessionPhase::derive(SessionKind::Qualifying, S::Racing), SessionPhase::QualifyingHotlaps);
+        assert_eq!(SessionPhase::derive(SessionKind::Qualifying, S::Checkered), SessionPhase::QualifyingClosed);
+        assert_eq!(SessionPhase::derive(SessionKind::Practice, S::Racing), SessionPhase::PracticeOpen);
+        assert_eq!(SessionPhase::derive(SessionKind::Practice, S::GetInCar), SessionPhase::Pending);
+        assert_eq!(SessionPhase::derive(SessionKind::Unknown, S::Racing), SessionPhase::RaceGreen);
+        assert_eq!(SessionPhase::derive(SessionKind::Race, S::CoolDown), SessionPhase::CoolDown);
+        assert_eq!(SessionPhase::derive(SessionKind::Race, S::Unknown), SessionPhase::Pending);
     }
 }
