@@ -149,3 +149,39 @@ Material is suppressed while the car is on pit road (including the box) or not
 in the world (`CarIdxTrackSurface < 0`), and the trend baseline is dropped at
 that point so a stop never produces a fabricated trend. It is emitted
 regardless of proximity to other cars.
+
+## 7. Battle identity (third-party pairs)
+
+Additive, same contract version (v2). `BATTLE_ENGAGED`, `BATTLE_CLOSING` and
+`BATTLE_BROKEN` are now emitted for **every close pair near the publishing
+rig** (any two cars within `SCAN_FIELD_POSITIONS` race positions of the rig,
+including pairs the rig is not part of), not only for the rig's own threat.
+The legacy player-threat path is unchanged and remains the sole source of
+events for pairs the rig is part of; when the pair tracker also holds that
+pair, those events carry the identity fields below so a consumer sees one
+`battleId` per fight, never two events for the same pair.
+
+Existing fields keep their names. For a pair the rig is not part of,
+`player_car_idx` carries the **behind** car and `opponent_car_idx` the
+**ahead** car, so `leaderCar`/`followerCar`, `attacker*`/`defender*` and the
+`car` envelope derive exactly as before. Use `publisherCarIdx` for the rig.
+
+Identity fields (absent when no pair is tracked, so an older consumer sees
+today's payload unchanged):
+
+| Field | Meaning |
+| --- | --- |
+| `battleId` | Stable for the life of one engagement; a new id is minted if the fight breaks and re-forms. |
+| `battlePhase` | `ENGAGED`, `CLOSING` or `BROKEN` — the lifecycle position of this event. |
+| `aheadCarIdx` / `behindCarIdx` | Explicit roles, re-evaluated each frame; an overtake swaps them without changing `battleId`. |
+| `engagedAt` | Session time the pair engaged. |
+| `battleAgeS` | Seconds since `engagedAt`. |
+| `currentGapS` | Latest gap between the two cars in seconds; null once the pair is no longer observable. |
+| `closingRateSPerLap` | Positive = the behind car is closing, seconds per lap over a ~20 s window; null until enough samples exist. |
+| `battleConfidence` | `0.0`–`1.0`; grows with samples, discounted while the lap time is only an estimate. |
+| `battleInvolvesPublisher` | `true` when the rig is one of the two cars. |
+| `battleBreakReason` | `BROKEN` only: `GAP_OPENED`, `CAR_PITTED` or `CAR_LEFT_WORLD`. |
+
+Lifecycle: one `ENGAGED` after five consecutive close frames, `CLOSING`
+updates rate-limited to one per 10 s while the behind car is measurably
+closing, and exactly one `BROKEN` per `battleId`.

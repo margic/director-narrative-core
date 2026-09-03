@@ -709,12 +709,12 @@ fn enrich_payload(
             // Resolve all involved cars to a CarRef array
             let involved_cars: Vec<Value> = car_idxs
                 .iter()
-                .map(|&idx| serde_json::to_value(&resolve_car(idx, roster)).unwrap_or(Value::Null))
+                .map(|&idx| serde_json::to_value(resolve_car(idx, roster)).unwrap_or(Value::Null))
                 .collect();
             obj.insert("involvedCars".to_owned(), Value::Array(involved_cars));
 
             // Resolve primary car (most-culpable)
-            let primary = primary_car_idx.map(|idx| serde_json::to_value(&resolve_car(idx, roster)).unwrap_or(Value::Null)).unwrap_or(Value::Null);
+            let primary = primary_car_idx.map(|idx| serde_json::to_value(resolve_car(idx, roster)).unwrap_or(Value::Null)).unwrap_or(Value::Null);
             obj.insert("primaryCar".to_owned(), primary);
 
             // Incident classification
@@ -929,6 +929,7 @@ mod tests {
             },
             prior_skirmishes: 0,
             prior_attack_time_s: 0.0,
+            battle: None,
         };
 
         let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001", None, None);
@@ -1012,6 +1013,7 @@ mod tests {
             prior_skirmishes: 0,
             prior_attack_time_s: 0.0,
             engagement_started_at_session_time_s: 12.0,
+            battle: None,
         };
 
         let env = build_event(&event, &minimal_frame(), None, "s", "r", None, None);
@@ -1041,6 +1043,7 @@ mod tests {
             },
             prior_skirmishes: 0,
             prior_attack_time_s: 0.0,
+            battle: None,
         };
         let broken = RaceEvent::BattleBroken {
             lap: 5,
@@ -1050,6 +1053,7 @@ mod tests {
             final_gap_sec: Some(2.1),
             car_race_position: 3,
             engagement_started_at_session_time_s: 1234.5,
+            battle: None,
         };
 
         for event in [closing, broken] {
@@ -1074,6 +1078,7 @@ mod tests {
             prior_skirmishes: 0,
             prior_attack_time_s: 0.0,
             engagement_started_at_session_time_s: 12.0,
+            battle: None,
         };
 
         let env = build_event(&event, &minimal_frame(), None, "s", "r", None, None);

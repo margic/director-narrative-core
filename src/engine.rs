@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::battle_pairs::{BattlePairTracker, FrameContext, PairTransition};
 use crate::battle_state::{
-    classify, BattleState, CLOSE_APPROACH_MIN_FRAMES, CLOSE_APPROACH_THRESH_S,
+    classify, BattleState, SlopeInfo, CLOSE_APPROACH_MIN_FRAMES, CLOSE_APPROACH_THRESH_S,
     MIN_PUSH_READINGS, SCAN_FIELD_POSITIONS,
 };
 use crate::braking_profile::BrakingProfileDetector;
@@ -15,7 +16,9 @@ use crate::incident_cluster::IncidentClusterDetector;
 use crate::lap_timer::LapTimer;
 use crate::lift_coast::LiftCoastDetector;
 use crate::micro_sector::MicroSectorTracker;
-use crate::race_event::{DriverEffort, FlagScope, GapTrend, LifecycleOrigin, RaceEvent};
+use crate::race_event::{
+    BattleIdentity, BattlePhase, DriverEffort, FlagScope, GapTrend, LifecycleOrigin, RaceEvent,
+};
 use crate::regression_store::RegressionStore;
 use crate::session_info::SessionRoster;
 use crate::telemetry_frame::TelemetryFrame;
@@ -48,6 +51,8 @@ const MAX_VALID_GAP_S: f32 = 100.0;
 pub struct NarrativeEngine {
     anchor_count: usize,
     lap_timer: LapTimer,
+    /// Field-wide pair tracker: every fight near the rig, not only the rig's.
+    battle_pairs: BattlePairTracker,
     sampler: AnchorSampler,
     sampler_behind: AnchorSampler,
     regression: RegressionStore,
@@ -110,6 +115,7 @@ impl NarrativeEngine {
         Self {
             anchor_count,
             lap_timer: LapTimer::new(),
+            battle_pairs: BattlePairTracker::new(),
             sampler: AnchorSampler::new(anchor_count),
             sampler_behind: AnchorSampler::new(anchor_count),
             regression: RegressionStore::new(),
@@ -402,6 +408,20 @@ impl NarrativeEngine {
             events.push(RaceEvent::PitExit { lap, session_time: t, player_car_idx: frame.player_car_idx, position: pos });
         }
 
+        // Third-party battles are tracked whatever the rig's own car is doing:
+        // the field keeps racing while the rig sits in the pit stall. Pairs the
+        // rig is part of are reported by the player-threat path below (stamped
+        // with the same identity), so they are not emitted twice.
+        {
+            let lap_t = self.lap_timer.best_estimate();
+            let lap_time_known = self.lap_timer.has_completed_lap();
+            for transition in self.battle_pairs.update(frame, lap_t, lap_time_known) {
+                if !transition.identity().battle_involves_publisher {
+                    events.push(self.pair_transition_event(transition, frame));
+                }
+            }
+        }
+
         if pos == 0 || lap < 1 {
             self.prev_lap = Some(lap);
             self.prev_on_pit = on_pit;
@@ -410,6 +430,7 @@ impl NarrativeEngine {
 
         self.lap_timer.update(lap, t);
         let lap_t = self.lap_timer.best_estimate();
+        let lap_time_known = self.lap_timer.has_completed_lap();
 
         let synth_flags = synthesize_flags(lap, ldp);
         let is_clean = (synth_flags & (YELLOW_WAVE | CAUTION)) == 0 && !on_pit;
@@ -458,6 +479,13 @@ impl NarrativeEngine {
                         prior_skirmishes,
                         prior_attack_time_s,
                         engagement_started_at_session_time_s: t,
+                        battle: self.player_battle_identity(
+                            frame,
+                            car_idx,
+                            BattlePhase::Engaged,
+                            lap_t,
+                            lap_time_known,
+                        ),
                     });
                 }
             }
@@ -478,6 +506,13 @@ impl NarrativeEngine {
                                 final_gap_sec,
                                 car_race_position,
                                 engagement_started_at_session_time_s,
+                                battle: self.player_battle_identity(
+                                    frame,
+                                    prev_car,
+                                    BattlePhase::Broken,
+                                    lap_t,
+                                    lap_time_known,
+                                ),
                             });
                         }
                     }
@@ -510,6 +545,13 @@ impl NarrativeEngine {
                         prior_skirmishes,
                         prior_attack_time_s,
                         engagement_started_at_session_time_s: t,
+                        battle: self.player_battle_identity(
+                            frame,
+                            car_idx,
+                            BattlePhase::Engaged,
+                            lap_t,
+                            lap_time_known,
+                        ),
                     });
                 }
             }
@@ -530,6 +572,13 @@ impl NarrativeEngine {
                                 final_gap_sec,
                                 car_race_position,
                                 engagement_started_at_session_time_s,
+                                battle: self.player_battle_identity(
+                                    frame,
+                                    prev_car,
+                                    BattlePhase::Broken,
+                                    lap_t,
+                                    lap_time_known,
+                                ),
                             });
                         }
                     }
@@ -617,10 +666,17 @@ impl NarrativeEngine {
                                 slope_info: si,
                                 prior_skirmishes,
                                 prior_attack_time_s,
+                                battle: self.player_battle_identity(
+                                    frame,
+                                    car_idx,
+                                    BattlePhase::Closing,
+                                    lap_t,
+                                    lap_time_known,
+                                ),
                             });
                         }
                     }
-                    self.engine_state = fwd.state.clone();
+                    self.engine_state = fwd.state;
                 }
                 if let Some(si) = &fwd.slope_info {
                     self.prev_slope = Some(si.median_slope);
@@ -659,10 +715,17 @@ impl NarrativeEngine {
                                 slope_info: si,
                                 prior_skirmishes,
                                 prior_attack_time_s,
+                                battle: self.player_battle_identity(
+                                    frame,
+                                    car_idx,
+                                    BattlePhase::Closing,
+                                    lap_t,
+                                    lap_time_known,
+                                ),
                             });
                         }
                     }
-                    self.defensive_state = def.state.clone();
+                    self.defensive_state = def.state;
                 }
                 if let Some(si) = &def.slope_info {
                     self.prev_slope_beh = Some(si.median_slope);
@@ -676,7 +739,7 @@ impl NarrativeEngine {
                         done_lap,
                     );
                     if let Some(history) = self.car_registry.find_opponent_history_mut(frame.player_car_idx, car_idx) {
-                        history.last_state_defensive = def.state.clone();
+                        history.last_state_defensive = def.state;
                     }
                 }
 
@@ -770,6 +833,96 @@ impl NarrativeEngine {
         self.prev_on_pit = on_pit;
         self.prev_position = Some(pos);
         events
+    }
+
+    /// Identity of the pair tracker's battle between the rig and `opponent`,
+    /// so the legacy player-threat events correlate with the pair events.
+    fn player_battle_identity(
+        &self,
+        frame: &TelemetryFrame,
+        opponent: u8,
+        phase: BattlePhase,
+        lap_t: f32,
+        lap_time_known: bool,
+    ) -> Option<BattleIdentity> {
+        self.battle_pairs.identity_for(
+            frame.player_car_idx,
+            opponent,
+            phase,
+            FrameContext::new(frame, lap_t, lap_time_known),
+        )
+    }
+
+    /// Express a pair-tracker transition as a battle event. The legacy
+    /// `player_car_idx` / `opponent_car_idx` slots carry the behind (attacking)
+    /// and ahead (defending) cars so an older consumer still derives
+    /// leader/follower correctly; `lap` is the rig's lap, as on every event.
+    fn pair_transition_event(
+        &self,
+        transition: PairTransition,
+        frame: &TelemetryFrame,
+    ) -> RaceEvent {
+        let lap = frame.lap;
+        let t = frame.session_time;
+        let id = transition.identity().clone();
+        let (behind, ahead) = (id.behind_car_idx, id.ahead_car_idx);
+        let car_race_position = frame
+            .car_idx_position
+            .get(ahead as usize)
+            .copied()
+            .unwrap_or(0);
+        let (prior_skirmishes, prior_attack_time_s) = self.opponent_history(behind, ahead);
+        match transition {
+            PairTransition::Engaged(_) => RaceEvent::BattleEngaged {
+                lap,
+                session_time: t,
+                player_car_idx: behind,
+                opponent_car_idx: ahead,
+                gap_s: id.current_gap_s.unwrap_or(f32::NAN),
+                car_race_position,
+                prior_skirmishes,
+                prior_attack_time_s,
+                engagement_started_at_session_time_s: id.engaged_at,
+                battle: Some(id),
+            },
+            PairTransition::Closing(_) => {
+                let rate = id.closing_rate_s_per_lap.unwrap_or(0.0);
+                let behind_ldp = frame
+                    .car_idx_lap_dist_pct
+                    .get(behind as usize)
+                    .copied()
+                    .unwrap_or(0.0)
+                    .max(0.0);
+                let samples = self.battle_pairs.sample_count(behind, ahead) as usize;
+                RaceEvent::BattleClosing {
+                    lap,
+                    session_time: t,
+                    player_car_idx: behind,
+                    opponent_car_idx: ahead,
+                    car_race_position,
+                    closing_rate_sec_per_lap: rate.abs(),
+                    slope_info: SlopeInfo {
+                        median_slope: -rate,
+                        anchors_qualifying: samples,
+                        anchors_agreeing: samples,
+                        hotspot_lap_dist_pct: behind_ldp,
+                    },
+                    prior_skirmishes,
+                    prior_attack_time_s,
+                    battle: Some(id),
+                }
+            }
+            PairTransition::Broken(_) => RaceEvent::BattleBroken {
+                lap,
+                session_time: t,
+                player_car_idx: behind,
+                opponent_car_idx: ahead,
+                final_gap_sec: id.current_gap_s.and_then(sanitize_gap),
+                car_race_position,
+                engagement_started_at_session_time_s: id.engaged_at,
+                battle: Some(id),
+            },
+        }
     }
 
     fn opponent_history(&self, player_idx: u8, opponent_idx: u8) -> (u32, f32) {
@@ -951,6 +1104,113 @@ mod tests {
         assert!(all_events.iter().any(|e| matches!(e, RaceEvent::BattleEngaged { opponent_car_idx: 1, .. })));
         let evs = engine.process_frame(&frame_no_opponent(1, 6.0));
         assert!(evs.iter().any(|e| matches!(e, RaceEvent::BattleBroken { opponent_car_idx: 1, .. })));
+    }
+
+    /// Rig (car 0) at P5; cars 2 (P6) and 3 (P7) fight behind it with `gap`
+    /// (in lap fraction) between them.
+    fn frame_third_party(lap: u8, t: f32, gap: f32) -> TelemetryFrame {
+        let mut f = frame_with_gap(lap, t, 4, -1.0);
+        f.car_idx_position = vec![5, 0, 6, 7];
+        f.car_idx_lap_dist_pct = vec![0.500, -1.0, 0.300, 0.300 - gap];
+        f.car_idx_on_pit_road = vec![false; 4];
+        f.car_idx_track_surface = vec![0; 4];
+        f.car_idx_lap_completed = vec![lap as i32; 4];
+        f
+    }
+
+    #[test]
+    fn third_party_battle_is_emitted_with_identity_and_correlated_lifecycle() {
+        let mut engine = NarrativeEngine::new(10);
+        let mut all_events = Vec::new();
+        for i in 0..6u32 {
+            all_events.extend(engine.process_frame(&frame_third_party(1, i as f32 / 60.0, 0.001)));
+        }
+        let engaged: Vec<_> = all_events
+            .iter()
+            .filter(|e| matches!(e, RaceEvent::BattleEngaged { .. }))
+            .collect();
+        assert_eq!(engaged.len(), 1, "{all_events:?}");
+        let RaceEvent::BattleEngaged {
+            player_car_idx,
+            opponent_car_idx,
+            battle: Some(id),
+            ..
+        } = engaged[0]
+        else {
+            panic!("expected BATTLE_ENGAGED with identity");
+        };
+        // Legacy slots carry behind/ahead so leader/follower still derive.
+        assert_eq!((*player_car_idx, *opponent_car_idx), (3, 2));
+        assert_eq!((id.ahead_car_idx, id.behind_car_idx), (2, 3));
+        assert_eq!(id.battle_phase, BattlePhase::Engaged);
+        assert!(!id.battle_involves_publisher);
+        let battle_id = id.battle_id.clone();
+
+        // The fight breaks: BROKEN carries the same id.
+        let mut broken = None;
+        for i in 0..40u32 {
+            for e in engine.process_frame(&frame_third_party(1, 1.0 + i as f32 / 60.0, 0.01)) {
+                if matches!(e, RaceEvent::BattleBroken { .. }) {
+                    broken = Some(e);
+                }
+            }
+        }
+        let Some(RaceEvent::BattleBroken {
+            battle: Some(id),
+            player_car_idx: 3,
+            opponent_car_idx: 2,
+            ..
+        }) = broken
+        else {
+            panic!("expected BATTLE_BROKEN with identity: {broken:?}");
+        };
+        assert_eq!(id.battle_id, battle_id);
+        assert_eq!(id.battle_phase, BattlePhase::Broken);
+    }
+
+    #[test]
+    fn third_party_battles_are_tracked_while_the_rig_is_in_the_pit_stall() {
+        let mut engine = NarrativeEngine::new(10);
+        let mut all_events = Vec::new();
+        for i in 0..6u32 {
+            let mut f = frame_third_party(0, i as f32 / 60.0, 0.001);
+            f.player_car_position = 0;
+            f.car_idx_position[0] = 0;
+            all_events.extend(engine.process_frame(&f));
+        }
+        assert!(all_events.iter().any(|e| matches!(
+            e,
+            RaceEvent::BattleEngaged {
+                battle: Some(_),
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn legacy_player_battle_is_stamped_with_the_pair_identity() {
+        let mut engine = NarrativeEngine::new(10);
+        let mut all_events = Vec::new();
+        for i in 0..6u8 {
+            all_events.extend(engine.process_frame(&frame_with_gap(1, i as f32, 4, 0.501)));
+        }
+        let engaged: Vec<_> = all_events
+            .iter()
+            .filter(|e| matches!(e, RaceEvent::BattleEngaged { .. }))
+            .collect();
+        // Exactly one ENGAGED: the pair tracker does not duplicate the rig's own fight.
+        assert_eq!(engaged.len(), 1, "{engaged:?}");
+        let RaceEvent::BattleEngaged {
+            player_car_idx: 0,
+            opponent_car_idx: 1,
+            battle: Some(id),
+            ..
+        } = engaged[0]
+        else {
+            panic!("legacy event should carry the pair identity: {:?}", engaged[0]);
+        };
+        assert!(id.battle_involves_publisher);
+        assert_eq!((id.ahead_car_idx, id.behind_car_idx), (1, 0));
     }
 
     #[test]

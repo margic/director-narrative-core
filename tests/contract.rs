@@ -1,6 +1,9 @@
 use director_narrative_core::battle_state::SlopeInfo;
 use director_narrative_core::publisher_event::{build_event, PublisherEvent};
-use director_narrative_core::race_event::{DriverEffort, FlagScope, GapTrend, LifecycleOrigin, RaceEvent};
+use director_narrative_core::race_event::{
+    BattleBreakReason, BattleIdentity, BattlePhase, DriverEffort, FlagScope, GapTrend, LifecycleOrigin,
+    RaceEvent,
+};
 use director_narrative_core::telemetry_frame::TelemetryFrame;
 use serde_json::Value;
 
@@ -138,6 +141,7 @@ fn battle_contract_includes_leader_and_follower_numbers() {
         prior_skirmishes: 0,
         prior_attack_time_s: 0.0,
         engagement_started_at_session_time_s: 12.0,
+        battle: None,
     };
 
     let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001", None, None);
@@ -176,6 +180,7 @@ fn battle_closing_contract_uses_opponent_car_as_primary_identity() {
         },
         prior_skirmishes: 0,
         prior_attack_time_s: 0.0,
+        battle: None,
     };
 
     let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001", None, None);
@@ -290,6 +295,7 @@ fn battle_events_identify_both_sides_directly() {
         prior_skirmishes: 1,
         prior_attack_time_s: 12.5,
         engagement_started_at_session_time_s: 50.0,
+        battle: None,
     };
 
     let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001", None, None);
@@ -323,6 +329,7 @@ fn battle_engaged_includes_engagement_start_time() {
         prior_skirmishes: 0,
         prior_attack_time_s: 0.0,
         engagement_started_at_session_time_s: 200.0,
+        battle: None,
     };
 
     let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001", None, None);
@@ -356,6 +363,7 @@ fn battle_broken_contract_uses_final_gap_sec_and_duration() {
         final_gap_sec: Some(1.8),
         car_race_position: 4,
         engagement_started_at_session_time_s: 320.0,
+        battle: None,
     };
 
     let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001", None, None);
@@ -687,6 +695,7 @@ fn battle_broken_with_no_gap_emits_null_final_gap() {
         final_gap_sec: None, // gap unknown — opponent left scan range
         car_race_position: 3,
         engagement_started_at_session_time_s: 390.0,
+        battle: None,
     };
 
     let env = build_event(&event, &minimal_frame(), None, "session-abc", "rig-001", None, None);
@@ -1108,3 +1117,202 @@ fn race_checkered_is_session_scoped() {
     assert_eq!(json["payload"]["subjectRole"], "SESSION");
 }
 
+
+// ── Battle identity (third-party pair tracker) ───────────────────────────────
+
+fn third_party_frame() -> TelemetryFrame {
+    // Rig is car 0 at P1; cars 3 (P2) and 5 (P3) are fighting behind it.
+    let mut frame = minimal_frame();
+    frame.car_idx_lap_dist_pct = vec![0.5, -1.0, -1.0, 0.20, -1.0, 0.195];
+    frame.car_idx_position = vec![1, 0, 0, 2, 0, 3];
+    frame.car_idx_on_pit_road = vec![false; 6];
+    frame.car_idx_track_surface = vec![0; 6];
+    frame.car_idx_lap_completed = vec![3; 6];
+    frame.player_car_position = 1;
+    frame
+}
+
+fn sample_identity(phase: BattlePhase) -> BattleIdentity {
+    BattleIdentity {
+        battle_id: "btl-03-05-1200000-1".into(),
+        battle_phase: phase,
+        ahead_car_idx: 3,
+        behind_car_idx: 5,
+        engaged_at: 1200.0,
+        battle_age_s: 34.5,
+        current_gap_s: Some(0.5),
+        closing_rate_s_per_lap: Some(1.25),
+        battle_confidence: 0.9,
+        battle_involves_publisher: false,
+        battle_break_reason: None,
+    }
+}
+
+/// Every additive identity field, in both snake_case and camelCase.
+fn assert_battle_identity_contract(payload: &Value, phase: &str) {
+    assert_eq!(payload["battleId"], "btl-03-05-1200000-1");
+    assert_eq!(payload["battle_id"], "btl-03-05-1200000-1");
+    assert_eq!(payload["battlePhase"], phase);
+    assert_eq!(payload["aheadCarIdx"], 3);
+    assert_eq!(payload["behindCarIdx"], 5);
+    assert_eq!(payload["ahead_car_idx"], 3);
+    assert_eq!(payload["behind_car_idx"], 5);
+    assert!((payload["engagedAt"].as_f64().unwrap() - 1200.0).abs() < 1e-3);
+    assert!((payload["battleAgeS"].as_f64().unwrap() - 34.5).abs() < 1e-3);
+    assert!((payload["currentGapS"].as_f64().unwrap() - 0.5).abs() < 1e-4);
+    assert!((payload["closingRateSPerLap"].as_f64().unwrap() - 1.25).abs() < 1e-4);
+    assert!((payload["battleConfidence"].as_f64().unwrap() - 0.9).abs() < 1e-4);
+    assert_eq!(payload["battleInvolvesPublisher"], false);
+}
+
+#[test]
+fn battle_engaged_for_a_third_party_pair_carries_identity_and_roles() {
+    let event = RaceEvent::BattleEngaged {
+        lap: 4,
+        session_time: 1234.5,
+        player_car_idx: 5,
+        opponent_car_idx: 3,
+        gap_s: 0.5,
+        car_race_position: 2,
+        prior_skirmishes: 0,
+        prior_attack_time_s: 0.0,
+        engagement_started_at_session_time_s: 1200.0,
+        battle: Some(sample_identity(BattlePhase::Engaged)),
+    };
+
+    let env = build_event(
+        &event,
+        &third_party_frame(),
+        None,
+        "session-abc",
+        "rig-001",
+        None,
+        None,
+    );
+    let json = normalized_event_json(&env);
+
+    assert_envelope_contract(&json, "BATTLE_ENGAGED");
+    let payload = &json["payload"];
+    assert_battle_identity_contract(payload, "ENGAGED");
+    assert!(payload["battleBreakReason"].is_null());
+
+    // Legacy leader/follower derivation still holds for a pair that does
+    // not involve the rig, and the rig's identity stays separate.
+    assert_eq!(payload["leaderCar"]["carIdx"], 3);
+    assert_eq!(payload["followerCar"]["carIdx"], 5);
+    assert_eq!(payload["attackerCarIdx"], 5);
+    assert_eq!(payload["defenderCarIdx"], 3);
+    assert_eq!(payload["subjectCarIdx"], 5);
+    assert_eq!(payload["publisherCarIdx"], 0);
+    assert_eq!(json["car"]["carIdx"], 3);
+}
+
+#[test]
+fn battle_closing_and_broken_share_the_battle_id() {
+    let closing = RaceEvent::BattleClosing {
+        lap: 4,
+        session_time: 1234.5,
+        player_car_idx: 5,
+        opponent_car_idx: 3,
+        car_race_position: 2,
+        closing_rate_sec_per_lap: 1.25,
+        slope_info: SlopeInfo {
+            median_slope: -1.25,
+            anchors_qualifying: 60,
+            anchors_agreeing: 60,
+            hotspot_lap_dist_pct: 0.195,
+        },
+        prior_skirmishes: 0,
+        prior_attack_time_s: 0.0,
+        battle: Some(sample_identity(BattlePhase::Closing)),
+    };
+    let broken = RaceEvent::BattleBroken {
+        lap: 4,
+        session_time: 1234.5,
+        player_car_idx: 5,
+        opponent_car_idx: 3,
+        final_gap_sec: Some(2.6),
+        car_race_position: 2,
+        engagement_started_at_session_time_s: 1200.0,
+        battle: Some(BattleIdentity {
+            battle_break_reason: Some(BattleBreakReason::GapOpened),
+            current_gap_s: Some(0.5),
+            ..sample_identity(BattlePhase::Broken)
+        }),
+    };
+
+    let frame = third_party_frame();
+    let closing_json = normalized_event_json(&build_event(
+        &closing, &frame, None, "s", "rig-001", None, None,
+    ));
+    let broken_json = normalized_event_json(&build_event(
+        &broken, &frame, None, "s", "rig-001", None, None,
+    ));
+
+    assert_envelope_contract(&closing_json, "BATTLE_CLOSING");
+    assert_envelope_contract(&broken_json, "BATTLE_BROKEN");
+    assert_battle_identity_contract(&closing_json["payload"], "CLOSING");
+    assert_battle_identity_contract(&broken_json["payload"], "BROKEN");
+    assert_eq!(
+        closing_json["payload"]["battleId"],
+        broken_json["payload"]["battleId"]
+    );
+    assert_eq!(broken_json["payload"]["battleBreakReason"], "GAP_OPENED");
+    assert_eq!(broken_json["payload"]["battle_break_reason"], "GAP_OPENED");
+    // Legacy closing-rate field is still populated alongside the new one.
+    assert!(
+        (closing_json["payload"]["closing_rate_sec_per_lap"]
+            .as_f64()
+            .unwrap()
+            - 1.25)
+            .abs()
+            < 1e-4
+    );
+}
+
+#[test]
+fn battle_events_without_identity_omit_the_new_fields() {
+    // An event from the legacy player-threat path with no tracked pair must
+    // serialise exactly as before: none of the identity keys appear.
+    let event = RaceEvent::BattleEngaged {
+        lap: 2,
+        session_time: 12.0,
+        player_car_idx: 0,
+        opponent_car_idx: 1,
+        gap_s: 0.4,
+        car_race_position: 4,
+        prior_skirmishes: 0,
+        prior_attack_time_s: 0.0,
+        engagement_started_at_session_time_s: 12.0,
+        battle: None,
+    };
+    let json = normalized_event_json(&build_event(
+        &event,
+        &minimal_frame(),
+        None,
+        "s",
+        "rig-001",
+        None,
+        None,
+    ));
+    let payload = json["payload"].as_object().unwrap();
+    for key in [
+        "battleId",
+        "battle_id",
+        "battlePhase",
+        "aheadCarIdx",
+        "behindCarIdx",
+        "engagedAt",
+        "battleAgeS",
+        "currentGapS",
+        "closingRateSPerLap",
+        "battleConfidence",
+        "battleInvolvesPublisher",
+        "battleBreakReason",
+        "battle",
+    ] {
+        assert!(!payload.contains_key(key), "unexpected key {key}");
+    }
+    assert_eq!(payload["leaderCarNumber"], "1");
+    assert_eq!(payload["followerCarNumber"], "0");
+}

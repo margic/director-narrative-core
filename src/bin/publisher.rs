@@ -823,6 +823,7 @@ fn pipeline_main(
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Parse `--config <path>` from command-line arguments.
+#[cfg(target_os = "windows")]
 fn parse_config_path() -> Option<std::path::PathBuf> {
     let args: Vec<String> = std::env::args().collect();
     args.windows(2)
@@ -831,6 +832,7 @@ fn parse_config_path() -> Option<std::path::PathBuf> {
 }
 
 /// Parse `--simulate <action>`. `Err` carries the unrecognised action.
+#[cfg(target_os = "windows")]
 fn parse_simulate() -> Result<Option<director_narrative_core::controls::ControlAction>, String> {
     use director_narrative_core::controls::ControlAction;
     let args: Vec<String> = std::env::args().collect();

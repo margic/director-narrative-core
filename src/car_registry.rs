@@ -141,8 +141,8 @@ impl CarRegistry {
             self.last_seen_tick[i] = session_tick;
         }
 
-        for i in 0..self.cars.len() {
-            if in_frame[i] {
+        for (i, &seen) in in_frame.iter().enumerate().take(self.cars.len()) {
+            if seen {
                 continue;
             }
             if self.cars[i].is_some() && session_tick.saturating_sub(self.last_seen_tick[i]) > 3600 {
@@ -210,7 +210,7 @@ impl CarRegistry {
                 history.time_in_attack_s += 60.0;
             }
         }
-        history.last_state_forward = state.clone();
+        history.last_state_forward = *state;
         history.last_engaged_lap = Some(lap);
     }
 
