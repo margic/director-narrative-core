@@ -241,9 +241,10 @@ mod tests {
                 line[..4].chars().all(|c| c.is_ascii_digit()),
                 "line should start with a 4-digit year: {line:?}"
             );
+            // Other tests share the global sink, so WARN lines are legal too.
             assert!(
-                line.contains(" INFO "),
-                "line should contain level: {line:?}"
+                line.contains(" INFO ") || line.contains(" WARN "),
+                "line should contain a level: {line:?}"
             );
         }
 
