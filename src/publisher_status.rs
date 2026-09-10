@@ -28,6 +28,14 @@ pub struct PublisherStatus {
     pub rc_last_http_status: Option<u16>,
     pub rc_connected:        bool,
     pub token_expires_at:    Option<SystemTime>,
+    /// Wall-clock time of the last successful batch POST.
+    pub last_post_at:        Option<SystemTime>,
+    /// `TransportErrorKind::label()` of the last failed call.
+    pub last_error_kind:     Option<String>,
+    /// Events buffered in the transport queue right now.
+    pub queued_events:       usize,
+    /// Set on shutdown so `status.json` reports `stopped`.
+    pub stopped:             bool,
 
     // ── Counters ──────────────────────────────────────────────────────────
     pub events_enqueued_total: u64,
@@ -57,5 +65,31 @@ impl PublisherStatus {
             self.event_log.pop_back();
         }
         self.event_log.push_front(entry);
+    }
+
+    /// Snapshot this status as the serialisable [`StatusFile`] written to
+    /// `status.json` in headless mode.
+    pub fn to_status_file(&self, destination: &str) -> crate::headless::StatusFile {
+        let state = if self.stopped {
+            "stopped"
+        } else if self.iracing_connected {
+            "connected"
+        } else {
+            "waiting_for_iracing"
+        };
+        crate::headless::StatusFile {
+            state:                 state.to_owned(),
+            destination:           destination.to_owned(),
+            updated_at:            crate::headless::iso8601_utc(SystemTime::now()),
+            last_post_at:          self.last_post_at.map(crate::headless::iso8601_utc),
+            last_error_kind:       self.last_error_kind.clone(),
+            queued_events:         self.queued_events,
+            sub_session_id:        self.sub_session_id,
+            events_enqueued_total: self.events_enqueued_total,
+            calls_total:           self.calls_total,
+            calls_failed:          self.calls_failed,
+            pid:                   std::process::id(),
+            version:               env!("CARGO_PKG_VERSION").to_owned(),
+        }
     }
 }

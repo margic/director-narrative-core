@@ -91,6 +91,30 @@ Start iRacing, then run the publisher:
 
 The publisher waits for iRacing's shared memory to become available, then streams `PublisherEvent` batches to the Race Control API at `batch_interval_ms` intervals. Press **Ctrl-C** for a clean shutdown.
 
+#### Destination: local
+
+Set `[publisher] destination = "local"` to post the same `IngestRequest` envelopes to a local collector instead of Race Control. Auth switches from Azure AD to a static `Authorization: Bearer <token>` header:
+
+```toml
+[publisher]
+destination = "local"
+
+[local]
+url   = "https://collector.local:8443"   # https for any host; http only for loopback
+token = "your-static-token"
+# Optional: pin the TLS connection to the collector's certificate
+# (SHA-256 of the DER, colons/case-insensitive)
+# cert_fingerprint = "AA:BB:...:FF"
+```
+
+Environment overrides (env wins over the file): `PUBLISHER_DESTINATION`, `PUBLISHER_LOCAL_URL`, `PUBLISHER_LOCAL_TOKEN`, `PUBLISHER_LOCAL_CERT_FINGERPRINT`.
+
+#### Flags
+
+- `--no-ui` — run without the status window.
+- `--headless` — implies `--no-ui` and additionally mirrors all log output to `%LOCALAPPDATA%\SimRaceCenter\publisher\publisher.log` (rotated at 5 MiB into `publisher.log.1`) and writes the live pipeline state to `status.json` in the same directory.
+- `--dry-run` — print each JSON batch to stdout; **nothing is sent** over the network (no token requests either).
+
 ### Python EDA (optional)
 
 The Python prototype in `scripts/` validates the spatial-anchor approach against the real Nürburgring session. It requires `data/session.jsonl` (gitignored, 31 MB).
