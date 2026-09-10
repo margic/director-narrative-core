@@ -1,6 +1,6 @@
 //! Headless-mode support: rotating file log and atomic `status.json` writer.
 //!
-//! When the publisher runs with `--headless` (implied by `--no-ui`) all log
+//! When the publisher runs with `--headless` (which implies `--no-ui`) all log
 //! output is mirrored into `%LOCALAPPDATA%\SimRaceCenter\publisher\publisher.log`
 //! (rotated at [`LOG_ROTATE_BYTES`]) and the live pipeline state is mirrored
 //! into `status.json` in the same directory.
