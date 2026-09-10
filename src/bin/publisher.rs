@@ -4,13 +4,24 @@
 //! # Usage
 //!
 //! ```powershell
-//! publisher.exe [--config <path-to-publisher.toml>] [--no-ui] [--dry-run]
-//!               [--simulate <focus_me|broadcast_toggle>]
+//! publisher.exe [--config <path-to-publisher.toml>] [--no-ui] [--headless]
+//!               [--dry-run] [--simulate <focus_me|broadcast_toggle>]
 //! ```
 //!
-//! `--dry-run`  Print each JSON batch to stdout instead of POSTing to Race
-//!              Control. Use this to verify the wire format while iRacing is
-//!              running without touching the live API.
+//! `--dry-run`  Print each JSON batch to stdout. Nothing is sent over the
+//!              network — use this to verify the wire format while iRacing is
+//!              running without touching any destination.
+//!
+//! `--headless` Implies `--no-ui` and additionally mirrors all log output to
+//!              `%LOCALAPPDATA%\SimRaceCenter\publisher\publisher.log`
+//!              (rotated at 5 MiB) and writes the live state to
+//!              `status.json` in the same directory.
+//!
+//! `[publisher] destination = "racecontrol"` (default) posts to Race Control
+//! with Azure AD auth; `"local"` posts to `[local] url` with a static bearer
+//! token and optional `cert_fingerprint` TLS pinning. Matching env vars:
+//! `PUBLISHER_DESTINATION`, `PUBLISHER_LOCAL_URL`, `PUBLISHER_LOCAL_TOKEN`,
+//! `PUBLISHER_LOCAL_CERT_FINGERPRINT`.
 //!
 //! `--simulate` Publish one driver control request as if the bound wheel
 //!              button had been pressed — no HID hardware needed.
@@ -24,7 +35,7 @@ mod publisher_ui;
 fn main() {
     #[cfg(not(target_os = "windows"))]
     {
-        eprintln!("[publisher] only supported on Windows (iRacing is Windows-only)");
+        director_narrative_core::log_warn!("[publisher] only supported on Windows (iRacing is Windows-only)");
         std::process::exit(1);
     }
 
@@ -45,21 +56,39 @@ fn run() {
 
     // ── 1. Load config ────────────────────────────────────────────────────
 
+    use director_narrative_core::{log_info, log_warn};
+
     let config_path = parse_config_path();
-    let no_ui       = std::env::args().any(|a| a == "--no-ui");
+    let headless    = std::env::args().any(|a| a == "--headless");
+    let no_ui       = headless || std::env::args().any(|a| a == "--no-ui");
     let dry_run     = std::env::args().any(|a| a == "--dry-run");
     let simulate    = match parse_simulate() {
         Ok(s) => s,
         Err(arg) => {
-            eprintln!("[publisher] unknown --simulate action '{arg}' (expected focus_me or broadcast_toggle)");
+            log_warn!("[publisher] unknown --simulate action '{arg}' (expected focus_me or broadcast_toggle)");
             std::process::exit(2);
         }
     };
 
+    // Headless: install the file sink before anything else logs so the
+    // startup lines land in publisher.log too.
+    if headless {
+        let dir = director_narrative_core::headless::data_dir();
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            log_warn!("[publisher] could not create data dir {}: {e}", dir.display());
+        }
+        if let Err(e) = director_narrative_core::headless::init_file_log(
+            &dir.join("publisher.log"),
+            director_narrative_core::headless::LOG_ROTATE_BYTES,
+        ) {
+            log_warn!("[publisher] file log unavailable: {e}");
+        }
+    }
+
     let cfg = match config::load(config_path.as_deref()) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[publisher] config error: {e}");
+            log_warn!("[publisher] config error: {e}");
             std::process::exit(1);
         }
     };
@@ -78,18 +107,30 @@ fn run() {
             c.exists().then(|| c.display().to_string())
         });
 
-    println!(
-        "[publisher] config loaded — api={} tenant={} client_id={}…{} scope={}",
-        cfg.publisher.rc_api_url,
-        cfg.auth.tenant_id,
-        &cfg.auth.client_id[..8.min(cfg.auth.client_id.len())],
-        &cfg.auth.client_id[cfg.auth.client_id.len().saturating_sub(4)..],
-        cfg.auth.scope,
-    );
+    match (&cfg.destination, &cfg.auth, &cfg.local) {
+        (config::Destination::Local, _, Some(local)) => {
+            log_info!(
+                "[publisher] config loaded — destination=local url={} pinned={}",
+                local.url,
+                local.cert_fingerprint.is_some(),
+            );
+        }
+        (_, Some(auth), _) => {
+            log_info!(
+                "[publisher] config loaded — api={} tenant={} client_id={}…{} scope={}",
+                cfg.publisher.rc_api_url,
+                auth.tenant_id,
+                &auth.client_id[..8.min(auth.client_id.len())],
+                &auth.client_id[auth.client_id.len().saturating_sub(4)..],
+                auth.scope,
+            );
+        }
+        _ => {}
+    }
     if let Some(ref p) = resolved_config_path {
-        println!("[publisher] using config file: {p}");
+        log_info!("[publisher] using config file: {p}");
     } else {
-        println!("[publisher] no publisher.toml found — using env vars only");
+        log_info!("[publisher] no publisher.toml found — using env vars only");
     }
 
     // ── 2. Shared state + shutdown flag ───────────────────────────────────
@@ -106,7 +147,7 @@ fn run() {
     let controls_file = controls::controls_path(config_path.as_deref());
     let controls = Arc::new(Mutex::new(match controls::load_controls(&controls_file) {
         Ok(c) => {
-            println!(
+            log_info!(
                 "[controls] {} ({} binding(s))",
                 controls_file.display(),
                 c.bindings.len()
@@ -114,7 +155,7 @@ fn run() {
             ControlsState::new(c, controls_file)
         }
         Err(e) => {
-            eprintln!("[controls] {e} — starting with no bindings");
+            log_warn!("[controls] {e} — starting with no bindings");
             let mut s = ControlsState::new(controls::ControlsConfig::default(), controls_file);
             s.last_error = Some(e);
             s
@@ -160,20 +201,75 @@ fn run() {
         })
         .expect("failed to spawn pipeline thread");
 
+    // ── 5b. Headless status writer ────────────────────────────────────────
+    // Mirrors the shared PublisherStatus into <data_dir>/status.json on a
+    // wall-clock cadence so external tooling can watch a file, not a console.
+
+    if headless {
+        let status_path = director_narrative_core::headless::data_dir().join("status.json");
+        // heartbeat_interval_ms of 0 (disabled) maps to a fixed 5s cadence.
+        let interval_ms = if cfg.publisher.heartbeat_interval_ms == 0 {
+            5_000
+        } else {
+            cfg.publisher.heartbeat_interval_ms.max(1_000)
+        };
+        let status_thread_status      = status.clone();
+        let status_thread_running     = running.clone();
+        let status_thread_destination = cfg.destination.as_str().to_owned();
+        std::thread::Builder::new()
+            .name("publisher-status".into())
+            .spawn(move || {
+                let mut warned = false;
+                while status_thread_running.load(Ordering::SeqCst) {
+                    let snapshot = status_thread_status
+                        .lock()
+                        .unwrap()
+                        .to_status_file(&status_thread_destination);
+                    if let Err(e) =
+                        director_narrative_core::headless::write_status_atomic(
+                            &status_path,
+                            &snapshot,
+                        )
+                    {
+                        if !warned {
+                            log_warn!("[publisher] status.json write failed: {e}");
+                            warned = true;
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+                }
+            })
+            .expect("failed to spawn status writer thread");
+    }
+
     // ── 6. UI or headless ─────────────────────────────────────────────────
 
     if no_ui {
         pipeline.join().ok();
     } else {
-        if let Err(e) = publisher_ui::run_ui(status, controls, running.clone()) {
-            eprintln!("[publisher] UI error: {e}");
+        if let Err(e) = publisher_ui::run_ui(status.clone(), controls, running.clone()) {
+            log_warn!("[publisher] UI error: {e}");
         }
         // Window closed — signal pipeline to stop and wait for flush.
         running.store(false, Ordering::SeqCst);
         pipeline.join().ok();
     }
 
-    println!("[publisher] done.");
+    // Final status.json write with state = "stopped".
+    if headless {
+        let mut s = status.lock().unwrap();
+        s.stopped = true;
+        let snapshot = s.to_status_file(cfg.destination.as_str());
+        drop(s);
+        let status_path = director_narrative_core::headless::data_dir().join("status.json");
+        if let Err(e) =
+            director_narrative_core::headless::write_status_atomic(&status_path, &snapshot)
+        {
+            log_warn!("[publisher] final status.json write failed: {e}");
+        }
+    }
+
+    log_info!("[publisher] done.");
 }
 
 // ── Pipeline ──────────────────────────────────────────────────────────────────
@@ -194,9 +290,11 @@ fn pipeline_main(
     const SESSION_CLOCK_ROLLBACK_S: f32 = 5.0;
 
     use director_narrative_core::{
+        config::Destination,
         controls::{now_wall_clock_ms, simulated_request, ControlRequest},
         engine::NarrativeEngine,
         lifecycle::{HeartbeatScheduler, IntervalScheduler, LifecyclePublisher},
+        log_info, log_warn,
         publisher_event::{build_event, PublisherEvent},
         race_event::{EventScope, RaceEvent},
         session_info::{is_ai_session, parse_sub_session_id, synthetic_sub_session_id, RosterCache, SessionMetadata},
@@ -211,39 +309,60 @@ fn pipeline_main(
 
     // ── Initialise transport + auth warmup ───────────────────────────────
 
-    let mut transport = PublisherTransport::new(
-        &cfg.auth.tenant_id,
-        &cfg.auth.client_id,
-        &cfg.auth.client_secret,
-        &cfg.auth.scope,
-        &cfg.publisher.rc_api_url,
-        cfg.publisher.batch_interval_ms,
-    );
+    let mut transport = match cfg.destination {
+        Destination::Local => {
+            let local = cfg.local.as_ref().expect("validated: local config present");
+            match PublisherTransport::new_local(
+                &local.url,
+                &local.token,
+                local.cert_fingerprint.as_deref(),
+                cfg.publisher.batch_interval_ms,
+            ) {
+                Ok(t) => t,
+                Err(e) => {
+                    log_warn!("[publisher] local transport setup failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Destination::RaceControl => {
+            let auth = cfg.auth.as_ref().expect("validated: auth config present");
+            PublisherTransport::new(
+                &auth.tenant_id,
+                &auth.client_id,
+                &auth.client_secret,
+                &auth.scope,
+                &cfg.publisher.rc_api_url,
+                cfg.publisher.batch_interval_ms,
+            )
+        }
+    };
     transport.set_dry_run(dry_run);
     if dry_run {
-        println!("[publisher] dry-run mode — payloads will be printed to stdout and still sent");
+        log_info!("[publisher] dry-run mode — payloads printed to stdout; nothing is sent");
     }
     // Warm up auth early so misconfiguration is visible before the first
     // event-triggered ingest attempt. Non-fatal: posting still retries and
     // refreshes tokens if this startup token expires before first publish.
     match transport.warmup_auth() {
         Ok(()) => {
-            println!("[publisher] auth warmup succeeded");
+            log_info!("[publisher] auth warmup succeeded");
             let mut s = status.lock().unwrap();
             s.rc_connected   = true;
             s.token_expires_at = transport.token_expires_at();
         }
         Err(e) => {
-            eprintln!("[publisher] auth warmup failed: {e}");
+            log_warn!("[publisher] auth warmup failed: {e}");
             let mut s = status.lock().unwrap();
             s.rc_connected   = false;
             s.token_expires_at = None;
+            s.last_error_kind = Some(e.kind.label());
         }
     }
 
     // ── Wait for iRacing ──────────────────────────────────────────────────
 
-    println!("[publisher] waiting for iRacing...");
+    log_info!("[publisher] waiting for iRacing...");
     let mut reader = match connect_loop(&running) {
         Some(r) => r,
         None => return,
@@ -281,7 +400,7 @@ fn pipeline_main(
         .map(|action| vec![simulated_request(action, now_wall_clock_ms())])
         .unwrap_or_default();
     if let Some(action) = simulate {
-        println!("[controls] --simulate {action}: request queued");
+        log_info!("[controls] --simulate {action}: request queued");
     }
 
     // ── First frame ───────────────────────────────────────────────────────
@@ -295,7 +414,7 @@ fn pipeline_main(
             .and_then(|r| r.lookup(frame.player_car_idx))
             .map(|c| format!("car=#{} {}", c.car_number, c.driver_name))
             .unwrap_or_else(|| format!("carIdx={}", frame.player_car_idx));
-        println!("[publisher] connected — {car_info}");
+        log_info!("[publisher] connected — {car_info}");
 
         {
             let mut s = status.lock().unwrap();
@@ -308,7 +427,7 @@ fn pipeline_main(
         last_frame = Some(frame);
     }
 
-    println!(
+    log_info!(
         "[publisher] publishing at 60 Hz (batch every {}ms)",
         cfg.publisher.batch_interval_ms
     );
@@ -317,7 +436,7 @@ fn pipeline_main(
 
     while running.load(Ordering::SeqCst) {
         if !reader.is_connected() {
-            println!("[publisher] iRacing disconnected — reconnecting...");
+            log_info!("[publisher] iRacing disconnected — reconnecting...");
             if sub_session_id > 0 {
                 if let Some(frame) = &last_frame {
                     let disconnected = RaceEvent::IracingDisconnected {
@@ -337,7 +456,8 @@ fn pipeline_main(
                     transport.enqueue(pe);
                     status.lock().unwrap().events_enqueued_total += 1;
                     if let Err(e) = transport.flush(frame.session_time as f64, frame.session_tick, sub_session_id) {
-                        eprintln!("[publisher] flush error after IRACING_DISCONNECTED: {e}");
+                        log_warn!("[publisher] flush error after IRACING_DISCONNECTED: {e}");
+                        status.lock().unwrap().last_error_kind = Some(e.kind.label());
                     }
                 }
             }
@@ -364,7 +484,7 @@ fn pipeline_main(
             current_session_meta = None;
             race_session_id = String::new();
             emit_iracing_connected = true;
-            println!("[publisher] reconnected");
+            log_info!("[publisher] reconnected");
             status.lock().unwrap().iracing_connected = true;
             continue;
         }
@@ -399,7 +519,7 @@ fn pipeline_main(
                         let new_sid = parse_sub_session_id(&yaml).or_else(|| {
                             if is_ai_session(&yaml) {
                                 let sid = synthetic_sub_session_id(&yaml);
-                                println!("[publisher] AI session detected — using synthetic subSessionId {sid}");
+                                log_info!("[publisher] AI session detected — using synthetic subSessionId {sid}");
                                 Some(sid)
                             } else {
                                 None
@@ -415,7 +535,7 @@ fn pipeline_main(
                             if sid != sub_session_id {
                                 if sub_session_id > 0 {
                                     // Flush whatever was in flight for the old session.
-                                    println!(
+                                    log_info!(
                                         "[publisher] session transition {sub_session_id} → {sid} — resetting engine"
                                     );
                                     // Stamped with the *live* sub-session: a
@@ -438,11 +558,14 @@ fn pipeline_main(
                                     );
                                     transport.enqueue(pe);
                                     status.lock().unwrap().events_enqueued_total += 1;
-                                    let _ = transport.flush(
+                                    if let Err(e) = transport.flush(
                                         frame.session_time as f64,
                                         frame.session_tick,
                                         sid,
-                                    );
+                                    ) {
+                                        status.lock().unwrap().last_error_kind =
+                                            Some(e.kind.label());
+                                    }
                                 }
                                 // Reset session-scoped state.
                                 let previous_sub_session_id = sub_session_id;
@@ -583,7 +706,7 @@ fn pipeline_main(
                     } else {
                         session_info_read_failures = session_info_read_failures.saturating_add(1);
                         if session_info_read_failures == 1 || session_info_read_failures % 300 == 0 {
-                            eprintln!(
+                            log_warn!(
                                 "[publisher] SessionInfo read failed (update={}, session_num={}, attempts={})",
                                 frame.session_info_update,
                                 frame.session_num,
@@ -613,7 +736,7 @@ fn pipeline_main(
                             previous_session_time: Some(prev_t),
                             reason: "session_clock_restarted".to_owned(),
                         };
-                        println!(
+                        log_info!(
                             "[publisher] SESSION_RESET \u{2014} session clock restarted {prev_t:.2}s -> {:.2}s",
                             frame.session_time,
                         );
@@ -697,6 +820,7 @@ fn pipeline_main(
                     s.session_tick      = frame.session_tick;
                     s.session_time_secs = frame.session_time as f64;
                     s.token_expires_at  = transport.token_expires_at();
+                    s.queued_events     = transport.queued_len();
                 }
 
                 // Flush — skip until subSessionId is resolved to avoid persisting
@@ -704,7 +828,7 @@ fn pipeline_main(
                 if sub_session_id == 0 {
                     sub_session_blocked_frames = sub_session_blocked_frames.saturating_add(1);
                     if sub_session_blocked_frames == 1 || sub_session_blocked_frames % 300 == 0 {
-                        eprintln!(
+                        log_warn!(
                             "[publisher] publishing paused: unresolved subSessionId (SessionInfoUpdate={})",
                             frame.session_info_update,
                         );
@@ -720,7 +844,7 @@ fn pipeline_main(
                     if pending_requests.len() < 8 {
                         pending_requests.push(request);
                     } else {
-                        eprintln!("[controls] dropping request: driver identity unresolved");
+                        log_warn!("[controls] dropping request: driver identity unresolved");
                     }
                 }
                 if !pending_requests.is_empty() {
@@ -754,10 +878,11 @@ fn pipeline_main(
                             frame.session_tick,
                             sub_session_id,
                         ) {
-                            eprintln!("[controls] flush error: {e}");
+                            log_warn!("[controls] flush error: {e}");
                             let mut s = status.lock().unwrap();
                             s.calls_total  += 1;
                             s.calls_failed += 1;
+                            s.last_error_kind = Some(e.kind.label());
                         }
                     }
                 }
@@ -820,13 +945,17 @@ fn pipeline_main(
                         s.rc_connected        = true;
                         s.rc_last_http_status = Some(202);
                         s.token_expires_at    = transport.token_expires_at();
+                        s.last_post_at        = Some(std::time::SystemTime::now());
+                        s.last_error_kind     = None;
+                        s.queued_events       = transport.queued_len();
                     }
                     Err(e) => {
-                        eprintln!("[transport] flush error: {e}");
+                        log_warn!("[transport] flush error: {e}");
                         let mut s = status.lock().unwrap();
                         s.calls_total  += 1;
                         s.calls_failed += 1;
                         s.rc_connected  = false;
+                        s.last_error_kind = Some(e.kind.label());
                     }
                     Ok(false) => {}
                 }
@@ -834,7 +963,7 @@ fn pipeline_main(
                 last_frame = Some(frame);
             }
             Ok(false) => {}
-            Err(e)    => eprintln!("[publisher] frame read error: {e}"),
+            Err(e)    => log_warn!("[publisher] frame read error: {e}"),
         }
     }
 
@@ -859,9 +988,10 @@ fn pipeline_main(
         transport.enqueue(pe);
     }
 
-    println!("[publisher] PUBLISHER_GOODBYE sent — flushing...");
+    log_info!("[publisher] PUBLISHER_GOODBYE sent — flushing...");
     if let Err(e) = transport.flush(bye_t as f64, 0, sub_session_id) {
-        eprintln!("[publisher] flush error: {e}");
+        log_warn!("[publisher] flush error: {e}");
+        status.lock().unwrap().last_error_kind = Some(e.kind.label());
     }
 }
 
@@ -984,6 +1114,7 @@ fn log_event(
     roster: Option<&director_narrative_core::session_info::SessionRoster>,
     _frame: &director_narrative_core::telemetry_frame::TelemetryFrame,
 ) {
+    use director_narrative_core::log_info;
     use director_narrative_core::race_event::RaceEvent;
     use director_narrative_core::session_info::SessionRoster;
 
@@ -995,33 +1126,33 @@ fn log_event(
     }
 
     match event {
-        RaceEvent::RaceGreen { .. }            => println!("[publisher] RACE_GREEN — session event, lap 1 underway"),
-        RaceEvent::RaceCheckered { .. }        => println!("[publisher] RACE_CHECKERED — session event"),
-        RaceEvent::FlagYellowFullCourse { .. } => println!("[publisher] FLAG_YELLOW_FULL_COURSE — session event"),
-        RaceEvent::FlagYellowLocal { .. }      => println!("[publisher] FLAG_YELLOW_LOCAL"),
-        RaceEvent::IracingConnected { .. }     => println!("[publisher] IRACING_CONNECTED — telemetry feed available"),
-        RaceEvent::IracingDisconnected { .. }  => println!("[publisher] IRACING_DISCONNECTED — telemetry feed dropped"),
+        RaceEvent::RaceGreen { .. }            => log_info!("[publisher] RACE_GREEN — session event, lap 1 underway"),
+        RaceEvent::RaceCheckered { .. }        => log_info!("[publisher] RACE_CHECKERED — session event"),
+        RaceEvent::FlagYellowFullCourse { .. } => log_info!("[publisher] FLAG_YELLOW_FULL_COURSE — session event"),
+        RaceEvent::FlagYellowLocal { .. }      => log_info!("[publisher] FLAG_YELLOW_LOCAL"),
+        RaceEvent::IracingConnected { .. }     => log_info!("[publisher] IRACING_CONNECTED — telemetry feed available"),
+        RaceEvent::IracingDisconnected { .. }  => log_info!("[publisher] IRACING_DISCONNECTED — telemetry feed dropped"),
         RaceEvent::DriverEnteredCar { player_car_idx, .. } => {
             let player = car_num(roster, *player_car_idx);
-            println!("[publisher] DRIVER_ENTERED_CAR — #{player}");
+            log_info!("[publisher] DRIVER_ENTERED_CAR — #{player}");
         }
         RaceEvent::DriverExitedCar { player_car_idx, .. } => {
             let player = car_num(roster, *player_car_idx);
-            println!("[publisher] DRIVER_EXITED_CAR — #{player}");
+            log_info!("[publisher] DRIVER_EXITED_CAR — #{player}");
         }
         RaceEvent::IncidentAlert { car_idx, reason, speed_drop_mps, .. } => {
             let player = car_num(roster, *car_idx);
-            println!("[publisher] INCIDENT_ALERT — #{player}, {reason}, speed drop {speed_drop_mps:.1} m/s");
+            log_info!("[publisher] INCIDENT_ALERT — #{player}, {reason}, speed drop {speed_drop_mps:.1} m/s");
         }
         RaceEvent::BattleEngaged { player_car_idx, opponent_car_idx, gap_s, .. } => {
             let player = car_num(roster, *player_car_idx);
             let opp    = car_num(roster, *opponent_car_idx);
-            println!("[publisher] BATTLE_ENGAGED — #{player} vs #{opp}, gap {gap_s:.1}s");
+            log_info!("[publisher] BATTLE_ENGAGED — #{player} vs #{opp}, gap {gap_s:.1}s");
         }
         RaceEvent::BattleClosing { player_car_idx, opponent_car_idx, closing_rate_sec_per_lap, .. } => {
             let player = car_num(roster, *player_car_idx);
             let opp    = car_num(roster, *opponent_car_idx);
-            println!(
+            log_info!(
                 "[publisher] BATTLE_CLOSING — #{player} vs #{opp}, \
                  closing {closing_rate_sec_per_lap:.1}s/lap"
             );
@@ -1029,12 +1160,12 @@ fn log_event(
         RaceEvent::Overtake { car_idx, overtaken_car_idx, position_to, .. } => {
             let player = car_num(roster, *car_idx);
             let overtaken = overtaken_car_idx.map(|idx| car_num(roster, idx)).unwrap_or_else(|| "?".to_string());
-            println!("[publisher] OVERTAKE — #{player} passed #{overtaken} to P{position_to}");
+            log_info!("[publisher] OVERTAKE — #{player} passed #{overtaken} to P{position_to}");
         }
         RaceEvent::OvertakeForLead { car_idx, overtaken_car_idx, .. } => {
             let player = car_num(roster, *car_idx);
             let overtaken = overtaken_car_idx.map(|idx| car_num(roster, idx)).unwrap_or_else(|| "?".to_string());
-            println!("[publisher] OVERTAKE_FOR_LEAD — #{player} passed #{overtaken}");
+            log_info!("[publisher] OVERTAKE_FOR_LEAD — #{player} passed #{overtaken}");
         }
         _ => {}
     }

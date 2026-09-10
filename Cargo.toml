@@ -6,6 +6,7 @@ resolver = "2"
 name = "director-narrative-core"
 version = "0.4.0"
 edition = "2021"
+license = "GPL-3.0-or-later"
 autobins = false
 
 [[bin]]
@@ -30,6 +31,8 @@ serde_json = "1"
 serde_yaml = "0.9"
 toml = "0.8"
 ureq = { version = "2", features = ["json"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+ring = "0.17"
 uuid = { version = "1", features = ["v4"] }
 ctrlc = "3"
 strum = { version = "0.26", features = ["derive"] }
@@ -48,3 +51,4 @@ egui   = "0.31"
 
 [dev-dependencies]
 mockito = "1"
+rcgen = "0.13"
